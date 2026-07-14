@@ -944,9 +944,10 @@ EOF
     kubectl apply -f "$manifest" >/dev/null 2>&1
 }
 
-# 删除所有探测Deployment(弹性池节点随之被autoscaler缩回0)
+# 删除所有探测Deployment和临时NodePort Service(弹性池节点随之被autoscaler缩回0)
 _clean_probe_deployments() {
     kubectl delete deployment -n "$NAMESPACE" -l app="${PROBE_PREFIX}" --ignore-not-found --wait=false >/dev/null 2>&1
+    kubectl delete service -n "$NAMESPACE" -l app="${PROBE_PREFIX}" --ignore-not-found --wait=false >/dev/null 2>&1
 }
 
 # 节点池未通过状态的可读解释(供失败行附带说明, 帮助用户定位修复方向)
@@ -1504,6 +1505,81 @@ test_localhost_to_pod_connectivity() {
     fi
 }
 
+# 为指定节点池的探测Pod创建临时NodePort Service，并从本地服务器验证
+# InternalIP:NodePort -> Service -> 对应节点池探测Pod；不依赖本地服务器直连Pod CIDR。
+test_localhost_to_service_connectivity() {
+    local pname="$1"
+    local service_name="${PROBE_PREFIX}-${pname}-svc"
+    local manifest="${ARTIFACT_DIR}/${service_name}.yaml"
+    local pod_node node_ip node_port endpoint_ips elapsed=0
+
+    log_step "本地服务器访问Kubernetes Service连通性检查"
+    _ensure_artifact_dir
+    cat >"$manifest" <<EOF_SERVICE
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${service_name}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${PROBE_PREFIX}
+    probe-pool: "${pname}"
+spec:
+  type: NodePort
+  externalTrafficPolicy: Cluster
+  selector:
+    app: ${PROBE_PREFIX}
+    probe-pool: "${pname}"
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 80
+EOF_SERVICE
+
+    if ! kubectl apply -f "$manifest" >/dev/null 2>&1; then
+        log_error "节点池[${pname}]创建NodePort Service失败: ${service_name}，请检查Service创建RBAC权限"
+        return 1
+    fi
+
+    node_port=$(kubectl get service "$service_name" -n "$NAMESPACE" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)
+    pod_node=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+    node_ip=$(kubectl get node "$pod_node" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null)
+    if [[ -z "$node_port" || -z "$pod_node" || -z "$node_ip" ]]; then
+        log_error "节点池[${pname}]无法获取Service NodePort或探测Pod所在节点InternalIP (service=${service_name}, node=${pod_node:-未知}, port=${node_port:-未知})"
+        return 1
+    fi
+
+    while [[ $elapsed -lt 30 ]]; do
+        endpoint_ips=$(kubectl get endpoints "$service_name" -n "$NAMESPACE" -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null)
+        if printf '%s\n' "$endpoint_ips" | tr ' ' '\n' | grep -qx "$POD_IP"; then
+            break
+        fi
+        sleep 2
+        ((elapsed += 2))
+    done
+    if ! printf '%s\n' "$endpoint_ips" | tr ' ' '\n' | grep -qx "$POD_IP"; then
+        log_error "节点池[${pname}]的Service ${service_name} 在30秒内未发现就绪Endpoint(PodIP=${POD_IP})"
+        kubectl describe service "$service_name" -n "$NAMESPACE" >"${ARTIFACT_DIR}/describe_service_${service_name}.txt" 2>&1
+        kubectl get endpoints "$service_name" -n "$NAMESPACE" -o yaml >>"${ARTIFACT_DIR}/describe_service_${service_name}.txt" 2>&1
+        return 1
+    fi
+
+    log_info "测试本地服务器 -> NodePort Service: ${node_ip}:${node_port} -> ${service_name} -> 节点池[${pname}]探测Pod"
+    local body
+    if body=$(curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://${node_ip}:${node_port}/" 2>&1) && [[ "$body" == *"Welcome to nginx!"* ]]; then
+        log_success "节点池[${pname}]本地服务器访问Kubernetes Service正常(Node=${node_ip}, NodePort=${node_port})"
+        return 0
+    fi
+
+    log_error "节点池[${pname}]本地服务器无法访问Kubernetes Service(${node_ip}:${node_port}, service=${service_name})"
+    log_error "请确认ta1到工作节点的NodePort范围已被安全组/防火墙放行，并检查节点路由和Service Endpoint"
+    kubectl describe service "$service_name" -n "$NAMESPACE" >"${ARTIFACT_DIR}/describe_service_${service_name}.txt" 2>&1
+    kubectl get endpoints "$service_name" -n "$NAMESPACE" -o yaml >>"${ARTIFACT_DIR}/describe_service_${service_name}.txt" 2>&1
+    return 1
+}
+
+
 test_pod_to_localhost_connectivity() {
     log_step "Pod访问本地服务器网络连通性检查"
     LOCAL_SERVER_IP=$(grep -w ta1 /etc/hosts | head -1 | awk '{print $1}')
@@ -1524,7 +1600,7 @@ test_pod_to_localhost_connectivity() {
 
     log_info "测试从Pod访问本地服务器: $LOCAL_SERVER_IP:$LOCAL_SERVER_PORT"
 
-    if kubectl exec -it $POD_NAME -n $NAMESPACE -- curl -LsS -m 10 "http://$LOCAL_SERVER_IP:$LOCAL_SERVER_PORT/metrics" &>/dev/null; then
+    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- curl -LsS -m 10 "http://$LOCAL_SERVER_IP:$LOCAL_SERVER_PORT/metrics" &>/dev/null; then
         log_success "测试Pod访问本地服务器正常"
         return 0
     else
@@ -1654,6 +1730,7 @@ run_network_checks_per_pool() {
         log_warning "无任何就绪探测Pod，跳过网络连通性测试"
         _clean_probe_deployments
         record_result "本地服务器访问Pod网络连通性" "SKIP" "无就绪节点池可供测试"
+        record_result "本地服务器访问Kubernetes Service连通性" "SKIP" "无就绪节点池可供测试"
         record_result "Pod访问本地服务器网络连通性" "SKIP" "无就绪节点池可供测试"
         record_result "Pod访问集群内MySQL连通性" "SKIP" "无就绪节点池可供测试"
         record_result "Pod访问集群内云主机延迟(<50ms)" "SKIP" "无就绪节点池可供测试"
@@ -1666,8 +1743,8 @@ run_network_checks_per_pool() {
     parse_mysql_target || mysql_ready=0
 
     local pname
-    local l2p_total=0 l2p_fail=0 p2l_total=0 p2l_fail=0
-    local l2p_failed_pools="" p2l_failed_pools=""
+    local l2p_total=0 l2p_fail=0 l2s_total=0 l2s_fail=0 p2l_total=0 p2l_fail=0
+    local l2p_failed_pools="" l2s_failed_pools="" p2l_failed_pools=""
     local mysql_total=0 mysql_fail=0 lat_total=0 lat_fail=0
     local mysql_failed_pools="" lat_failed_pools="" lat_detail=""
     for pname in $PROBE_READY_POOLS; do
@@ -1678,7 +1755,6 @@ run_network_checks_per_pool() {
             continue
         fi
         log_section "节点池[${pname}] 网络连通性测试 (Pod: ${POD_NAME} / ${POD_IP})"
-        ensure_iptables_for_pod_cidr
 
         ((l2p_total++))
         test_localhost_to_pod_connectivity || {
@@ -1686,6 +1762,14 @@ run_network_checks_per_pool() {
             l2p_failed_pools="${l2p_failed_pools} ${pname}"
         }
 
+        ((l2s_total++))
+        test_localhost_to_service_connectivity "$pname" || {
+            ((l2s_fail++))
+            l2s_failed_pools="${l2s_failed_pools} ${pname}"
+        }
+
+        # Pod -> 本地服务器仍依赖本机对Pod网段的iptables放行，保持既有实施口径。
+        ensure_iptables_for_pod_cidr
         ((p2l_total++))
         test_pod_to_localhost_connectivity || {
             ((p2l_fail++))
@@ -1717,6 +1801,13 @@ run_network_checks_per_pool() {
         record_result "本地服务器访问Pod网络连通性" "PASS" "${l2p_total}个就绪节点池均连通"
     else
         record_result "本地服务器访问Pod网络连通性" "FAIL" "${l2p_fail}/${l2p_total}个节点池不通:${l2p_failed_pools# }(疑似安全组未放行)"
+    fi
+    if [[ $l2s_total -eq 0 ]]; then
+        record_result "本地服务器访问Kubernetes Service连通性" "SKIP" "无可测试的就绪Pod"
+    elif [[ $l2s_fail -eq 0 ]]; then
+        record_result "本地服务器访问Kubernetes Service连通性" "PASS" "${l2s_total}个就绪节点池均可经NodePort Service访问"
+    else
+        record_result "本地服务器访问Kubernetes Service连通性" "FAIL" "${l2s_fail}/${l2s_total}个节点池Service不通:${l2s_failed_pools# }(请检查NodePort范围、安全组、节点路由和Service Endpoint)"
     fi
     if [[ $p2l_total -eq 0 ]]; then
         record_result "Pod访问本地服务器网络连通性" "SKIP" "无可测试的就绪Pod"
@@ -1755,7 +1846,7 @@ run_network_checks_per_pool() {
             "【重要提醒】Pod IP(${IPTABLES_PERSIST_POD_IP})与本机IP(${IPTABLES_PERSIST_LOCAL_IP})不在同一/8网段，请将 cloud.intranet.segment=${IPTABLES_PERSIST_CIDR} 持久化到 install.properties 确保全集群内网放行！"
     fi
 
-    log_info "清理探测Deployment(弹性池节点将被autoscaler缩回0，请关注计费窗口)..."
+    log_info "清理探测Deployment/Service(弹性池节点将被autoscaler缩回0，请关注计费窗口)..."
     _clean_probe_deployments
 }
 
@@ -2517,12 +2608,13 @@ main() {
     log_info "6. Pod部署启动检查(并发探测所有节点池)"
     log_info "7. 节点池与节点配置检查"
     log_info "8. 节点组契约校验(规格/付费类型/污点 vs 池名声明)"
-    log_info "9. 本地服务器访问Pod网络连通性检查"
-    log_info "10. Pod访问本地服务器网络连通性检查"
-    log_info "11. Pod访问集群内MySQL连通性检查(混合部署网络错配探测)"
-    log_info "12. Pod访问集群内云主机延迟检查(<${HOST_LATENCY_THRESHOLD_MS}ms, TCP握手近似RTT)"
-    log_info "13. 端到端存储验证(块存储 te-disk: SC->PVC->挂载PVC的Pod起服)"
-    log_info "14. 端到端存储验证(网络存储 te-nfs: SC->PVC->挂载PVC的Pod起服)"
+    log_info "9. 本地服务器访问Pod网络连通性检查(兼容性验证)"
+    log_info "10. 本地服务器访问Kubernetes Service连通性检查(NodePort)"
+    log_info "11. Pod访问本地服务器网络连通性检查"
+    log_info "12. Pod访问集群内MySQL连通性检查(混合部署网络错配探测)"
+    log_info "13. Pod访问集群内云主机延迟检查(<${HOST_LATENCY_THRESHOLD_MS}ms, TCP握手近似RTT)"
+    log_info "14. 端到端存储验证(块存储 te-disk: SC->PVC->挂载PVC的Pod起服)"
+    log_info "15. 端到端存储验证(网络存储 te-nfs: SC->PVC->挂载PVC的Pod起服)"
     log_info "    (端到端 SC->PVC->Pod 起服为 CSI 就绪的唯一金标准)"
     echo ""
 
@@ -2626,12 +2718,14 @@ cleanup_on_exit() {
     if ! $SCRIPT_COMPLETED; then
         # 兼容旧测试资源(nginx-test)与新探测资源(np-probe-*),按label批量清理
         if kubectl get deployment -n "$NAMESPACE" -l app=nginx-test 2>/dev/null | grep -q . ||
-            kubectl get deployment -n "$NAMESPACE" -l app="${PROBE_PREFIX}" 2>/dev/null | grep -q .; then
+            kubectl get deployment -n "$NAMESPACE" -l app="${PROBE_PREFIX}" 2>/dev/null | grep -q . ||
+            kubectl get service -n "$NAMESPACE" -l app="${PROBE_PREFIX}" 2>/dev/null | grep -q .; then
             log_warning "检测到脚本异常退出，清理残留测试资源(nginx-test/${PROBE_PREFIX}-*)，避免弹性池遗留计费节点..."
             kubectl delete deployment -n "$NAMESPACE" -l app=nginx-test --force --grace-period=0 &>/dev/null
             kubectl delete deployment -n "$NAMESPACE" -l app="${PROBE_PREFIX}" --force --grace-period=0 &>/dev/null
             kubectl delete pods -n "$NAMESPACE" -l app=nginx-test --force --grace-period=0 &>/dev/null
             kubectl delete pods -n "$NAMESPACE" -l app="${PROBE_PREFIX}" --force --grace-period=0 &>/dev/null
+            kubectl delete service -n "$NAMESPACE" -l app="${PROBE_PREFIX}" --ignore-not-found &>/dev/null
         fi
         # 端到端存储验证残留(te-csi-check Pod/PVC): PVC 残留会持续占用并计费底层云盘, 务必清理
         if kubectl get pvc -n "$NAMESPACE" -l app=te-csi-check 2>/dev/null | grep -q . ||
