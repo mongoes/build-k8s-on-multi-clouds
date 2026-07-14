@@ -83,6 +83,9 @@ APP_CONFIG_FILE="/data/home/ta/base_server_ta/application.yml"
 HOST_LATENCY_THRESHOLD_MS=50
 # 延迟采样次数(取均值, 削峰抖动)。TCP 握手计时近似 RTT(略高于 ICMP 但同量级)。
 HOST_LATENCY_SAMPLES=5
+# Endpoint 出现后，kube-proxy/CNI 将 Service 规则同步至数据面的最长等待时间。
+# Endpoint 就绪不代表 ClusterIP/NodePort 在每个节点上已立即可用。
+SERVICE_DATA_PLANE_RETRY_TIMEOUT=30
 
 # 端到端存储验证 PVC 请求容量。各云块存储有最小容量下限且不一:腾讯 CBS [10,32000]、
 # 火山 ESSD/阿里 cloud_essd(默认PL1) 等下限 10~20 GiB; 请求过小(如 1Gi)会被云 API 拒
@@ -90,6 +93,11 @@ HOST_LATENCY_SAMPLES=5
 # 非 CSI 故障。取 20Gi 可一次性越过全部云下限(阿里 PL1 的 20 是最高门槛); 盘随测试几分钟
 # 即删, 瞬时计费可忽略。AWS gp3 下限仅 1Gi, 取 20 同样合规。
 E2E_PVC_SIZE="20Gi"
+
+# 华为CCE文件存储的人工VPC ID兜底。正常情况下脚本从内置 csi-nas 的
+# everest.io/share-access-to 自动读取；仅自动读取失败时使用本变量。
+# 用法: HUAWEI_CCE_VPC_ID='<vpc-uuid>' bash k8sAvailCheck.sh
+HUAWEI_CCE_VPC_ID="${HUAWEI_CCE_VPC_ID:-}"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -1482,12 +1490,12 @@ ensure_iptables_for_pod_cidr() {
         log_warning "iptables规则持久化失败(service iptables save)，重启后可能失效，请手动确认"
 
     log_success "本机iptables已放行Pod网段: ${pod_cidr}"
-    log_error "请将cloud.intranet.segment=${pod_cidr}策略持久化到install.properties中确保全集群内网放行！"
+    log_warning "建议将cloud.intranet.segment=${pod_cidr}策略持久化到install.properties中确保全集群内网放行！"
 
     # 分布式集群提示：除ta1外若存在其他ta节点，本脚本不自动处理，提醒用户在install.properties配置Pod网段
     local ta_hosts_count=$(grep -E -c '[[:space:]]ta[0-9]+([[:space:]]|$)' /etc/hosts 2>/dev/null)
     if [[ "${ta_hosts_count:-0}" -gt 1 ]]; then
-        log_error "检测到分布式集群环境(本脚本仅放行了本机ta1的iptables)，请务必在install.properties中配置 cloud.intranet.segment=${pod_cidr} 持久化放行全集群内网！"
+        log_warning "检测到分布式集群环境(本脚本仅放行了本机ta1的iptables)，建议在install.properties中配置 cloud.intranet.segment=${pod_cidr} 持久化放行全集群内网！"
     fi
 
     return 0
@@ -1517,6 +1525,35 @@ _capture_service_diagnostics() {
         kubectl get endpointslice -n "$NAMESPACE" -l "kubernetes.io/service-name=${service_name}" -o yaml 2>&1
     } >"$detail"
     log_error "Service诊断已存盘: ${detail}"
+}
+
+# 等待 Endpoint 控制器之后的 kube-proxy/CNI 数据面同步。成功条件与原探测一致：HTTP 200
+# 且 nginx 首页特征存在；每次失败均保留最后一次输出供诊断文件引用。
+curl_service_with_retry() {
+    local stage="$1" start="$SECONDS" interval=2
+    local deadline=$((SECONDS + SERVICE_DATA_PLANE_RETRY_TIMEOUT))
+    local elapsed remaining sleep_seconds
+    shift
+    SERVICE_CURL_BODY=""
+    SERVICE_CURL_RC=1
+    SERVICE_CURL_ATTEMPTS=0
+    while :; do
+        SERVICE_CURL_BODY=$("$@" 2>&1)
+        SERVICE_CURL_RC=$?
+        ((SERVICE_CURL_ATTEMPTS++))
+        if [[ $SERVICE_CURL_RC -eq 0 && "$SERVICE_CURL_BODY" == *"Welcome to nginx!"* ]]; then
+            return 0
+        fi
+        elapsed=$((SECONDS - start))
+        remaining=$((deadline - SECONDS))
+        if [[ $remaining -le 0 ]]; then
+            return 1
+        fi
+        log_info "等待Service数据面同步(${stage}): 已等待${elapsed}s/${SERVICE_DATA_PLANE_RETRY_TIMEOUT}s，exit_code=${SERVICE_CURL_RC}"
+        sleep_seconds=$interval
+        ((sleep_seconds > remaining)) && sleep_seconds=$remaining
+        sleep "$sleep_seconds"
+    done
 }
 
 # 为指定节点池创建临时 NodePort Service，先验证集群内 Service，再验证 NodePort 和 ta1 入口。
@@ -1577,8 +1614,10 @@ EOF_SERVICE
     fi
 
     stage_file="${ARTIFACT_DIR}/curl_service_${service_name}_clusterip.txt"
-    body=$(kubectl exec "$POD_NAME" -n "$NAMESPACE" -- curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://${cluster_ip}:80/" 2>&1); rc=$?
-    printf 'stage=集群内Service(ClusterIP)\nexit_code=%s\n%s\n' "$rc" "$body" >"$stage_file"
+    curl_service_with_retry "集群内Service(ClusterIP)" kubectl exec "$POD_NAME" -n "$NAMESPACE" -- curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://${cluster_ip}:80/"
+    rc=$SERVICE_CURL_RC
+    body=$SERVICE_CURL_BODY
+    printf 'stage=集群内Service(ClusterIP)\nattempts=%s\nexit_code=%s\n%s\n' "$SERVICE_CURL_ATTEMPTS" "$rc" "$body" >"$stage_file"
     if [[ $rc -ne 0 || "$body" != *"Welcome to nginx!"* ]]; then
         log_error "节点池[${pname}]集群内Service(ClusterIP)异常: ${cluster_ip}:80，NodePort入口测试无意义"
         _capture_service_diagnostics "$service_name"
@@ -1587,8 +1626,10 @@ EOF_SERVICE
     log_success "节点池[${pname}]集群内Service(ClusterIP)正常: ${cluster_ip}:80"
 
     stage_file="${ARTIFACT_DIR}/curl_service_${service_name}_pod_nodeport.txt"
-    body=$(kubectl exec "$POD_NAME" -n "$NAMESPACE" -- curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://${node_ip}:${node_port}/" 2>&1); rc=$?
-    printf 'stage=Pod内访问NodePort\nexit_code=%s\n%s\n' "$rc" "$body" >"$stage_file"
+    curl_service_with_retry "Pod内访问NodePort" kubectl exec "$POD_NAME" -n "$NAMESPACE" -- curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://${node_ip}:${node_port}/"
+    rc=$SERVICE_CURL_RC
+    body=$SERVICE_CURL_BODY
+    printf 'stage=Pod内访问NodePort\nattempts=%s\nexit_code=%s\n%s\n' "$SERVICE_CURL_ATTEMPTS" "$rc" "$body" >"$stage_file"
     if [[ $rc -ne 0 || "$body" != *"Welcome to nginx!"* ]]; then
         log_error "节点池[${pname}]Pod内访问NodePort失败: ${node_ip}:${node_port}，请排查NodePort数据面、kube-proxy或CNI"
         _capture_service_diagnostics "$service_name"
@@ -1598,8 +1639,10 @@ EOF_SERVICE
 
     log_info "测试本地服务器 -> NodePort Service: ${node_ip}:${node_port} -> ${service_name} -> 节点池[${pname}]探测Pod"
     stage_file="${ARTIFACT_DIR}/curl_service_${service_name}_ta1_nodeport.txt"
-    body=$(curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://${node_ip}:${node_port}/" 2>&1); rc=$?
-    printf 'stage=ta1访问NodePort\nexit_code=%s\n%s\n' "$rc" "$body" >"$stage_file"
+    curl_service_with_retry "ta1访问NodePort" curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://${node_ip}:${node_port}/"
+    rc=$SERVICE_CURL_RC
+    body=$SERVICE_CURL_BODY
+    printf 'stage=ta1访问NodePort\nattempts=%s\nexit_code=%s\n%s\n' "$SERVICE_CURL_ATTEMPTS" "$rc" "$body" >"$stage_file"
     if [[ $rc -eq 0 && "$body" == *"Welcome to nginx!"* ]]; then
         log_success "节点池[${pname}]本地服务器访问Kubernetes Service正常(Node=${node_ip}, NodePort=${node_port})"
         return 0
@@ -1609,7 +1652,6 @@ EOF_SERVICE
     _capture_service_diagnostics "$service_name"
     return 1
 }
-
 
 test_pod_to_localhost_connectivity() {
     log_step "Pod访问本地服务器网络连通性检查"
@@ -1869,12 +1911,11 @@ run_network_checks_per_pool() {
         fi
     fi
 
-    # iptables 持久化重要项: 若探测期间发现 Pod 网段与本机不在同一/8(已本机临时放行),
-    # 标记为[重要]后续动作——必须在 install.properties 持久化 cloud.intranet.segment,
-    # 否则全集群/重启后内网未放行。红色高亮但不计入失败。
+    # iptables 持久化提醒: 若探测期间发现 Pod 网段与本机不在同一/8(已本机临时放行),
+    # 以黄色关注项提示在 install.properties 持久化 cloud.intranet.segment。
     if [[ -n "$IPTABLES_PERSIST_CIDR" ]]; then
-        record_result "Pod网段iptables放行(install.properties持久化)" "IMPORTANT" \
-            "【重要提醒】Pod IP(${IPTABLES_PERSIST_POD_IP})与本机IP(${IPTABLES_PERSIST_LOCAL_IP})不在同一/8网段，请将 cloud.intranet.segment=${IPTABLES_PERSIST_CIDR} 持久化到 install.properties 确保全集群内网放行！"
+        record_result "Pod网段iptables放行(install.properties持久化)" "WARN" \
+            "Pod IP(${IPTABLES_PERSIST_POD_IP})与本机IP(${IPTABLES_PERSIST_LOCAL_IP})不在同一/8网段，建议将 cloud.intranet.segment=${IPTABLES_PERSIST_CIDR} 持久化到 install.properties 确保全集群内网放行"
     fi
 
     log_info "清理探测Deployment/Service(弹性池节点将被autoscaler缩回0，请关注计费窗口)..."
@@ -2220,7 +2261,7 @@ volumeBindingMode: WaitForFirstConsumer
 EOF
         ;;
     *)
-        log_warning "未知云平台(${cloud_platform})，无法自动创建StorageClass，请手动配置默认SC: te-disk"
+        log_error "未知云平台(${cloud_platform})，无法自动创建StorageClass，请手动配置默认SC: te-disk"
         return 1
         ;;
     esac
@@ -2243,26 +2284,104 @@ EOF
 # 各云 K8S 都需要一个基于网络存储(NFS/文件存储)的 SC, 统一命名为 te-nfs, 供网络存储端到端验证。
 # 两类处置:
 #   A. 客户在云控制台创建(阿里ACK/腾讯TKE/火山VKE): 脚本只 kubectl get sc te-nfs 确认存在,
-#      存在即进端到端测试; 不存在则打印该平台参考模版并记 WARN(不自动建, 依赖控制台侧 NAS/CFS 资源)。
+#      存在即进端到端测试; 不存在则打印该平台参考模版并记 FAIL(不自动建, 依赖控制台侧 NAS/CFS 资源)。
 #   B. 脚本侧创建:
 #      - 内置K8S(nfs-provisioner)/华为CCE(everest nas): 模版自洽, 直接 kubectl apply 自动创建;
 #        华为 te-nfs 依赖 VPCEP, 端到端不可用时由 verify 段追加 VPCEP 提示。
-#      - AWS(efs): 依赖控制台返回的 fileSystemId, 无法自动获取, 打印模版供手动填充创建, 记 WARN。
-#      - Google(GCP): 模版待补充(TODO), 记 SKIP。
+#      - AWS(efs): 依赖控制台返回的 fileSystemId, 无法自动获取, 打印模版供手动填充创建, 记 FAIL。
+#      - Google(GCP): 模版待补充(TODO), 记 FAIL。
 # 返回 0 表示 te-nfs 已存在(可进端到端); 非 0 表示未就绪(打印了模版/TODO), 由 main 据此跳过网络 e2e。
+# 华为CCE: csi-nas 的 share-access-to 是集群VPC ID，是唯一自动权威来源。
+# 当 csi-nas 无法读取时，允许云管理员用 HUAWEI_CCE_VPC_ID 人工兜底。
+capture_huawei_csi_nas_diagnostics() {
+    local level="${1:-error}"
+    _ensure_artifact_dir
+    local detail="${ARTIFACT_DIR}/huawei_csi_nas_diagnostic.txt"
+    {
+        echo "==== Huawei CCE csi-nas VPC ID diagnostics ===="
+        echo "timestamp=$(date '+%Y-%m-%d %H:%M:%S')"
+        echo "==== current-context ===="
+        kubectl config current-context 2>&1
+        echo "==== RBAC: get storageclass/csi-nas ===="
+        kubectl auth can-i get storageclass/csi-nas 2>&1
+        echo "==== StorageClass list ===="
+        kubectl get sc 2>&1
+        echo "==== csi-nas yaml ===="
+        kubectl get sc csi-nas -o yaml 2>&1
+        echo "==== csi-nas describe ===="
+        kubectl describe sc csi-nas 2>&1
+    } >"$detail"
+    if [[ "$level" == "warning" ]]; then
+        log_warning "华为CCE csi-nas诊断物料已保存: ${detail}"
+    else
+        log_error "华为CCE csi-nas诊断物料已保存: ${detail}"
+    fi
+}
+
+get_huawei_cce_vpc_id() {
+    HUAWEI_CCE_VPC_ID_RESOLVED=""
+    HUAWEI_CCE_VPC_ID_SOURCE=""
+    HUAWEI_CCE_VPC_ID_ERROR=""
+    local csi_nas_vpc=""
+    if kubectl get sc csi-nas &>/dev/null; then
+        csi_nas_vpc=$(kubectl get sc csi-nas -o jsonpath='{.parameters.everest\.io/share-access-to}' 2>/dev/null)
+    fi
+
+    if [[ -n "$csi_nas_vpc" ]]; then
+        if [[ -n "$HUAWEI_CCE_VPC_ID" && "$HUAWEI_CCE_VPC_ID" != "$csi_nas_vpc" ]]; then
+            HUAWEI_CCE_VPC_ID_ERROR="csi-nas自动解析的VPC ID与HUAWEI_CCE_VPC_ID不一致"
+            return 1
+        fi
+        HUAWEI_CCE_VPC_ID_RESOLVED="$csi_nas_vpc"
+        HUAWEI_CCE_VPC_ID_SOURCE="csi-nas"
+        return 0
+    fi
+
+    if [[ -n "$HUAWEI_CCE_VPC_ID" ]]; then
+        HUAWEI_CCE_VPC_ID_RESOLVED="$HUAWEI_CCE_VPC_ID"
+        HUAWEI_CCE_VPC_ID_SOURCE="manual"
+        return 0
+    fi
+
+    HUAWEI_CCE_VPC_ID_ERROR="未发现csi-nas或其everest.io/share-access-to为空，且未提供HUAWEI_CCE_VPC_ID"
+    return 1
+}
 ensure_nfs_storageclass() {
     local cloud_platform="$1"
     log_step "网络存储StorageClass就绪检查(te-nfs)"
 
-    # 已存在 te-nfs 则直接就绪(无论客户建还是脚本建, 幂等)
+    if [[ "$cloud_platform" == *huawei* ]]; then
+        if ! get_huawei_cce_vpc_id; then
+            capture_huawei_csi_nas_diagnostics
+            log_error "华为CCE文件存储前置检查失败: ${HUAWEI_CCE_VPC_ID_ERROR}"
+            log_error "请修复csi-nas后重试；若云管理员已确认集群VPC ID，可使用: HUAWEI_CCE_VPC_ID='<vpc-uuid>' bash k8sAvailCheck.sh"
+            record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "无法取得可信VPC ID，未创建或使用te-nfs；详见csi-nas诊断物料"
+            return 1
+        fi
+        if [[ "$HUAWEI_CCE_VPC_ID_SOURCE" == "manual" ]]; then
+            capture_huawei_csi_nas_diagnostics warning
+            log_warning "未能从csi-nas自动读取VPC ID，已使用云管理员提供的HUAWEI_CCE_VPC_ID继续检查"
+        fi
+    fi
+
     if kubectl get sc te-nfs &>/dev/null; then
+        if [[ "$cloud_platform" == *huawei* ]]; then
+            local configured_vpc
+            configured_vpc=$(kubectl get sc te-nfs -o jsonpath='{.parameters.everest\.io/share-access-to}' 2>/dev/null)
+            if [[ "$configured_vpc" != "$HUAWEI_CCE_VPC_ID_RESOLVED" ]]; then
+                log_error "te-nfs share-access-to与内置csi-nas VPC ID不一致(配置=${configured_vpc:-空})，跳过RWX挂载测试"
+                record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "te-nfs VPC授权与解析出的VPC ID不匹配，跳过RWX测试"
+                return 1
+            fi
+            log_success "te-nfs VPC授权校验通过(csi-nas)"
+        fi
         log_success "已存在网络存储StorageClass: te-nfs，无需创建"
         return 0
     fi
 
     case $cloud_platform in
     *alibaba* | *ali*)
-        log_warning "未发现 te-nfs：阿里云ACK 的 te-nfs 需在云控制台(NAS)创建后由集群自动可见，请按下方模版在控制台创建对应 NAS 文件系统与 te-nfs SC(server/挂载点需替换为实际值):"
+        log_error "未发现 te-nfs：阿里云ACK 的 te-nfs 需在云控制台(NAS)创建后由集群自动可见，请按下方模版在控制台创建对应 NAS 文件系统与 te-nfs SC(server/挂载点需替换为实际值):"
         cat <<'EOF' | tee -a "$LOG_FILE"
 ---------------- 阿里云ACK te-nfs.yaml (控制台侧创建, server 需替换为实际 NAS 挂载点) ----------------
 apiVersion: storage.k8s.io/v1
@@ -2280,13 +2399,13 @@ reclaimPolicy: Retain
 volumeBindingMode: Immediate
 --------------------------------------------------------------------------------------------------
 EOF
-        record_result "网络存储SC就绪检查(te-nfs)" "WARN" "未发现 te-nfs，阿里ACK 需控制台创建 NAS 后 te-nfs 才可见，已打印模版"
+        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现 te-nfs，阿里ACK 需控制台创建 NAS 后重试，已打印模版"
         return 1
         ;;
     *tencent*)
-        log_warning "未发现 te-nfs：腾讯云TKE 的 te-nfs 需在云控制台(CFS)创建后由集群自动可见，请按下方模版在控制台创建对应 CFS 与 te-nfs SC(vpcid/subnetid/zone 等需替换为实际值):"
+        log_error "未发现 te-nfs：腾讯云TKE 的 te-nfs 需在云控制台(CFS)创建后由集群自动可见，请按下方模版在控制台创建对应 CFS 与 te-nfs SC(vpcid/subnetid/zone 等需替换为实际值):"
         cat <<'EOF' | tee -a "$LOG_FILE"
----------------- 腾讯云TKE te-nfs.yaml (控制台侧创建, vpcid/subnetid/zone 需替换为实际值) ----------------
+---------------- 腾讯云TKE te-nfs.yaml (腾讯云TKE te-nfs 需要在控制台侧创建, 如下是示例模版，vpcid/subnetid/zone 需替换为实际值) ----------------
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -2304,11 +2423,11 @@ reclaimPolicy: Retain
 volumeBindingMode: Immediate
 ------------------------------------------------------------------------------------------------------
 EOF
-        record_result "网络存储SC就绪检查(te-nfs)" "WARN" "未发现 te-nfs，腾讯TKE 需控制台创建 CFS 后 te-nfs 才可见，已打印模版"
+        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现 te-nfs，腾讯TKE 需控制台创建 CFS 后重试，已打印模版"
         return 1
         ;;
     *volc*)
-        log_warning "未发现 te-nfs：火山云VKE 的 te-nfs 需客户在控制台完成 CSI 安装与 NAS 文件系统创建后由集群自动可见，请按下方模版在控制台创建对应 NAS 与 te-nfs SC(fsId/server 需替换为实际值):"
+        log_error "未发现 te-nfs：火山云VKE 的 te-nfs 需客户在控制台完成 CSI 安装与 NAS 文件系统创建后由集群自动可见，请按下方模版在控制台创建对应 NAS 与 te-nfs SC(fsId/server 需替换为实际值):"
         cat <<'EOF' | tee -a "$LOG_FILE"
 ---------------- 火山云VKE te-nfs.yaml (控制台侧创建, fsId/server 需替换为实际值) ----------------
 apiVersion: storage.k8s.io/v1
@@ -2330,13 +2449,11 @@ reclaimPolicy: Retain
 volumeBindingMode: Immediate
 ------------------------------------------------------------------------------------------------
 EOF
-        record_result "网络存储SC就绪检查(te-nfs)" "WARN" "未发现 te-nfs，火山VKE 需控制台安装CSI+创建NAS 后 te-nfs 才可见，已打印模版"
+        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现 te-nfs，火山VKE 需控制台安装CSI+创建NAS 后重试，已打印模版"
         return 1
         ;;
     *huawei*)
-        # 华为CCE(everest nas): 模版自洽, 自动创建。但依赖 VPCEP 配置, 端到端不可用时由 verify 段追加 VPCEP 提示。
-        log_info "创建华为云CCE 网络存储StorageClass: te-nfs (everest nas, SFS3.0)"
-        cat <<'EOF' | kubectl apply -f -
+        cat <<EOF_HUAWEI_NFS | kubectl apply -f -
 allowVolumeExpansion: true
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -2347,16 +2464,16 @@ parameters:
   csi.storage.k8s.io/fstype: nfs
   everest.io/sfs-version: sfs3.0
   everest.io/share-access-level: rw
-  everest.io/share-access-to: b35d40d7-1d27-4914-beb9-79c8f3a31174
+  everest.io/share-access-to: ${HUAWEI_CCE_VPC_ID_RESOLVED}
+  everest.io/share-is-public: "false"
 provisioner: everest-csi-provisioner
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
-EOF
-        log_warning "华为CCE te-nfs 依赖 VPCEP(VPC 终端节点)配置才能正常挂载；若稍后网络存储端到端测试不可用，请先确认 VPCEP 是否已配置"
+EOF_HUAWEI_NFS
         ;;
     *aws*)
         # AWS EFS: 依赖控制台返回的 fileSystemId, 无法自动获取, 打印模版供手动填充创建。
-        log_warning "未发现 te-nfs：AWS EKS 的 te-nfs(EFS)依赖控制台返回的文件系统ID(fileSystemId)，无法自动创建。请在EFS控制台创建文件系统并获取 fileSystemId(形如 fs-00ca782a22033a2xx)后，填充下方模版并手动 kubectl apply:"
+        log_error "未发现 te-nfs：AWS EKS 的 te-nfs(EFS)依赖控制台返回的文件系统ID(fileSystemId)，无法自动创建。请在EFS控制台创建文件系统并获取 fileSystemId(形如 fs-00ca782a22033a2xx)后，填充下方模版并手动 kubectl apply:"
         cat <<'EOF' | tee -a "$LOG_FILE"
 ---------------- AWS EKS te-nfs.yaml (请替换 fileSystemId 后手动创建) ----------------
 kind: StorageClass
@@ -2371,13 +2488,13 @@ parameters:
 reclaimPolicy: Retain
 -----------------------------------------------------------------------------------
 EOF
-        record_result "网络存储SC就绪检查(te-nfs)" "WARN" "未发现 te-nfs，AWS EFS 依赖控制台 fileSystemId，请填充模版后手动创建"
+        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现 te-nfs，AWS EFS 依赖控制台 fileSystemId，请填充模版后手动创建并重试"
         return 1
         ;;
     *google*)
         # TODO: Google GCP 网络存储(Filestore/GCS FUSE) te-nfs 模版待补充, 下次完善
-        log_warning "Google GCP 网络存储 te-nfs 模版暂缺(待办项)，本次跳过其创建与端到端验证，后续补充完善"
-        record_result "网络存储SC就绪检查(te-nfs)" "SKIP" "Google GCP te-nfs 模版待补充(TODO)，后续完善"
+        log_error "Google GCP 网络存储 te-nfs 模版暂缺，文件存储可用性检查未完成"
+        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "Google GCP te-nfs 模版待补充，文件存储可用性未完成"
         return 1
         ;;
     vmware | kvm | qemu | baremetal)
@@ -2399,8 +2516,8 @@ volumeBindingMode: Immediate
 EOF
         ;;
     *)
-        log_warning "未知云平台(${cloud_platform})，无法自动创建网络存储SC，请手动配置 te-nfs"
-        record_result "网络存储SC就绪检查(te-nfs)" "WARN" "未知云平台，请手动配置 te-nfs"
+        log_error "未知云平台(${cloud_platform})，无法自动创建网络存储SC，请手动配置 te-nfs"
+        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "未知云平台，未能验证te-nfs"
         return 1
         ;;
     esac
@@ -2412,6 +2529,7 @@ EOF
         return 0
     else
         log_error "网络存储StorageClass(te-nfs)创建失败，请检查网络存储 CSI 插件是否正常运行"
+        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "te-nfs 创建后未发现StorageClass，请检查网络存储 CSI 插件"
         return 1
     fi
 }
@@ -2759,7 +2877,7 @@ main() {
     if ensure_storageclass "$cloud_platform"; then
         record_result "StorageClass就绪检查" "PASS" "默认StorageClass(te-disk)就绪"
     else
-        record_result "StorageClass就绪检查" "WARN" "默认StorageClass未就绪，请确认CSI插件与手动配置指引"
+        record_result "StorageClass就绪检查" "FAIL" "默认StorageClass未就绪，请确认CSI插件与手动配置指引"
     fi
 
     # 网络存储SC(te-nfs)就绪检查: 客户控制台建(阿里/腾讯/火山)只确认存在, 脚本侧建(内置K8S/华为/AWS)按平台处置。
@@ -2770,7 +2888,7 @@ main() {
         record_result "网络存储SC就绪检查(te-nfs)" "PASS" "网络存储StorageClass(te-nfs)已就绪"
     else
         nfs_ready=0
-        # WARN/SKIP 已由 ensure_nfs_storageclass 内部按平台登记, 此处不重复登记
+        # FAIL 已由 ensure_nfs_storageclass 内部按平台登记, 此处不重复登记
     fi
 
     # 平台专属附加项(CSI 之外): 腾讯 imc-operator、AWS auto_build_nodepool。其余平台无附加项。
@@ -2807,7 +2925,7 @@ main() {
     if verify_storage_e2e "te-disk" "块存储 te-disk RWO" "te-csi-check-disk" "ReadWriteOnce"; then
         record_result "端到端存储验证(块存储 te-disk, RWO)" "PASS" "RWO PVC动态供给、挂载与单Pod读写成功"
     else
-        record_result "端到端存储验证(块存储 te-disk, RWO)" "WARN" "te-disk 缺失或RWO PVC未Bound、挂载或读写失败，请排查块存储CSI"
+        record_result "端到端存储验证(块存储 te-disk, RWO)" "FAIL" "te-disk 缺失或RWO PVC未Bound、挂载或读写失败，请排查块存储CSI"
     fi
 
     # 文件存储 te-nfs: RWX 基础读写 + 条件性的跨节点共享读写验证。
@@ -2825,10 +2943,10 @@ main() {
             elif verify_nfs_rwx_cross_node "te-nfs" "te-csi-check-nfs-rwx" "$nfs_hint"; then
                 record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "PASS" "Writer/Reader位于不同节点，跨节点共享读写成功"
             else
-                record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "WARN" "跨节点RWX挂载或共享读写失败，请查看测试物料与describe${nfs_hint:+(${nfs_hint})}"
+                record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "FAIL" "跨节点RWX挂载或共享读写失败，请查看测试物料与describe${nfs_hint:+(${nfs_hint})}"
             fi
         else
-            record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "WARN" "RWX PVC未Bound、挂载或单Pod读写失败，请排查文件存储CSI${nfs_hint:+(${nfs_hint})}"
+            record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "FAIL" "RWX PVC未Bound、挂载或单Pod读写失败，请排查文件存储CSI${nfs_hint:+(${nfs_hint})}"
             record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "SKIP" "RWX基础验证未通过，跳过跨节点共享验证"
         fi
     else
