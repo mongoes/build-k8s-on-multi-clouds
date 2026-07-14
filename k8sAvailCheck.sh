@@ -2392,15 +2392,52 @@ EOF
 #   CSIDriver 对象不阻断动态供给(腾讯 TKE 实证: CFS-only 集群无 .cbs 对象, CBS PVC 照样
 #   Bound 并被业务用 18 天), 按平台写死驱动/组件关键字的 grep 只增误报与噪声。
 #   故不再做组件级预检查, 直接以端到端建 PVC 为准。
-# CSI 控制器就绪仅证明"组件在跑"；本函数进一步用默认 te- StorageClass 真实创建 PVC，
-# 并起一个挂载该 PVC 的 Pod。使用了 PVC 的 Pod 能 Running，即等价于:
-#   PVC 已 Bound(动态供给成功) + 卷 attach/mount 成功 == 底层 CSI 存储端到端就绪可用。
-# 注: 默认 SC 多为 WaitForFirstConsumer，PVC 须由 Pod 调度触发绑定，故 PVC 与 Pod 一并创建。
+# 显式按 StorageClass 与 accessMode 验证存储，不回退至其他默认 SC。
+# 单 Pod 读写用于验证 PVC 供给、挂载及实际可写性；RWX 跨节点共享由独立函数验证。
+_storage_e2e_cleanup() {
+    local pvc="$1"
+    shift
+    local pod
+    for pod in "$@"; do
+        kubectl delete pod "$pod" -n "$NAMESPACE" --force --grace-period=0 --ignore-not-found &>/dev/null
+    done
+    kubectl delete pvc "$pvc" -n "$NAMESPACE" --ignore-not-found &>/dev/null
+}
+
+_storage_e2e_capture_diagnostics() {
+    local pvc="$1" prefix="$2"
+    shift 2
+    local detail="${ARTIFACT_DIR}/describe_storage_${prefix}.txt" pod
+    {
+        echo "==== PVC ${pvc} ===="
+        kubectl describe pvc "$pvc" -n "$NAMESPACE" 2>&1
+        for pod in "$@"; do
+            echo "==== Pod ${pod} ===="
+            kubectl describe pod "$pod" -n "$NAMESPACE" 2>&1
+        done
+    } >"$detail"
+    log_error "排查详情(describe)已存盘: ${detail}"
+}
+
 _apply_csi_check_pod() {
-    local pod="$1" pvc="$2" image="$3"
+    # 参数: pod pvc image role test_label; role=reader 时强制与 writer 分布到不同节点。
+    local pod="$1" pvc="$2" image="$3" role="${4:-single}" test_label="${5:-storage-e2e}"
+    local anti_affinity=""
+    if [[ "$role" == "reader" ]]; then
+        anti_affinity="
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app: te-csi-check
+            e2e-test: ${test_label}
+            e2e-role: writer
+        topologyKey: kubernetes.io/hostname"
+    fi
     _ensure_artifact_dir
     local manifest="${ARTIFACT_DIR}/${pod}.yaml"
-    cat >"$manifest" <<EOF
+    cat >"$manifest" <<EOF_POD
 apiVersion: v1
 kind: Pod
 metadata:
@@ -2408,10 +2445,13 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     app: te-csi-check
-spec:
+    e2e-test: ${test_label}
+    e2e-role: ${role}
+spec:${anti_affinity}
   containers:
   - name: csi-check
     image: ${image}
+    command: ["/bin/sh", "-c", "sleep 3600"]
     volumeMounts:
     - name: data
       mountPath: /data
@@ -2432,38 +2472,43 @@ spec:
     key: node.k8s.te/billing-mode
     operator: Equal
     value: spot
-EOF
+EOF_POD
     kubectl apply -f "$manifest" >/dev/null 2>&1
 }
 
+_wait_for_storage_pod() {
+    local pod="$1" timeout="${2:-240}" elapsed=0 interval=10
+    while [[ $elapsed -lt $timeout ]]; do
+        local phase wreason
+        phase=$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null)
+        wreason=$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null)
+        [[ "$phase" == "Running" ]] && return 0
+        if [[ "$wreason" == "ErrImagePull" || "$wreason" == "ImagePullBackOff" ]]; then
+            log_error "${IMAGE_PULL_FAIL_HINT}"
+            return 1
+        fi
+        sleep "$interval"
+        ((elapsed += interval))
+    done
+    return 1
+}
+
 verify_storage_e2e() {
-    # 参数: $1=SC名(空则取默认SC, 用于块存储te-disk); $2=类别标签(如"块存储"/"网络存储");
-    #       $3=资源名前缀(隔离两次运行的PVC/Pod); $4=失败时附加提示(可空, 如华为VPCEP提示)
-    local want_sc="$1" category="${2:-块存储}" res_prefix="${3:-te-csi-check}" extra_hint="${4:-}"
-    log_step "端到端存储验证(${category}: SC->PVC->Pod挂载)"
+    # 参数: StorageClass 类别 资源前缀 accessMode 失败附加提示。
+    local storage_class="$1" category="$2" res_prefix="$3" access_mode="$4" extra_hint="${5:-}"
+    local pvc_name="${res_prefix}-pvc" pod_name="${res_prefix}-pod" image="${NGINX_IMAGE}"
+    local token="storage-e2e-${RUN_TS}-${RANDOM}" token_file="/data/.${res_prefix}-token"
+    log_step "端到端存储验证(${category}: ${access_mode} PVC->Pod挂载->读写)"
     ensure_namespace
 
-    local default_sc="$want_sc"
-    if [[ -z "$default_sc" ]]; then
-        # 未指定SC(块存储): 取默认 SC(由 ensure_storageclass 确保, 通常为 te-disk)
-        default_sc=$(kubectl get sc -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{"\n"}{end}' 2>/dev/null | head -1)
-    fi
-    if [[ -z "$default_sc" ]]; then
-        log_warning "未发现可用于${category}验证的 StorageClass，跳过端到端存储验证(请先确保 CSI 与 SC 就绪)"
+    if ! kubectl get sc "$storage_class" &>/dev/null; then
+        log_warning "未发现目标StorageClass ${storage_class}，不回退至其他默认SC，跳过本项验证"
         return 1
     fi
-    log_info "使用 StorageClass: ${default_sc}"
 
-    local pvc_name="${res_prefix}-pvc"
-    local pod_name="${res_prefix}-pod"
-    local image="${NGINX_IMAGE}"
-
-    # 清理可能的历史残留(幂等)
-    kubectl delete pod "$pod_name" -n "$NAMESPACE" --force --grace-period=0 &>/dev/null
-    kubectl delete pvc "$pvc_name" -n "$NAMESPACE" --ignore-not-found &>/dev/null
-
+    _storage_e2e_cleanup "$pvc_name" "$pod_name"
     _ensure_artifact_dir
-    cat >"${ARTIFACT_DIR}/${pvc_name}.yaml" <<EOF
+    cat >"${ARTIFACT_DIR}/${pvc_name}.yaml" <<EOF_PVC
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -2471,77 +2516,124 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     app: te-csi-check
+    e2e-test: ${res_prefix}
 spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: ${default_sc}
+  accessModes: [${access_mode}]
+  storageClassName: ${storage_class}
   resources:
     requests:
       storage: ${E2E_PVC_SIZE}
-EOF
-    kubectl apply -f "${ARTIFACT_DIR}/${pvc_name}.yaml" >/dev/null 2>&1
-    _apply_csi_check_pod "$pod_name" "$pvc_name" "$image"
+EOF_PVC
+    if ! kubectl apply -f "${ARTIFACT_DIR}/${pvc_name}.yaml" >/dev/null 2>&1; then
+        log_error "创建${access_mode} PVC失败: ${pvc_name}"
+        _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$pod_name"
+        return 1
+    fi
+    _apply_csi_check_pod "$pod_name" "$pvc_name" "$image" "single" "$res_prefix"
 
-    log_info "等待 PVC 绑定 + Pod 启动(动态供给+attach 通常 1~3 分钟)..."
-    local timeout=240 elapsed=0 interval=10
-    local pod_ready=false
-    while [[ $elapsed -lt $timeout ]]; do
-        local phase=$(kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null)
-        local wreason=$(kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null)
-        if [[ "$phase" == "Running" ]]; then
-            pod_ready=true
-            break
-        fi
-        # 镜像拉取失败 -> 镜像统一来自 docker-ta.thinkingdata.cn, 无备用仓库可回退。
-        # 直接强提示(大概率容器集群网络策略未放行该仓库)并停止等待, 避免把镜像问题误判为存储问题。
-        if [[ "$wreason" == "ErrImagePull" || "$wreason" == "ImagePullBackOff" ]]; then
-            log_error "  ${IMAGE_PULL_FAIL_HINT}"
-            break
-        fi
-        sleep $interval
-        ((elapsed += interval))
-    done
-
-    local pvc_phase=$(kubectl get pvc "$pvc_name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null)
-
-    if $pod_ready; then
-        log_success "端到端存储验证通过(${category}): PVC[${pvc_name}]=${pvc_phase}，挂载 PVC 的 Pod 已 Running —— 底层 CSI ${category}就绪可用"
-    else
-        # 先落盘 describe(下面按 PVC 的 Events 区分根因, 复用其输出)
-        local pvc_desc="${ARTIFACT_DIR}/describe_pvc_${pvc_name}.txt"
-        local pod_desc="${ARTIFACT_DIR}/describe_pod_${pod_name}.txt"
-        kubectl describe pvc "$pvc_name" -n "$NAMESPACE" >"$pvc_desc" 2>&1
-        kubectl describe pod "$pod_name" -n "$NAMESPACE" >"$pod_desc" 2>&1
-
-        if [[ "$pvc_phase" != "Bound" ]]; then
-            # PVC 未 Bound: 从 Events 区分根因, 避免把"测试参数不合规"或"调度未触发"误报成 CSI 故障。
-            # (SC 默认 WaitForFirstConsumer, PVC 须由 Pod 调度触发绑定; 节点 cordon / 弹性池冷启动慢也会卡在此。)
-            if grep -Eq "ProvisioningFailed|failed to provision" "$pvc_desc"; then
-                # ProvisioningFailed 再细分: 若是云盘 API 的参数越界(容量/规格不合规), 说明 CSI provisioner
-                # 已正常 watch 并调到云 API、只是被参数拒绝 —— 这恰证明 CSI 链路健康, 是测试 yaml 不贴合
-                # 云平台特性(如腾讯 CBS 最小10Gi、火山/阿里 ESSD 下限), 非底层服务异常。
-                if grep -Eiq "size is invalid|invalid.*size|InvalidVolumeSize|InvalidArgument|invalid.*parameter|disk size" "$pvc_desc"; then
-                    log_warning "PVC[${pvc_name}] 未 Bound: Events 为云盘 API 参数越界(容量/规格不合规) —— CSI provisioner 已正常调用云 API 仅被参数拒绝, 属测试参数不贴合云平台特性、非 CSI 故障。请调大 E2E_PVC_SIZE(当前 ${E2E_PVC_SIZE})或核对 SC 规格后重试"
-                else
-                    log_warning "PVC[${pvc_name}] 未 Bound (当前: ${pvc_phase:-未知})，Events 含 ProvisioningFailed 且非参数越界 —— 动态供给真失败，请排查 CSI controller/provisioner"
-                fi
-            elif grep -Eq "FailedScheduling|WaitForFirstConsumer|waiting for first consumer" "$pvc_desc"; then
-                log_warning "PVC[${pvc_name}] 未 Bound (当前: ${pvc_phase:-未知})，Events 指向 Pod 未调度(FailedScheduling/WaitForFirstConsumer) —— 属调度未触发或 ${timeout}s 超时(节点 cordon/弹性池冷启动慢)，非 CSI 供给故障，请排查 Pod 可调度性"
-            else
-                log_warning "PVC[${pvc_name}] 未 Bound (当前: ${pvc_phase:-未知})，未从 Events 命中明确签名，请查 describe 存盘排查供给/调度"
-            fi
-        else
-            log_warning "PVC 已 Bound 但挂载 PVC 的 Pod 未 Running，卷 attach/mount 可能异常或镜像不可达，详见 describe 存盘"
-        fi
+    if ! _wait_for_storage_pod "$pod_name"; then
+        log_warning "${category} PVC未Bound或挂载Pod未Running"
+        _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$pod_name"
         [[ -n "$extra_hint" ]] && log_error "  ${extra_hint}"
-        log_error "排查详情(describe)已存盘: ${pvc_desc} 与 ${pod_desc}"
-        log_error "测试物料 yaml 已存盘: ${ARTIFACT_DIR}/${pvc_name}.yaml 与 ${ARTIFACT_DIR}/${pod_name}.yaml，可用 kubectl apply -f 复现"
+        _storage_e2e_cleanup "$pvc_name" "$pod_name"
+        return 1
     fi
 
-    # 清理(reclaimPolicy=Delete 时底层卷随 PVC 删除一并回收; Retain 的网络存储卷需按需在控制台清理)
-    kubectl delete pod "$pod_name" -n "$NAMESPACE" --force --grace-period=0 &>/dev/null
-    kubectl delete pvc "$pvc_name" -n "$NAMESPACE" --ignore-not-found &>/dev/null
+    if ! kubectl exec "$pod_name" -n "$NAMESPACE" -- sh -c "printf '%s\\n' '${token}' > '${token_file}'" >/dev/null 2>&1; then
+        log_error "${category} Pod已挂载PVC但写入校验文件失败"
+        _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$pod_name"
+        _storage_e2e_cleanup "$pvc_name" "$pod_name"
+        return 1
+    fi
+    local read_token
+    read_token=$(kubectl exec "$pod_name" -n "$NAMESPACE" -- sh -c "cat '${token_file}'" 2>/dev/null)
+    if [[ "$read_token" != "$token" ]]; then
+        log_error "${category} Pod已挂载PVC但读取校验文件失败"
+        _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$pod_name"
+        _storage_e2e_cleanup "$pvc_name" "$pod_name"
+        return 1
+    fi
 
-    $pod_ready && return 0 || return 1
+    log_success "${category}验证通过: ${storage_class}/${access_mode} PVC已挂载且单Pod读写成功"
+    _storage_e2e_cleanup "$pvc_name" "$pod_name"
+    return 0
+}
+
+verify_nfs_rwx_cross_node() {
+    # 参数: StorageClass 资源前缀 失败附加提示。调用方负责确保至少两个可调度节点。
+    local storage_class="$1" res_prefix="$2" extra_hint="${3:-}"
+    local pvc_name="${res_prefix}-pvc" writer="${res_prefix}-writer" reader="${res_prefix}-reader" image="${NGINX_IMAGE}"
+    local token="rwx-e2e-${RUN_TS}-${RANDOM}" token_file="/data/.${res_prefix}-token"
+    local writer_node reader_node read_token
+    log_step "端到端存储验证(文件存储 te-nfs: RWX跨节点共享读写)"
+    ensure_namespace
+
+    _storage_e2e_cleanup "$pvc_name" "$writer" "$reader"
+    _ensure_artifact_dir
+    cat >"${ARTIFACT_DIR}/${pvc_name}.yaml" <<EOF_RWX_PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${pvc_name}
+  namespace: ${NAMESPACE}
+  labels:
+    app: te-csi-check
+    e2e-test: ${res_prefix}
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ${storage_class}
+  resources:
+    requests:
+      storage: ${E2E_PVC_SIZE}
+EOF_RWX_PVC
+    if ! kubectl apply -f "${ARTIFACT_DIR}/${pvc_name}.yaml" >/dev/null 2>&1; then
+        log_error "创建RWX跨节点验证PVC失败: ${pvc_name}"
+        _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$writer" "$reader"
+        return 1
+    fi
+
+    _apply_csi_check_pod "$writer" "$pvc_name" "$image" "writer" "$res_prefix"
+    if ! _wait_for_storage_pod "$writer"; then
+        log_error "RWX Writer Pod未能挂载并启动"
+        _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$writer" "$reader"
+        [[ -n "$extra_hint" ]] && log_error "  ${extra_hint}"
+        _storage_e2e_cleanup "$pvc_name" "$writer" "$reader"
+        return 1
+    fi
+    writer_node=$(kubectl get pod "$writer" -n "$NAMESPACE" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+    if ! kubectl exec "$writer" -n "$NAMESPACE" -- sh -c "printf '%s\\n' '${token}' > '${token_file}'" >/dev/null 2>&1; then
+        log_error "RWX Writer Pod挂载成功但写入共享文件失败"
+        _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$writer" "$reader"
+        _storage_e2e_cleanup "$pvc_name" "$writer" "$reader"
+        return 1
+    fi
+
+    _apply_csi_check_pod "$reader" "$pvc_name" "$image" "reader" "$res_prefix"
+    if ! _wait_for_storage_pod "$reader"; then
+        log_error "RWX Reader Pod未能在不同节点挂载并启动"
+        _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$writer" "$reader"
+        [[ -n "$extra_hint" ]] && log_error "  ${extra_hint}"
+        _storage_e2e_cleanup "$pvc_name" "$writer" "$reader"
+        return 1
+    fi
+    reader_node=$(kubectl get pod "$reader" -n "$NAMESPACE" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+    if [[ -z "$writer_node" || -z "$reader_node" || "$writer_node" == "$reader_node" ]]; then
+        log_error "RWX Writer/Reader未分布到不同节点(writer=${writer_node:-未知}, reader=${reader_node:-未知})"
+        _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$writer" "$reader"
+        _storage_e2e_cleanup "$pvc_name" "$writer" "$reader"
+        return 1
+    fi
+    read_token=$(kubectl exec "$reader" -n "$NAMESPACE" -- sh -c "cat '${token_file}'" 2>/dev/null)
+    if [[ "$read_token" != "$token" ]]; then
+        log_error "RWX Reader未读取到Writer写入的正确内容，跨节点共享读写失败"
+        _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$writer" "$reader"
+        _storage_e2e_cleanup "$pvc_name" "$writer" "$reader"
+        return 1
+    fi
+
+    log_success "te-nfs RWX跨节点共享验证通过: Writer=${writer_node}, Reader=${reader_node}"
+    _storage_e2e_cleanup "$pvc_name" "$writer" "$reader"
+    return 0
 }
 
 # ==================== 云平台特性检查函数(CSI 之外的平台专属附加项) ====================
@@ -2613,8 +2705,9 @@ main() {
     log_info "11. Pod访问本地服务器网络连通性检查"
     log_info "12. Pod访问集群内MySQL连通性检查(混合部署网络错配探测)"
     log_info "13. Pod访问集群内云主机延迟检查(<${HOST_LATENCY_THRESHOLD_MS}ms, TCP握手近似RTT)"
-    log_info "14. 端到端存储验证(块存储 te-disk: SC->PVC->挂载PVC的Pod起服)"
-    log_info "15. 端到端存储验证(网络存储 te-nfs: SC->PVC->挂载PVC的Pod起服)"
+    log_info "14. 端到端存储验证(块存储 te-disk, RWO: PVC->单Pod挂载->读写)"
+    log_info "15. 端到端存储验证(文件存储 te-nfs, RWX: PVC->单Pod挂载->读写)"
+    log_info "16. 端到端存储验证(文件存储 te-nfs, RWX跨节点共享读写)"
     log_info "    (端到端 SC->PVC->Pod 起服为 CSI 就绪的唯一金标准)"
     echo ""
 
@@ -2680,26 +2773,37 @@ main() {
     # 对每个就绪节点池的 Pod 做双向网络连通性测试, 完成后清理探测资源。结果由函数内部登记。
     run_network_checks_per_pool
 
-    # 端到端存储验证(块存储 te-disk): 用默认 SC 真实创建 PVC + 挂载它的 Pod, Pod 能起服即证明底层 CSI 块存储就绪
-    if verify_storage_e2e "" "块存储" "te-csi-check-disk"; then
-        record_result "端到端存储验证(块存储 te-disk)" "PASS" "PVC动态供给+卷挂载成功，底层CSI块存储就绪"
+    # 块存储验证固定针对 te-disk，不依赖其他默认 StorageClass。
+    if verify_storage_e2e "te-disk" "块存储 te-disk RWO" "te-csi-check-disk" "ReadWriteOnce"; then
+        record_result "端到端存储验证(块存储 te-disk, RWO)" "PASS" "RWO PVC动态供给、挂载与单Pod读写成功"
     else
-        record_result "端到端存储验证(块存储 te-disk)" "WARN" "PVC未Bound或挂载Pod未就绪，使用PVC的应用请排查块存储CSI"
+        record_result "端到端存储验证(块存储 te-disk, RWO)" "WARN" "te-disk 缺失或RWO PVC未Bound、挂载或读写失败，请排查块存储CSI"
     fi
 
-    # 端到端存储验证(网络存储 te-nfs): 仅当 te-nfs 已就绪时执行; 华为需 VPCEP, 失败时追加提示。
+    # 文件存储 te-nfs: RWX 基础读写 + 条件性的跨节点共享读写验证。
     if [[ $nfs_ready -eq 1 ]]; then
         local nfs_hint=""
         case $cloud_platform in
         *huawei*) nfs_hint="华为CCE te-nfs 依赖 VPCEP(VPC 终端节点)配置，若失败请先确认 VPCEP 是否已正确配置" ;;
         esac
-        if verify_storage_e2e "te-nfs" "网络存储" "te-csi-check-nfs" "$nfs_hint"; then
-            record_result "端到端存储验证(网络存储 te-nfs)" "PASS" "PVC动态供给+卷挂载成功，底层CSI网络存储就绪"
+        if verify_storage_e2e "te-nfs" "文件存储 te-nfs RWX基础" "te-csi-check-nfs" "ReadWriteMany" "$nfs_hint"; then
+            record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "PASS" "RWX PVC动态供给、挂载与单Pod读写成功"
+            local schedulable_nodes
+            schedulable_nodes=$(kubectl get nodes --no-headers 2>/dev/null | awk '$2 ~ /^Ready/ && $2 !~ /SchedulingDisabled/ {n++} END {print n+0}')
+            if [[ "$schedulable_nodes" -lt 2 ]]; then
+                record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "SKIP" "仅${schedulable_nodes}个可调度节点，无法验证跨节点共享；RWX基础读写已通过"
+            elif verify_nfs_rwx_cross_node "te-nfs" "te-csi-check-nfs-rwx" "$nfs_hint"; then
+                record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "PASS" "Writer/Reader位于不同节点，跨节点共享读写成功"
+            else
+                record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "WARN" "跨节点RWX挂载或共享读写失败，请查看测试物料与describe${nfs_hint:+(${nfs_hint})}"
+            fi
         else
-            record_result "端到端存储验证(网络存储 te-nfs)" "WARN" "te-nfs PVC未Bound或挂载Pod未就绪，请排查网络存储CSI${nfs_hint:+(${nfs_hint})}"
+            record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "WARN" "RWX PVC未Bound、挂载或单Pod读写失败，请排查文件存储CSI${nfs_hint:+(${nfs_hint})}"
+            record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "SKIP" "RWX基础验证未通过，跳过跨节点共享验证"
         fi
     else
-        record_result "端到端存储验证(网络存储 te-nfs)" "SKIP" "te-nfs 未就绪(见网络存储SC就绪检查)，跳过网络存储端到端验证"
+        record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "SKIP" "te-nfs 未就绪(见网络存储SC就绪检查)，跳过RWX验证"
+        record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "SKIP" "te-nfs 未就绪，跳过跨节点共享验证"
     fi
 
     print_summary
