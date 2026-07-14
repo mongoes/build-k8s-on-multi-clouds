@@ -1494,26 +1494,39 @@ ensure_iptables_for_pod_cidr() {
 }
 
 test_localhost_to_pod_connectivity() {
-    log_step "本地服务器访问Pod网络连通性检查"
-    if curl -s -m 10 "http://$POD_IP" | grep -q "Welcome to nginx!"; then
+    log_step "本地服务器访问Pod网络连通性检查(兼容性验证)"
+    if curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://${POD_IP}/" >/dev/null 2>&1; then
         log_success "测试本地服务器访问POD网络正常"
         return 0
-    else
-        log_error "错误：测试本地服务器访问POD网络异常，可能原因："
-        log_error "  1. 本地服务器和K8S绑定的安全组未相互放行所有流量"
-        return 1
     fi
+    log_warning "本地服务器无法直连Pod IP(${POD_IP})，这属于兼容性关注项，可能原因："
+    log_warning "  1. 本地服务器和K8S绑定的安全组未相互放行所有流量"
+    log_warning "  2. K8S CNI未允许直连Pod ip，常见于内置/自建K8S"
+    log_warning "可能影响：这并不意味着无法部署服务，请以下方探测K8S service结果为准；如service探测通过则认为网络通畅，反之则一定不通畅需要检查放行网络安全策略！"
+    return 1
 }
 
-# 为指定节点池的探测Pod创建临时NodePort Service，并从本地服务器验证
-# InternalIP:NodePort -> Service -> 对应节点池探测Pod；不依赖本地服务器直连Pod CIDR。
-test_localhost_to_service_connectivity() {
-    local pname="$1"
-    local service_name="${PROBE_PREFIX}-${pname}-svc"
-    local manifest="${ARTIFACT_DIR}/${service_name}.yaml"
-    local pod_node node_ip node_port endpoint_ips elapsed=0
+_capture_service_diagnostics() {
+    local service_name="$1" detail="${ARTIFACT_DIR}/describe_service_${1}.txt"
+    {
+        echo "==== Service ${service_name} ===="
+        kubectl describe service "$service_name" -n "$NAMESPACE" 2>&1
+        echo "==== Endpoints ${service_name} ===="
+        kubectl get endpoints "$service_name" -n "$NAMESPACE" -o yaml 2>&1
+        echo "==== EndpointSlices selector service-name=${service_name} ===="
+        kubectl get endpointslice -n "$NAMESPACE" -l "kubernetes.io/service-name=${service_name}" -o yaml 2>&1
+    } >"$detail"
+    log_error "Service诊断已存盘: ${detail}"
+}
 
-    log_step "本地服务器访问Kubernetes Service连通性检查"
+# 为指定节点池创建临时 NodePort Service，先验证集群内 Service，再验证 NodePort 和 ta1 入口。
+test_localhost_to_service_connectivity() {
+    local pname="$1" service_name="${PROBE_PREFIX}-${pname}-svc"
+    local manifest="${ARTIFACT_DIR}/${service_name}.yaml"
+    local pod_node node_ip node_port cluster_ip endpoint_ips elapsed=0
+    local body rc stage_file
+
+    log_step "本地服务器访问Kubernetes Service连通性检查(NodePort)"
     _ensure_artifact_dir
     cat >"$manifest" <<EOF_SERVICE
 apiVersion: v1
@@ -1536,46 +1549,64 @@ spec:
       port: 80
       targetPort: 80
 EOF_SERVICE
-
     if ! kubectl apply -f "$manifest" >/dev/null 2>&1; then
         log_error "节点池[${pname}]创建NodePort Service失败: ${service_name}，请检查Service创建RBAC权限"
         return 1
     fi
 
     node_port=$(kubectl get service "$service_name" -n "$NAMESPACE" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)
+    cluster_ip=$(kubectl get service "$service_name" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
     pod_node=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
     node_ip=$(kubectl get node "$pod_node" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null)
-    if [[ -z "$node_port" || -z "$pod_node" || -z "$node_ip" ]]; then
-        log_error "节点池[${pname}]无法获取Service NodePort或探测Pod所在节点InternalIP (service=${service_name}, node=${pod_node:-未知}, port=${node_port:-未知})"
+    if [[ -z "$node_port" || -z "$cluster_ip" || -z "$pod_node" || -z "$node_ip" ]]; then
+        log_error "节点池[${pname}]无法获取Service ClusterIP/NodePort或探测Pod所在节点InternalIP(service=${service_name}, clusterIP=${cluster_ip:-未知}, node=${pod_node:-未知}, port=${node_port:-未知})"
+        _capture_service_diagnostics "$service_name"
         return 1
     fi
 
     while [[ $elapsed -lt 30 ]]; do
         endpoint_ips=$(kubectl get endpoints "$service_name" -n "$NAMESPACE" -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null)
-        if printf '%s\n' "$endpoint_ips" | tr ' ' '\n' | grep -qx "$POD_IP"; then
-            break
-        fi
+        if printf '%s\n' "$endpoint_ips" | tr ' ' '\n' | grep -qx "$POD_IP"; then break; fi
         sleep 2
         ((elapsed += 2))
     done
     if ! printf '%s\n' "$endpoint_ips" | tr ' ' '\n' | grep -qx "$POD_IP"; then
-        log_error "节点池[${pname}]的Service ${service_name} 在30秒内未发现就绪Endpoint(PodIP=${POD_IP})"
-        kubectl describe service "$service_name" -n "$NAMESPACE" >"${ARTIFACT_DIR}/describe_service_${service_name}.txt" 2>&1
-        kubectl get endpoints "$service_name" -n "$NAMESPACE" -o yaml >>"${ARTIFACT_DIR}/describe_service_${service_name}.txt" 2>&1
+        log_error "节点池[${pname}]的Service ${service_name} 在30秒内未发现就绪Endpoint(PodIP=${POD_IP})，无法确认集群内Service正常"
+        _capture_service_diagnostics "$service_name"
         return 1
     fi
 
+    stage_file="${ARTIFACT_DIR}/curl_service_${service_name}_clusterip.txt"
+    body=$(kubectl exec "$POD_NAME" -n "$NAMESPACE" -- curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://${cluster_ip}:80/" 2>&1); rc=$?
+    printf 'stage=集群内Service(ClusterIP)\nexit_code=%s\n%s\n' "$rc" "$body" >"$stage_file"
+    if [[ $rc -ne 0 || "$body" != *"Welcome to nginx!"* ]]; then
+        log_error "节点池[${pname}]集群内Service(ClusterIP)异常: ${cluster_ip}:80，NodePort入口测试无意义"
+        _capture_service_diagnostics "$service_name"
+        return 1
+    fi
+    log_success "节点池[${pname}]集群内Service(ClusterIP)正常: ${cluster_ip}:80"
+
+    stage_file="${ARTIFACT_DIR}/curl_service_${service_name}_pod_nodeport.txt"
+    body=$(kubectl exec "$POD_NAME" -n "$NAMESPACE" -- curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://${node_ip}:${node_port}/" 2>&1); rc=$?
+    printf 'stage=Pod内访问NodePort\nexit_code=%s\n%s\n' "$rc" "$body" >"$stage_file"
+    if [[ $rc -ne 0 || "$body" != *"Welcome to nginx!"* ]]; then
+        log_error "节点池[${pname}]Pod内访问NodePort失败: ${node_ip}:${node_port}，请排查NodePort数据面、kube-proxy或CNI"
+        _capture_service_diagnostics "$service_name"
+        return 1
+    fi
+    log_success "节点池[${pname}]Pod内访问NodePort正常: ${node_ip}:${node_port}"
+
     log_info "测试本地服务器 -> NodePort Service: ${node_ip}:${node_port} -> ${service_name} -> 节点池[${pname}]探测Pod"
-    local body
-    if body=$(curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://${node_ip}:${node_port}/" 2>&1) && [[ "$body" == *"Welcome to nginx!"* ]]; then
+    stage_file="${ARTIFACT_DIR}/curl_service_${service_name}_ta1_nodeport.txt"
+    body=$(curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://${node_ip}:${node_port}/" 2>&1); rc=$?
+    printf 'stage=ta1访问NodePort\nexit_code=%s\n%s\n' "$rc" "$body" >"$stage_file"
+    if [[ $rc -eq 0 && "$body" == *"Welcome to nginx!"* ]]; then
         log_success "节点池[${pname}]本地服务器访问Kubernetes Service正常(Node=${node_ip}, NodePort=${node_port})"
         return 0
     fi
-
     log_error "节点池[${pname}]本地服务器无法访问Kubernetes Service(${node_ip}:${node_port}, service=${service_name})"
-    log_error "请确认ta1到工作节点的NodePort范围已被安全组/防火墙放行，并检查节点路由和Service Endpoint"
-    kubectl describe service "$service_name" -n "$NAMESPACE" >"${ARTIFACT_DIR}/describe_service_${service_name}.txt" 2>&1
-    kubectl get endpoints "$service_name" -n "$NAMESPACE" -o yaml >>"${ARTIFACT_DIR}/describe_service_${service_name}.txt" 2>&1
+    log_error "可能原因：1. 本地服务器和K8S绑定的安全组未相互放行所有流量；2. 本地服务器、K8S Node路由异常，特殊Case可团队内沟通反馈"
+    _capture_service_diagnostics "$service_name"
     return 1
 }
 
@@ -1800,7 +1831,7 @@ run_network_checks_per_pool() {
     elif [[ $l2p_fail -eq 0 ]]; then
         record_result "本地服务器访问Pod网络连通性" "PASS" "${l2p_total}个就绪节点池均连通"
     else
-        record_result "本地服务器访问Pod网络连通性" "FAIL" "${l2p_fail}/${l2p_total}个节点池不通:${l2p_failed_pools# }(疑似安全组未放行)"
+        record_result "本地服务器访问Pod网络连通性" "WARN" "${l2p_fail}/${l2p_total}个节点池无法直连Pod IP:${l2p_failed_pools# }；此为兼容性关注项，请以Kubernetes Service连通性结果为准"
     fi
     if [[ $l2s_total -eq 0 ]]; then
         record_result "本地服务器访问Kubernetes Service连通性" "SKIP" "无可测试的就绪Pod"
@@ -2384,7 +2415,6 @@ EOF
         return 1
     fi
 }
-
 # ==================== 端到端存储验证 (SC -> PVC -> Pod 挂载) ====================
 # CSI 就绪性的唯一金标准是"真实建 PVC + 起挂载它的 Pod"(见下 verify_storage_e2e)。
 # 此前按平台 grep 期望的 CSIDriver 对象名/controller/node DaemonSet 的预检查已删除:
