@@ -7,10 +7,19 @@ require_text() { grep -qF "$1" "$SCRIPT" || fail "missing required text: $1"; }
 forbid_text() { ! grep -qF "$1" "$SCRIPT" || fail "forbidden text remains: $1"; }
 
 require_text 'get_huawei_cce_vpc_id()'
+require_text '检查项说明'
+require_text '集群、节点池与调度能力'
+require_text '存储动态供给、挂载与读写'
+require_text 'Pod、Service/NodePort 与云主机网络连通性'
+require_text '执行期间会在 namespace=debug 创建临时探测资源'
 require_text 'HUAWEI_CCE_VPC_ID'
 require_text 'capture_huawei_csi_nas_diagnostics warning'
 require_text 'SERVICE_DATA_PLANE_RETRY_TIMEOUT=30'
 require_text 'curl_service_with_retry()'
+require_text '_classify_probe_failure()'
+require_text 'image-pull-failed'
+require_text 'scheduling-failed'
+require_text '镜像拉取失败，存储端到端未完成验证'
 require_text 'local deadline=$((SECONDS + SERVICE_DATA_PLANE_RETRY_TIMEOUT))'
 require_text '等待Service数据面同步'
 require_text 'record_result "Pod网段iptables放行(install.properties持久化)" "WARN"'
@@ -76,6 +85,12 @@ kubectl() {
         [[ "${MOCK_APPLY_FAIL:-0}" == 1 ]] && return 1
         cat >"$MOCK_APPLIED_MANIFEST"
         MOCK_TE_NFS_EXISTS=1
+        ;;
+    "get pod storage-image -n debug -o jsonpath={.status.phase}")
+        printf 'Pending'
+        ;;
+    "get pod storage-image -n debug -o jsonpath={.status.containerStatuses[0].state.waiting.reason}")
+        printf 'ImagePullBackOff'
         ;;
     *)
         return 0
@@ -163,5 +178,28 @@ if ! curl_service_with_retry 'mock-service' service_probe; then
     fail 'service data plane should succeed after retry'
 fi
 [[ $SERVICE_CURL_ATTEMPTS -eq 2 ]] || fail 'service data plane should retry once before succeeding'
+
+# 节点池探测必须以当前容器状态优先于历史调度事件，防止镜像失败被误报为调度超时。
+probe_source="$test_tmp/k8sAvailCheck.probe.functions.sh"
+sed -n '/^_classify_probe_failure()/,/^# 探测结果/p' "$SCRIPT" >"$probe_source"
+# shellcheck disable=SC1090
+source "$probe_source"
+[[ "$(_classify_probe_failure 'ImagePullBackOff' 'Warning FailedScheduling: 0/3 nodes are available')" == image-pull-failed ]] || fail 'image pull must take precedence over historical scheduling events'
+[[ "$(_classify_probe_failure '' 'Warning FailedScheduling: 0/3 nodes are available')" == scheduling-failed ]] || fail 'FailedScheduling must have its own terminal state'
+[[ "$(_classify_probe_failure '' "pod didn't trigger scale-up: no node group")" == no-nodepool ]] || fail 'autoscaler refusal must remain no-nodepool'
+[[ "$(_pool_fail_reason image-pull-failed)" == *"镜像拉取失败"* ]] || fail 'image pull must have a dedicated pool failure reason'
+
+# 存储探测镜像失败只能说明未完成存储验证，不能归因为 PVC 或 CSI 故障。
+storage_wait_source="$test_tmp/k8sAvailCheck.storage-wait.functions.sh"
+sed -n '/^_wait_for_storage_pod()/,/^}/p' "$SCRIPT" >"$storage_wait_source"
+# shellcheck disable=SC1090
+source "$storage_wait_source"
+NAMESPACE=debug
+IMAGE_PULL_FAIL_HINT='image pull failed'
+STORAGE_WAIT_REASON=''
+if _wait_for_storage_pod storage-image 1; then
+    fail 'mocked storage image pull must not become ready'
+fi
+[[ "$STORAGE_WAIT_REASON" == image-pull-failed ]] || fail 'storage image pull must be distinguishable from PVC failure'
 
 echo 'PASS: availability-check regression assertions'

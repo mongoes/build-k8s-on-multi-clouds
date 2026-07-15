@@ -1,10 +1,24 @@
 #!/bin/bash
-# K8S就绪可用性确保脚本
-# 功能：确保K8S环境就绪可用，包含：
-#   - kubectl安装与集群连通性检查
-#   - 云平台识别与StorageClass自动创建（腾讯云/阿里云/华为云/AWS/GCP）
-#   - 节点池与节点规格一致性检查
-#   - Pod调度、起服、网络联通性验证
+# 脚本功能：检查K8S基建就绪，可用于数数服务部署
+# 预计耗时：5min
+# 检查项包含：
+#1. kubectl检查
+#2. K8S集群连通性检查
+#3. K8S所属环境检查
+#4. 块存储StorageClass就绪检查(te-disk)
+#5. 网络存储StorageClass就绪检查(te-nfs)
+#6. Pod部署启动检查(并发探测所有节点池)
+#7. 节点池与节点配置检查
+#8. 节点组契约校验(规格/付费类型/污点 vs 池名声明)
+#9. 本地服务器访问Pod网络连通性检查(兼容性验证)
+##10. 本地服务器访问Kubernetes Service连通性检查(NodePort)
+#11. Pod访问本地服务器网络连通性检查
+#12. Pod访问集群内MySQL连通性检查(混合部署网络错配探测)
+#13. Pod访问集群内云主机延迟检查(<50ms, TCP握手近似RTT)
+#14. 端到端存储验证(块存储 te-disk, RWO: PVC->单Pod挂载->读写)
+#15. 端到端存储验证(文件存储 te-nfs, RWX: PVC->单Pod挂载->读写)
+#16. 端到端存储验证(文件存储 te-nfs, RWX跨节点共享读写)
+#    (端到端 SC->PVC->Pod 起服为存储服务就绪的唯一金标准)
 
 # ==================== 配置部分 ====================
 # 本次运行时间戳: 日志与测试物料目录共用同一戳, 便于一一对应
@@ -67,6 +81,8 @@ get_expected_nodepools() {
 # Pod探测就绪总超时(秒)。云资源扩容通常1~2分钟内完成,超过3分钟多半是
 # 节点池异常或未打标签,不再傻等;另结合 Pod events 提前识别"无匹配节点池"。
 POD_PROBE_TIMEOUT=180
+# 最近一次存储探测 Pod 等待失败原因；供结果总览区分镜像前置失败与存储本身失败。
+STORAGE_WAIT_REASON=""
 # 探测Deployment名称前缀,用于统一清理(含EXIT trap兜底)
 PROBE_PREFIX="np-probe"
 # 节点组契约校验: 池实际 capacity 与池名声明规格的相对差值容差。
@@ -959,13 +975,46 @@ _clean_probe_deployments() {
 }
 
 # 节点池未通过状态的可读解释(供失败行附带说明, 帮助用户定位修复方向)
+_classify_probe_failure() {
+    # 参数: 容器当前 waiting.reason、kubectl describe pods 输出。
+    # 容器等待状态优先于历史 Events：ImagePullBackOff 说明 Pod 已调度到节点，不能误报为调度失败。
+    local waiting_reason="$1" pod_desc="$2"
+    case "$waiting_reason" in
+    ErrImagePull | ImagePullBackOff)
+        echo "image-pull-failed"
+        return 0
+        ;;
+    CrashLoopBackOff | CreateContainerConfigError | CreateContainerError | RunContainerError)
+        echo "container-start-failed"
+        return 0
+        ;;
+    esac
+
+    if echo "$pod_desc" | grep -qiE "didn't trigger scale-up|did not trigger scale-up|missing matching nodepool|no matching node group|pod didn't trigger scale-up"; then
+        echo "no-nodepool"
+    elif echo "$pod_desc" | grep -qi "FailedScheduling"; then
+        echo "scheduling-failed"
+    else
+        echo "timeout-unknown"
+    fi
+}
+
 _pool_fail_reason() {
     case "$1" in
-    timeout)
-        echo "存在对应标签的节点池但调度异常(常见为出现预期外的污点/节点NotReady/资源不足)"
+    image-pull-failed)
+        echo "Pod已调度到节点，但探测镜像拉取失败；请检查节点到镜像仓库的公网/专线网络、DNS、镜像仓库认证及TKE镜像缓存"
+        ;;
+    container-start-failed)
+        echo "Pod已调度到节点，但容器启动失败；请查看describe中的容器状态、挂载、配置和运行时错误"
+        ;;
+    scheduling-failed)
+        echo "调度失败；请根据describe Events排查资源不足、未容忍污点、nodeSelector/亲和性或节点不可调度"
         ;;
     no-nodepool)
         echo "autoscaler未匹配到该节点池(常见为未采购创建该池/nodepool-name标签拼写错误)"
+        ;;
+    timeout-unknown)
+        echo "探测超时，未能从Pod状态或Events判定根因；请查看describe排查节点、调度器和容器运行时"
         ;;
     *)
         echo "未知状态"
@@ -1179,12 +1228,11 @@ pod_deploy_check() {
     local interval=10
     while [[ $elapsed -lt $POD_PROBE_TIMEOUT ]]; do
         local all_done=true
-        local image_pull_failing=false
 
         for pname in "${pool_order[@]}"; do
-            # ready / no-nodepool / sibling-skip 为终态, 不再等待
+            # ready / 已归因失败 / sibling-skip 为终态, 不再等待
             case "${POOL_EXIST[$pname]}" in
-            ready | no-nodepool | sibling-skip) continue ;;
+            ready | image-pull-failed | container-start-failed | no-nodepool | sibling-skip) continue ;;
             esac
 
             local phase=$(kubectl get pods -n $NAMESPACE -l probe-pool=${pname} -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
@@ -1209,31 +1257,25 @@ pod_deploy_check() {
                 continue
             fi
 
-            # pending池: 检测该池Pod自身events是否为autoscaler"拒绝扩容/无匹配节点池"。
-            # 仅匹配 autoscaler 明确拒绝的签名(NotTriggerScaleUp),不匹配裸 "0/N nodes are available"
-            # ——后者在弹性池0->1正常扩容等待期间也会出现,会误判健康池。命中则提前判负不再等待。
             local pod_desc=$(kubectl describe pods -n $NAMESPACE -l probe-pool=${pname} 2>/dev/null)
-            if echo "${pod_desc}" | grep -qiE "didn't trigger scale-up|did not trigger scale-up|missing matching nodepool|no matching node group|pod didn't trigger scale-up"; then
+            local failure_state=$(_classify_probe_failure "$waiting_reason" "$pod_desc")
+            if [[ "$failure_state" == "image-pull-failed" || "$failure_state" == "container-start-failed" ]]; then
+                POOL_EXIST[$pname]="$failure_state"
+                log_error "  节点池[${pname}]$(_pool_fail_reason "$failure_state")，停止等待"
+                continue
+            fi
+            # 仅对 autoscaler 明确拒绝的签名提前判负；FailedScheduling 在弹性池0->1时可能是暂态，
+            # 留到超时后再按最终 Events 分类，避免健康弹性池被过早判失败。
+            if [[ "$failure_state" == "no-nodepool" ]]; then
                 POOL_EXIST[$pname]="no-nodepool"
                 log_warning "  节点池[${pname}]无匹配节点池/autoscaler拒绝扩容(疑似未打标签或未采购该池)，停止等待"
                 continue
             fi
 
             all_done=false
-            if [[ "$waiting_reason" == "ErrImagePull" || "$waiting_reason" == "ImagePullBackOff" ]]; then
-                image_pull_failing=true
-            fi
         done
 
         $all_done && break
-
-        # 镜像拉取失败 -> 与实际部署来源(docker-ta.thinkingdata.cn)一致, 无备用仓库可回退。
-        # 拉取失败大概率是容器集群网络策略未放行该仓库, 直接强提示并停止等待(不再切换备用镜像)。
-        if $image_pull_failing; then
-            log_error "  ${IMAGE_PULL_FAIL_HINT}"
-            kubectl get pods -n $NAMESPACE -l app=${PROBE_PREFIX} -o wide >>${LOG_FILE} 2>&1
-            break
-        fi
 
         # 进度按"档"统计就绪(OR 组任一就绪即算该档就绪)
         local ready_slots_now=0 si
@@ -1252,13 +1294,16 @@ pod_deploy_check() {
         log_info "  探测中... 已等待${elapsed}s/${POD_PROBE_TIMEOUT}s (就绪 ${ready_slots_now}/${total_slots} 档)"
     done
 
-    # 未达终态的池标记为timeout(sibling-skip 不算超时),并将describe落盘到测试物料目录便于排查
+    # 未达终态的池在超时后按最终状态/Events精确分类(sibling-skip不算失败),并落盘describe。
     for pname in "${pool_order[@]}"; do
         case "${POOL_EXIST[$pname]}" in
-        ready | no-nodepool | sibling-skip) ;;
+        ready | image-pull-failed | container-start-failed | no-nodepool | sibling-skip) ;;
         *)
-            POOL_EXIST[$pname]="timeout"
-            log_warning "  节点池[${pname}]探测超时: 请确认该池节点的 node.k8s.te/nodepool-name 标签是否存在且拼写与期望池名[${pname}]完全一致(常见为标签拼写错误或未采购该池)"
+            local final_waiting_reason=$(kubectl get pods -n $NAMESPACE -l probe-pool=${pname} \
+                -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null)
+            local final_desc=$(kubectl describe pods -n $NAMESPACE -l probe-pool=${pname} 2>/dev/null)
+            POOL_EXIST[$pname]=$(_classify_probe_failure "$final_waiting_reason" "$final_desc")
+            log_warning "  节点池[${pname}]探测未就绪: $(_pool_fail_reason "${POOL_EXIST[$pname]}")"
             ;;
         esac
     done
@@ -1305,7 +1350,7 @@ pod_deploy_check() {
                 local desc_file="${ARTIFACT_DIR}/describe_pod_${PROBE_PREFIX}-${m}.txt"
                 log_error "  ✗ 节点池[${m}]未通过: 状态=${st} —— $(_pool_fail_reason "$st")"
                 log_error "     排查详情(describe)已存盘: ${desc_file}"
-                [[ "$st" == "timeout" ]] && _diagnose_timeout_pool "$m" "$desc_file"
+                [[ "$st" == "scheduling-failed" || "$st" == "timeout-unknown" ]] && _diagnose_timeout_pool "$m" "$desc_file"
             done
             [[ "$token" == *"|"* ]] && log_error "  (二选一档[${token}]的候选均未就绪，该档判未通过)"
         fi
@@ -2073,7 +2118,7 @@ label_internal_k8s_nodes() {
 #          无法自动获取, 故输出模版供用户拿到 fileSystemId 后手动创建
 ensure_storageclass() {
     local cloud_platform="$1"
-    log_step "StorageClass就绪检查"
+    log_step "块存储StorageClass就绪检查（te-disk）"
 
     # 默认SC统一逻辑: 已有 te-disk 则就绪; 否则按现有默认SC命名决定处置:
     #   - 非 te- 开头(如云厂商内置 alicloud-disk-essd / 客户自建 default 等): 直接初始化(摘注解+建 te-disk)
@@ -2100,7 +2145,7 @@ ensure_storageclass() {
             fi
             if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
                 log_info "用户选择保留现有默认StorageClass(${te_list})，跳过 te-disk 初始化"
-                record_result "StorageClass就绪检查(保留现有默认SC)" "WARN" "保留现有默认SC(${te_list})，未统一为 te-disk，请确认其与业务匹配"
+                record_result "块存储StorageClass就绪检查(保留现有默认SC)" "WARN" "保留现有默认SC(${te_list})，未统一为 te-disk，请确认其与业务匹配"
                 return 0
             fi
             log_info "用户确认重新初始化默认SC为 te-disk"
@@ -2626,12 +2671,14 @@ EOF_POD
 
 _wait_for_storage_pod() {
     local pod="$1" timeout="${2:-240}" elapsed=0 interval=10
+    STORAGE_WAIT_REASON=""
     while [[ $elapsed -lt $timeout ]]; do
         local phase wreason
         phase=$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null)
         wreason=$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null)
         [[ "$phase" == "Running" ]] && return 0
         if [[ "$wreason" == "ErrImagePull" || "$wreason" == "ImagePullBackOff" ]]; then
+            STORAGE_WAIT_REASON="image-pull-failed"
             log_error "${IMAGE_PULL_FAIL_HINT}"
             return 1
         fi
@@ -2680,7 +2727,11 @@ EOF_PVC
     _apply_csi_check_pod "$pod_name" "$pvc_name" "$image" "single" "$res_prefix"
 
     if ! _wait_for_storage_pod "$pod_name"; then
-        log_warning "${category} PVC未Bound或挂载Pod未Running"
+        if [[ "$STORAGE_WAIT_REASON" == "image-pull-failed" ]]; then
+            log_error "${category} 探测镜像拉取失败，存储端到端未完成验证"
+        else
+            log_warning "${category} PVC未Bound或挂载Pod未Running"
+        fi
         _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$pod_name"
         [[ -n "$extra_hint" ]] && log_error "  ${extra_hint}"
         _storage_e2e_cleanup "$pvc_name" "$pod_name"
@@ -2742,7 +2793,11 @@ EOF_RWX_PVC
 
     _apply_csi_check_pod "$writer" "$pvc_name" "$image" "writer" "$res_prefix"
     if ! _wait_for_storage_pod "$writer"; then
-        log_error "RWX Writer Pod未能挂载并启动"
+        if [[ "$STORAGE_WAIT_REASON" == "image-pull-failed" ]]; then
+            log_error "RWX Writer探测镜像拉取失败，存储端到端未完成验证"
+        else
+            log_error "RWX Writer Pod未能挂载并启动"
+        fi
         _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$writer" "$reader"
         [[ -n "$extra_hint" ]] && log_error "  ${extra_hint}"
         _storage_e2e_cleanup "$pvc_name" "$writer" "$reader"
@@ -2758,7 +2813,11 @@ EOF_RWX_PVC
 
     _apply_csi_check_pod "$reader" "$pvc_name" "$image" "reader" "$res_prefix"
     if ! _wait_for_storage_pod "$reader"; then
-        log_error "RWX Reader Pod未能在不同节点挂载并启动"
+        if [[ "$STORAGE_WAIT_REASON" == "image-pull-failed" ]]; then
+            log_error "RWX Reader探测镜像拉取失败，存储端到端未完成验证"
+        else
+            log_error "RWX Reader Pod未能在不同节点挂载并启动"
+        fi
         _storage_e2e_capture_diagnostics "$pvc_name" "$res_prefix" "$writer" "$reader"
         [[ -n "$extra_hint" ]] && log_error "  ${extra_hint}"
         _storage_e2e_cleanup "$pvc_name" "$writer" "$reader"
@@ -2838,12 +2897,19 @@ main() {
     log_info "测试物料/异常详情目录: $ARTIFACT_DIR (测试 yaml 与异常 describe 落盘于此, 资源回收后仍可凭此 kubectl apply -f 复现)"
     echo -e "$(_banner_rule)${NC}"
 
+    echo -e "\n${BOLD}$(_banner_line "检查项说明")${NC}"
+    log_info "本脚本将依次确认以下部署前置能力："
+    log_info "- 集群、节点池与调度能力：kubectl/集群连通性、云环境识别、节点池规格/标签/污点及弹性扩容起服"
+    log_info "- 存储动态供给、挂载与读写：te-disk(RWO)和te-nfs(RWX)的StorageClass、PVC、Pod及跨节点共享验证"
+    log_info "- Pod、Service/NodePort 与云主机网络连通性：本地服务器、Pod、MySQL及云主机间的双向可达性和延迟"
+    log_info "执行期间会在 namespace=debug 创建临时探测资源（Deployment、Service、PVC、Pod），结束后自动清理；测试yaml与诊断信息保留在物料目录。"
+
     echo -e "\n${BOLD}$(_banner_line "检查计划")${NC}"
 
     log_info "1. kubectl检查"
     log_info "2. K8S集群连通性检查"
     log_info "3. K8S所属环境检查"
-    log_info "4. StorageClass就绪检查(块存储 te-disk)"
+    log_info "4. 块存储StorageClass就绪检查(te-disk)"
     log_info "5. 网络存储StorageClass就绪检查(te-nfs)"
     log_info "6. Pod部署启动检查(并发探测所有节点池)"
     log_info "7. 节点池与节点配置检查"
@@ -2875,9 +2941,9 @@ main() {
     # CSI 不再做组件级预检查(SC.provisioner 与 CSIDriver 对象解耦, grep 期望组件只增误报);
     # CSI 就绪由末尾 verify_storage_e2e 端到端真实建 PVC + 起挂载 Pod 作唯一金标准。
     if ensure_storageclass "$cloud_platform"; then
-        record_result "StorageClass就绪检查" "PASS" "默认StorageClass(te-disk)就绪"
+        record_result "块存储StorageClass就绪检查" "PASS" "默认StorageClass(te-disk)就绪"
     else
-        record_result "StorageClass就绪检查" "FAIL" "默认StorageClass未就绪，请确认CSI插件与手动配置指引"
+        record_result "块存储StorageClass就绪检查" "FAIL" "默认StorageClass未就绪，请确认CSI插件与手动配置指引"
     fi
 
     # 网络存储SC(te-nfs)就绪检查: 客户控制台建(阿里/腾讯/火山)只确认存在, 脚本侧建(内置K8S/华为/AWS)按平台处置。
@@ -2924,6 +2990,8 @@ main() {
     # 块存储验证固定针对 te-disk，不依赖其他默认 StorageClass。
     if verify_storage_e2e "te-disk" "块存储 te-disk RWO" "te-csi-check-disk" "ReadWriteOnce"; then
         record_result "端到端存储验证(块存储 te-disk, RWO)" "PASS" "RWO PVC动态供给、挂载与单Pod读写成功"
+    elif [[ "$STORAGE_WAIT_REASON" == "image-pull-failed" ]]; then
+        record_result "端到端存储验证(块存储 te-disk, RWO)" "FAIL" "镜像拉取失败，存储端到端未完成验证；请先检查节点到镜像仓库的网络、DNS、认证或镜像缓存"
     else
         record_result "端到端存储验证(块存储 te-disk, RWO)" "FAIL" "te-disk 缺失或RWO PVC未Bound、挂载或读写失败，请排查块存储CSI"
     fi
@@ -2942,12 +3010,19 @@ main() {
                 record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "SKIP" "仅${schedulable_nodes}个可调度节点，无法验证跨节点共享；RWX基础读写已通过"
             elif verify_nfs_rwx_cross_node "te-nfs" "te-csi-check-nfs-rwx" "$nfs_hint"; then
                 record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "PASS" "Writer/Reader位于不同节点，跨节点共享读写成功"
+            elif [[ "$STORAGE_WAIT_REASON" == "image-pull-failed" ]]; then
+                record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "FAIL" "镜像拉取失败，存储端到端未完成验证；请先检查节点到镜像仓库的网络、DNS、认证或镜像缓存${nfs_hint:+(${nfs_hint})}"
             else
                 record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "FAIL" "跨节点RWX挂载或共享读写失败，请查看测试物料与describe${nfs_hint:+(${nfs_hint})}"
             fi
         else
-            record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "FAIL" "RWX PVC未Bound、挂载或单Pod读写失败，请排查文件存储CSI${nfs_hint:+(${nfs_hint})}"
-            record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "SKIP" "RWX基础验证未通过，跳过跨节点共享验证"
+            if [[ "$STORAGE_WAIT_REASON" == "image-pull-failed" ]]; then
+                record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "FAIL" "镜像拉取失败，存储端到端未完成验证；请先检查节点到镜像仓库的网络、DNS、认证或镜像缓存${nfs_hint:+(${nfs_hint})}"
+                record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "SKIP" "镜像拉取失败，RWX基础存储未完成验证，跳过跨节点共享验证"
+            else
+                record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "FAIL" "RWX PVC未Bound、挂载或单Pod读写失败，请排查文件存储CSI${nfs_hint:+(${nfs_hint})}"
+                record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "SKIP" "RWX基础验证未通过，跳过跨节点共享验证"
+            fi
         fi
     else
         record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "SKIP" "te-nfs 未就绪(见网络存储SC就绪检查)，跳过RWX验证"
