@@ -2239,6 +2239,19 @@ ensure_storageclass() {
     log_step "块存储StorageClass就绪检查（te-disk）"
 
     if [[ "$cloud_platform" == *huawei* ]]; then
+        # 无论 te-disk 是缺失、已符合模板或历史配置，均须先确认 Everest 能安全使用
+        # GPSSD2；版本不可识别时也不能自动创建或迁移 StorageClass。
+        check_huawei_gpssd2_support || true
+        case "$HUAWEI_GPSSD2_SUPPORT" in
+        fail)
+            record_result "华为GPSSD2支持度检查" "FAIL" "Everest版本低于2.4.4，不支持GPSSD2"
+            return 1
+            ;;
+        warn)
+            record_result "华为GPSSD2支持度检查" "WARN" "无法从kubectl可靠识别Everest版本；不自动创建或迁移te-disk"
+            return 2
+            ;;
+        esac
         inspect_huawei_te_disk
         case "$HUAWEI_TE_DISK_STATE" in
         expected)
@@ -2246,14 +2259,6 @@ ensure_storageclass() {
             return 0
             ;;
         legacy)
-            check_huawei_gpssd2_support || true
-            if [[ "$HUAWEI_GPSSD2_SUPPORT" == "fail" ]]; then
-                return 1
-            fi
-            if [[ "$HUAWEI_GPSSD2_SUPPORT" == "warn" ]]; then
-                log_warning "Everest 版本不可识别，保留旧 te-disk，不自动切换到 GPSSD2"
-                return 2
-            fi
             reconcile_huawei_te_disk
             return $?
             ;;
