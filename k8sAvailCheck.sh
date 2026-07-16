@@ -2252,10 +2252,12 @@ ensure_storageclass() {
         legacy)
             check_huawei_gpssd2_support || true
             if [[ "$HUAWEI_GPSSD2_SUPPORT" == "fail" ]]; then
+                record_result "华为GPSSD2支持度检查" "FAIL" "Everest版本低于2.4.4，不支持GPSSD2"
                 return 1
             fi
             if [[ "$HUAWEI_GPSSD2_SUPPORT" == "warn" ]]; then
                 log_warning "Everest 版本不可识别，保留旧 te-disk，不自动切换到 GPSSD2"
+                record_result "华为GPSSD2支持度检查" "WARN" "无法从kubectl可靠识别Everest版本；继续以端到端PVC验证为准"
                 return 2
             fi
             reconcile_huawei_te_disk
@@ -3073,7 +3075,11 @@ main() {
     if [[ $storageclass_rc -eq 0 ]]; then
         record_result "块存储StorageClass就绪检查" "PASS" "默认StorageClass(te-disk)就绪"
     elif [[ $storageclass_rc -eq 2 ]]; then
-        record_result "块存储StorageClass就绪检查" "WARN" "为保护现有华为 te-disk 或因 Everest 版本不可识别，未自动修改StorageClass"
+        if [[ "$cloud_platform" == *huawei* && ( -n "$HUAWEI_TE_DISK_PVCS" || -n "$HUAWEI_TE_DISK_PVS" ) ]]; then
+            record_result "块存储StorageClass就绪检查" "WARN" "发现被PVC/PV依赖的历史te-disk，保留现有盘型以兼容存量应用"
+        else
+            record_result "块存储StorageClass就绪检查" "WARN" "为保护现有华为 te-disk 或因 Everest 版本不可识别，未自动修改StorageClass"
+        fi
     else
         record_result "块存储StorageClass就绪检查" "FAIL" "默认StorageClass未就绪，请确认CSI插件与手动配置指引"
     fi

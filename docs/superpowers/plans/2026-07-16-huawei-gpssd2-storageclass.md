@@ -104,7 +104,7 @@ Expected: `PASS: availability-check regression assertions`.
 - Consumes Task 2 state and return values.
 - Produces precise GPSSD2 status while retaining `verify_storage_e2e "te-disk"` as the final usability check.
 
-- [ ] **Step 1: Wire Huawei handling before generic te-disk early return**
+- [x] **Step 1: Wire Huawei handling before generic te-disk early return**
 
 Record exact outcomes:
 
@@ -116,7 +116,7 @@ record_result "块存储StorageClass就绪检查" "WARN" "发现被PVC/PV依赖�
 
 Do not alter the later `verify_storage_e2e "te-disk"` call.
 
-- [ ] **Step 2: Add mutation-safety assertions**
+- [x] **Step 2: Add mutation-safety assertions**
 
 In the mocked dependency case, capture kubectl calls and assert there is no `apply`, `patch`, or `delete sc te-disk`. In the no-dependency case, assert backup precedes `delete sc te-disk`, followed by GPSSD2 creation. Require the backup filename and GPSSD2 result strings in static assertions.
 
