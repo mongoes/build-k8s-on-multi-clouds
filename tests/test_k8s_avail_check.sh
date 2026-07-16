@@ -202,4 +202,61 @@ if _wait_for_storage_pod storage-image 1; then
 fi
 [[ "$STORAGE_WAIT_REASON" == image-pull-failed ]] || fail 'storage image pull must be distinguishable from PVC failure'
 
+# 所有有效 JDBC MySQL URL 都必须作为目标；同一主机端口仅探测一次，且域名/IP 保持原样。
+mysql_source="$test_tmp/k8sAvailCheck.mysql.functions.sh"
+sed -n '/^parse_mysql_targets()/,/^# ==================== 混合部署: Pod -> 集群内 MySQL TCP 连通性/p' "$SCRIPT" >"$mysql_source"
+log_warning() { MYSQL_WARNINGS="${MYSQL_WARNINGS:-}$*\n"; }
+MYSQL_PROBE_TARGETS=()
+# shellcheck disable=SC1090
+source "$mysql_source"
+
+APP_CONFIG_FILE="$test_tmp/application.yml"
+cat >"$APP_CONFIG_FILE" <<'EOF'
+spring:
+  datasource:
+    url: jdbc:mysql://primary.mysql.example:3306/common?useSSL=false
+hive:
+  metastore:
+    mysql:
+      url: jdbc:mysql://primary.mysql.example:3306/hive?useSSL=false
+secondary:
+  url: "jdbc:mysql://10.10.0.25/report"
+# ignored: jdbc:mysql://commented.mysql.example:3307/ignored
+EOF
+MYSQL_WARNINGS=''
+parse_mysql_targets || fail 'valid JDBC MySQL targets should parse'
+[[ " ${MYSQL_PROBE_TARGETS[*]} " == *' primary.mysql.example:3306 '* ]] || fail 'hostname target must be retained'
+[[ " ${MYSQL_PROBE_TARGETS[*]} " == *' 10.10.0.25:3306 '* ]] || fail 'IP target must retain default port'
+[[ ${#MYSQL_PROBE_TARGETS[@]} -eq 2 ]] || fail 'same host and port must be deduplicated'
+[[ " ${MYSQL_PROBE_TARGETS[*]} " != *' commented.mysql.example:3307 '* ]] || fail 'commented JDBC URL must be ignored'
+
+cat >"$APP_CONFIG_FILE" <<'EOF'
+spring:
+  datasource:
+    url: jdbc:mysql:///missing-host
+EOF
+MYSQL_WARNINGS=''
+if parse_mysql_targets; then
+    fail 'malformed JDBC MySQL URL must fail parsing'
+fi
+[[ "$MYSQL_WARNINGS" == *'无法解析'* ]] || fail 'malformed JDBC URL must report a parse reason'
+
+cat >"$APP_CONFIG_FILE" <<'EOF'
+spring:
+  datasource:
+    username: ta
+EOF
+MYSQL_WARNINGS=''
+if parse_mysql_targets; then
+    fail 'missing JDBC MySQL URL must fail parsing'
+fi
+[[ "$MYSQL_WARNINGS" == *'未找到 jdbc:mysql://'* ]] || fail 'missing JDBC URL must report a parse reason'
+
+require_text 'parse_mysql_targets()'
+require_text 'for mysql_target in "${MYSQL_PROBE_TARGETS[@]}"'
+require_text 'test_pod_to_mysql_connectivity "$mysql_target"'
+require_text 'test_pod_to_host_latency "$mysql_target"'
+forbid_text 'MYSQL_PROBE_IP'
+forbid_text 'MYSQL_HOST_RAW'
+
 echo 'PASS: availability-check regression assertions'

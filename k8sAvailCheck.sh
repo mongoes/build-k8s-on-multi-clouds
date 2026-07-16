@@ -1729,52 +1729,63 @@ test_pod_to_localhost_connectivity() {
 }
 
 # ==================== 混合部署: 解析集群外置 MySQL 探测目标 ====================
-# 从业务配置 application.yml 的 spring.datasource.url 解析 jdbc:mysql://主机名:端口,
-# 由于 Pod 内 DNS 解析不了业务主机名(如 ta3), 用宿主机 /etc/hosts 把主机名翻成 IP,
-# 拼成 IP:PORT 作为 Pod 侧真实探测地址。仅做 TCP 可达探测, 不解析账密、不登录 MySQL。
-# 解析成功置全局 MYSQL_PROBE_IP / MYSQL_PROBE_PORT / MYSQL_HOST_RAW 并返回 0; 失败返回 1。
-MYSQL_PROBE_IP=""
-MYSQL_PROBE_PORT=""
-MYSQL_HOST_RAW=""
-parse_mysql_target() {
+# 逐行扫描 application.yml 中所有非注释 jdbc:mysql:// URL，提取主机:端口并去重。
+# 不读取 /etc/hosts、不预解析 DNS；让每个探测 Pod 直接连接配置原值，以验证其自身
+# 的 DNS、路由和安全组。仅做 TCP 可达探测，不解析账密、不登录 MySQL。
+MYSQL_PROBE_TARGETS=()
+MYSQL_PARSE_ERROR=""
+parse_mysql_targets() {
+    MYSQL_PROBE_TARGETS=()
+    MYSQL_PARSE_ERROR=""
     if [[ ! -r "$APP_CONFIG_FILE" ]]; then
-        log_warning "未找到业务配置文件 ${APP_CONFIG_FILE}, 跳过 Pod->MySQL 相关探测"
+        MYSQL_PARSE_ERROR="未找到业务配置文件 ${APP_CONFIG_FILE}"
+        log_warning "$MYSQL_PARSE_ERROR"
         return 1
     fi
 
-    # 取 datasource.url 行的 jdbc:mysql://host:port 段(容忍前导空格/制表符)。
-    local url
-    url=$(grep -E '^[[:space:]]*url:[[:space:]]*jdbc:mysql://' "$APP_CONFIG_FILE" | head -1)
-    if [[ -z "$url" ]]; then
-        log_warning "${APP_CONFIG_FILE} 的 datasource 段未解析到 jdbc:mysql:// url, 跳过 Pod->MySQL 相关探测"
+    local line remainder hostport host port target target_seen known found=0 invalid=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" == *"jdbc:mysql://"* ]] || continue
+        found=1
+
+        remainder="${line#*jdbc:mysql://}"
+        hostport="${remainder%%/*}"
+        hostport="${hostport%%\?*}"
+        hostport="${hostport%%\"*}"
+        hostport="${hostport%%\'*}"
+        hostport="${hostport//[[:space:]]/}"
+
+        host="${hostport%%:*}"
+        port="${hostport##*:}"
+        [[ "$port" == "$hostport" || -z "$port" ]] && port="3306"
+        if [[ -z "$host" || "$host" == *:* || ! "$port" =~ ^[0-9]+$ ]]; then
+            log_warning "无法解析 MySQL JDBC 地址: ${line}"
+            invalid=1
+            continue
+        fi
+
+        target="${host}:${port}"
+        known=0
+        for target_seen in "${MYSQL_PROBE_TARGETS[@]:-}"; do
+            [[ "$target_seen" == "$target" ]] && known=1 && break
+        done
+        [[ $known -eq 1 ]] || MYSQL_PROBE_TARGETS+=("$target")
+    done <"$APP_CONFIG_FILE"
+
+    if [[ $found -eq 0 ]]; then
+        MYSQL_PARSE_ERROR="${APP_CONFIG_FILE} 中未找到 jdbc:mysql:// 地址"
+    elif [[ $invalid -ne 0 ]]; then
+        MYSQL_PARSE_ERROR="${APP_CONFIG_FILE} 中存在无法解析的 MySQL JDBC 地址"
+    elif [[ ${#MYSQL_PROBE_TARGETS[@]} -eq 0 ]]; then
+        MYSQL_PARSE_ERROR="${APP_CONFIG_FILE} 中未解析到有效 MySQL 探测目标"
+    fi
+    if [[ -n "$MYSQL_PARSE_ERROR" ]]; then
+        log_warning "$MYSQL_PARSE_ERROR"
         return 1
     fi
 
-    # 从 jdbc:mysql://HOST:PORT/db?... 中提取 HOST 与 PORT。
-    local hostport
-    hostport=$(echo "$url" | sed -E 's#.*jdbc:mysql://([^/?]+).*#\1#')
-    MYSQL_HOST_RAW="${hostport%%:*}"
-    local port="${hostport##*:}"
-    [[ "$port" == "$hostport" || -z "$port" ]] && port="3306" # url 未显式带端口时默认 3306
-    MYSQL_PROBE_PORT="$port"
-
-    if [[ -z "$MYSQL_HOST_RAW" ]]; then
-        log_warning "无法从 url 解析 MySQL 主机名(${hostport}), 跳过 Pod->MySQL 相关探测"
-        return 1
-    fi
-
-    # 主机名 -> IP: 容器无法识别业务主机名, 必须用宿主机 /etc/hosts 翻译。
-    # 形如 "10.214.0.239  ta3" 取第一列 IP。精确匹配主机名整词, 避免 ta3 误中 ta30。
-    local ip
-    ip=$(grep -E "[[:space:]]${MYSQL_HOST_RAW}([[:space:]]|\$)" /etc/hosts 2>/dev/null | grep -v '^[[:space:]]*#' | head -1 | awk '{print $1}')
-    if [[ -z "$ip" ]]; then
-        log_warning "在 /etc/hosts 中未找到主机名 ${MYSQL_HOST_RAW} 的 IP 映射, 跳过 Pod->MySQL 相关探测"
-        log_warning "  请确认 /etc/hosts 已配置 ${MYSQL_HOST_RAW} -> MySQL 所在云主机 IP"
-        return 1
-    fi
-    MYSQL_PROBE_IP="$ip"
-
-    log_info "解析到集群外置 MySQL: 配置主机名 ${MYSQL_HOST_RAW}:${MYSQL_PROBE_PORT} -> Pod侧探测地址 ${MYSQL_PROBE_IP}:${MYSQL_PROBE_PORT}"
+    log_info "解析到 ${#MYSQL_PROBE_TARGETS[@]} 个去重后的 MySQL 探测目标: ${MYSQL_PROBE_TARGETS[*]}"
     return 0
 }
 
@@ -1782,28 +1793,30 @@ parse_mysql_target() {
 # 复用就绪 nginx Pod(debian 基础镜像自带 bash, 支持 /dev/tcp), 三次握手成功即判连通。
 # 只验"网络+端口可达"(安全组/路由是否放行), 不登录、不依赖 mysql 客户端。
 test_pod_to_mysql_connectivity() {
+    local mysql_target="$1"
     log_step "Pod访问集群内MySQL连通性检查"
-    log_info "测试从Pod访问MySQL: ${MYSQL_PROBE_IP}:${MYSQL_PROBE_PORT} (配置主机名 ${MYSQL_HOST_RAW})"
+    log_info "测试从Pod访问MySQL: ${mysql_target} (配置原始地址)"
 
     if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- \
-        bash -c "timeout 5 bash -c 'exec 3<>/dev/tcp/${MYSQL_PROBE_IP}/${MYSQL_PROBE_PORT}' 2>/dev/null" &>/dev/null; then
-        log_success "测试Pod访问集群内MySQL正常(TCP ${MYSQL_PROBE_IP}:${MYSQL_PROBE_PORT} 可达)"
+        bash -c "timeout 5 bash -c 'exec 3<>/dev/tcp/${mysql_target%:*}/${mysql_target##*:}' 2>/dev/null" &>/dev/null; then
+        log_success "测试Pod访问集群内MySQL正常(TCP ${mysql_target} 可达)"
         return 0
     else
-        log_error "错误：Pod无法连通集群内MySQL(${MYSQL_PROBE_IP}:${MYSQL_PROBE_PORT})，可能原因："
-        log_error "  1. MySQL所在云主机安全组未放行Pod网段到${MYSQL_PROBE_PORT}端口"
-        log_error "  2. 混合部署下Pod网段与云主机不在同一VPC/路由未打通"
-        log_error "  3. MySQL服务未监听或未对外暴露${MYSQL_PROBE_PORT}端口"
+        log_error "错误：Pod无法连通集群内MySQL(${mysql_target})，可能原因："
+        log_error "  1. Pod DNS 无法解析配置中的 MySQL 域名，或地址不可路由"
+        log_error "  2. MySQL所在云主机安全组未放行Pod网段到目标端口"
+        log_error "  3. MySQL服务未监听或未对外暴露目标端口"
         return 1
     fi
 }
 
 # ==================== 混合部署: Pod -> MySQL 所在云主机延迟 ====================
-# 云主机 IP 即 MySQL 所在主机 IP(同机)。规避 ICMP 常被云安全组拦截, 用对 MySQL 端口
-# 多次 TCP 握手计时取均值近似 RTT, 低于阈值(默认50ms)判通过。Pod 内用 GNU date +%s%N 计时。
+# 规避 ICMP 常被云安全组拦截，对每个 MySQL 目标端口多次 TCP 握手计时取均值近似 RTT，
+# 低于阈值(默认50ms)判通过。Pod 内用 GNU date +%s%N 计时。
 test_pod_to_host_latency() {
+    local mysql_target="$1"
     log_step "Pod访问集群内云主机网络延迟检查"
-    log_info "测试从Pod到云主机 ${MYSQL_PROBE_IP} 的网络延迟(TCP握手近似RTT, ${HOST_LATENCY_SAMPLES}次取均值, 阈值<${HOST_LATENCY_THRESHOLD_MS}ms)"
+    log_info "测试从Pod到MySQL ${mysql_target} 的网络延迟(TCP握手近似RTT, ${HOST_LATENCY_SAMPLES}次取均值, 阈值<${HOST_LATENCY_THRESHOLD_MS}ms)"
 
     # 在 Pod 内循环: 每次 TCP 连 IP:PORT 计纳秒耗时, 成功则累加, 末尾输出 "均值ms 成功次数"。
     local out
@@ -1811,7 +1824,7 @@ test_pod_to_host_latency() {
         total=0; ok=0
         for i in \$(seq 1 ${HOST_LATENCY_SAMPLES}); do
             s=\$(date +%s%N)
-            if timeout 2 bash -c 'exec 3<>/dev/tcp/${MYSQL_PROBE_IP}/${MYSQL_PROBE_PORT}' 2>/dev/null; then
+            if timeout 2 bash -c 'exec 3<>/dev/tcp/${mysql_target%:*}/${mysql_target##*:}' 2>/dev/null; then
                 e=\$(date +%s%N)
                 total=\$((total + (e - s) / 1000000))
                 ok=\$((ok + 1))
@@ -1824,7 +1837,7 @@ test_pod_to_host_latency() {
     local ok_cnt="${out##* }"
 
     if [[ -z "$avg_ms" || "$avg_ms" == "-1" || "${ok_cnt:-0}" -eq 0 ]]; then
-        log_error "错误：Pod到云主机 ${MYSQL_PROBE_IP}:${MYSQL_PROBE_PORT} 全部探测失败，无法测得延迟(端口不可达, 详见连通性检查项)"
+        log_error "错误：Pod到MySQL ${mysql_target} 全部探测失败，无法测得延迟(端口不可达, 详见连通性检查项)"
         HOST_LATENCY_LAST_MS="-1"
         return 1
     fi
@@ -1855,16 +1868,17 @@ run_network_checks_per_pool() {
         return 0
     fi
 
-    # 混合部署探测目标(集群外置 MySQL/云主机)解析一次, 供所有就绪池复用。
-    # 解析失败(无配置文件/无 hosts 映射)则两新项整体 SKIP, 不影响既有双向连通性检查。
+    # 混合部署探测目标(集群外置 MySQL)解析一次, 供所有就绪池复用。
+    # 所有非注释 JDBC MySQL 地址都必须可解析；任一配置异常即两项均 FAIL。
     local mysql_ready=1
-    parse_mysql_target || mysql_ready=0
+    parse_mysql_targets || mysql_ready=0
 
     local pname
     local l2p_total=0 l2p_fail=0 l2s_total=0 l2s_fail=0 p2l_total=0 p2l_fail=0
     local l2p_failed_pools="" l2s_failed_pools="" p2l_failed_pools=""
     local mysql_total=0 mysql_fail=0 lat_total=0 lat_fail=0
     local mysql_failed_pools="" lat_failed_pools="" lat_detail=""
+    local mysql_target
     for pname in $PROBE_READY_POOLS; do
         POD_NAME="${PROBE_POD_NAME[$pname]}"
         POD_IP="${PROBE_POD_IP[$pname]}"
@@ -1894,21 +1908,23 @@ run_network_checks_per_pool() {
             p2l_failed_pools="${p2l_failed_pools} ${pname}"
         }
 
-        # 混合部署两新项: 仅在 MySQL 目标解析成功时逐池执行。
+        # 混合部署两项: 每个就绪节点池均探测所有去重后的 MySQL 目标。
         if [[ $mysql_ready -eq 1 ]]; then
-            ((mysql_total++))
-            test_pod_to_mysql_connectivity || {
-                ((mysql_fail++))
-                mysql_failed_pools="${mysql_failed_pools} ${pname}"
-            }
+            for mysql_target in "${MYSQL_PROBE_TARGETS[@]}"; do
+                ((mysql_total++))
+                test_pod_to_mysql_connectivity "$mysql_target" || {
+                    ((mysql_fail++))
+                    mysql_failed_pools="${mysql_failed_pools} ${pname}->${mysql_target}"
+                }
 
-            ((lat_total++))
-            if test_pod_to_host_latency; then
-                lat_detail="${lat_detail} ${pname}:${HOST_LATENCY_LAST_MS}ms"
-            else
-                ((lat_fail++))
-                lat_failed_pools="${lat_failed_pools} ${pname}(${HOST_LATENCY_LAST_MS}ms)"
-            fi
+                ((lat_total++))
+                if test_pod_to_host_latency "$mysql_target"; then
+                    lat_detail="${lat_detail} ${pname}->${mysql_target}:${HOST_LATENCY_LAST_MS}ms"
+                else
+                    ((lat_fail++))
+                    lat_failed_pools="${lat_failed_pools} ${pname}->${mysql_target}(${HOST_LATENCY_LAST_MS}ms)"
+                fi
+            done
         fi
     done
 
@@ -1935,17 +1951,17 @@ run_network_checks_per_pool() {
         record_result "Pod访问本地服务器网络连通性" "FAIL" "${p2l_fail}/${p2l_total}个节点池不通:${p2l_failed_pools# }(疑似安全组/iptables拦截)"
     fi
 
-    # 混合部署两新项聚合: MySQL 目标未解析则 SKIP(附原因), 否则按各池结果 PASS/FAIL。
+    # 混合部署两项聚合: JDBC MySQL 目标未解析属于配置缺陷，必须 FAIL。
     if [[ $mysql_ready -eq 0 ]]; then
-        record_result "Pod访问集群内MySQL连通性" "SKIP" "未解析到MySQL目标(无${APP_CONFIG_FILE}或/etc/hosts缺主机映射)"
-        record_result "Pod访问集群内云主机延迟(<${HOST_LATENCY_THRESHOLD_MS}ms)" "SKIP" "未解析到MySQL所在云主机IP"
+        record_result "Pod访问集群内MySQL连通性" "FAIL" "MySQL JDBC探测目标解析失败: ${MYSQL_PARSE_ERROR}"
+        record_result "Pod访问集群内云主机延迟(<${HOST_LATENCY_THRESHOLD_MS}ms)" "FAIL" "MySQL JDBC探测目标解析失败，未执行延迟探测"
     else
         if [[ $mysql_total -eq 0 ]]; then
             record_result "Pod访问集群内MySQL连通性" "SKIP" "无可测试的就绪Pod"
         elif [[ $mysql_fail -eq 0 ]]; then
-            record_result "Pod访问集群内MySQL连通性" "PASS" "${mysql_total}个就绪节点池均连通${MYSQL_PROBE_IP}:${MYSQL_PROBE_PORT}"
+            record_result "Pod访问集群内MySQL连通性" "PASS" "${mysql_total}个节点池×MySQL目标组合均连通: ${MYSQL_PROBE_TARGETS[*]}"
         else
-            record_result "Pod访问集群内MySQL连通性" "FAIL" "${mysql_fail}/${mysql_total}个节点池不通${MYSQL_PROBE_IP}:${MYSQL_PROBE_PORT}:${mysql_failed_pools# }(疑似云主机安全组未放行Pod网段)"
+            record_result "Pod访问集群内MySQL连通性" "FAIL" "${mysql_fail}/${mysql_total}个节点池×MySQL目标组合不通:${mysql_failed_pools# }(请检查Pod DNS、路由及安全组)"
         fi
         if [[ $lat_total -eq 0 ]]; then
             record_result "Pod访问集群内云主机延迟(<${HOST_LATENCY_THRESHOLD_MS}ms)" "SKIP" "无可测试的就绪Pod"
