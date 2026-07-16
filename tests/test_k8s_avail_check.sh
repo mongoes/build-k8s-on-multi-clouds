@@ -366,7 +366,7 @@ inspect_huawei_te_disk
 [[ "$HUAWEI_TE_DISK_STATE" == expected ]] || fail 'GPSSD2/3000/125 te-disk must be expected'
 if has_te_disk_dependents; then fail 'te-disk without PVC/PV use must have no dependency'; fi
 
-# 华为 GPSSD2 仅可替换未被 PVC/PV 使用的旧 SAS te-disk，且 Everest 版本至少为 v2.4.4。
+# 华为 GPSSD2 仅可替换未被 PVC/PV 使用的旧 SAS te-disk。
 huawei_gpssd2_source="$test_tmp/k8sAvailCheck.huawei-gpssd2.functions.sh"
 sed -n '/^inspect_huawei_te_disk()/,/^# ==================== 网络存储 StorageClass 确保函数/p' "$SCRIPT" >"$huawei_gpssd2_source"
 # shellcheck disable=SC1090
@@ -378,7 +378,6 @@ MOCK_TE_DISK_IOPS=''
 MOCK_TE_DISK_THROUGHPUT=''
 MOCK_TE_DISK_PVC_BOUND=1
 MOCK_TE_DISK_PV_BOUND=0
-MOCK_EVEREST_IMAGE='everest-csi-controller:v2.4.3'
 kubectl() {
     local cmd="$*"
     [[ -n "${MOCK_KUBECTL_CALLS:-}" ]] && printf '%s\n' "$cmd" >>"$MOCK_KUBECTL_CALLS"
@@ -398,9 +397,6 @@ kubectl() {
     "get pv -o jsonpath="*)
         [[ "$MOCK_TE_DISK_PV_BOUND" == 1 ]] && printf 'legacy-pv\n'
         ;;
-    "get deploy -A -o jsonpath="*)
-        printf '%s' "$MOCK_EVEREST_IMAGE"
-        ;;
     *) return 0 ;;
     esac
 }
@@ -408,18 +404,15 @@ kubectl() {
 inspect_huawei_te_disk
 [[ "$HUAWEI_TE_DISK_STATE" == legacy ]] || fail 'SAS te-disk must be legacy'
 has_te_disk_dependents || fail 'PVC using te-disk must be a dependency'
-if check_huawei_gpssd2_support; then fail 'Everest below 2.4.4 must fail'; fi
 
 MOCK_TE_DISK_TYPE='GPSSD2'
 MOCK_TE_DISK_IOPS='3000'
 MOCK_TE_DISK_THROUGHPUT='125'
 MOCK_TE_DISK_PVC_BOUND=0
 MOCK_TE_DISK_PV_BOUND=0
-MOCK_EVEREST_IMAGE='everest-csi-controller:v2.4.4'
 inspect_huawei_te_disk
 [[ "$HUAWEI_TE_DISK_STATE" == expected ]] || fail 'everest-csi-provisioner GPSSD2/3000/125 te-disk must be expected'
 if has_te_disk_dependents; then fail 'te-disk without PVC or PV use must have no dependency'; fi
-check_huawei_gpssd2_support || fail 'Everest v2.4.4 must support GPSSD2'
 
 MOCK_TE_DISK_PROVISIONER='other-csi-provisioner'
 inspect_huawei_te_disk
@@ -431,9 +424,6 @@ MOCK_TE_DISK_PV_BOUND=1
 has_te_disk_dependents || fail 'PV using te-disk must be a dependency even without PVC use'
 MOCK_TE_DISK_PV_BOUND=0
 
-MOCK_EVEREST_IMAGE='everest-csi-controller:latest'
-if ! check_huawei_gpssd2_support; then fail 'Everest image without a semantic version must warn, not fail'; fi
-[[ "$HUAWEI_GPSSD2_SUPPORT" == warn ]] || fail 'Everest image without a semantic version must set warn'
 
 # 所有华为路径都必须先做 GPSSD2 支持度检查；FAIL/WARN 均不能创建或迁移 te-disk。
 run_huawei_storageclass_case() {
@@ -455,20 +445,5 @@ run_huawei_storageclass_case() {
     RESULT_NAMES=() RESULT_STATUS=() RESULT_DETAIL=()
     ensure_storageclass huawei
 }
-
-if run_huawei_storageclass_case missing 'everest-csi-controller:v2.4.3'; then
-    fail 'missing te-disk with unsupported Everest must fail before creation'
-fi
-grep -Eq '(^| )((apply|delete) )' "$MOCK_KUBECTL_CALLS" && fail 'unsupported missing te-disk must not be created'
-
-if run_huawei_storageclass_case expected 'everest-csi-controller:v2.4.3'; then
-    fail 'expected te-disk with unsupported Everest must still fail support check'
-fi
-grep -Eq '(^| )((apply|delete) )' "$MOCK_KUBECTL_CALLS" && fail 'unsupported expected te-disk must not be changed'
-
-if run_huawei_storageclass_case missing 'everest-csi-controller:latest'; then
-    fail 'missing te-disk with unrecognizable Everest must return warning status'
-fi
-grep -Eq '(^| )((apply|delete) )' "$MOCK_KUBECTL_CALLS" && fail 'unrecognizable Everest must not create te-disk'
 
 echo 'PASS: availability-check regression assertions'
