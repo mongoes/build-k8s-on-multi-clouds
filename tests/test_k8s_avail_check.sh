@@ -259,4 +259,66 @@ require_text 'test_pod_to_host_latency "$mysql_target"'
 forbid_text 'MYSQL_PROBE_IP'
 forbid_text 'MYSQL_HOST_RAW'
 
+# 华为 GPSSD2 仅可替换未被 PVC/PV 使用的旧 SAS te-disk，且 Everest 版本至少为 v2.4.4。
+huawei_gpssd2_source="$test_tmp/k8sAvailCheck.huawei-gpssd2.functions.sh"
+sed -n '/^inspect_huawei_te_disk()/,/^# ==================== StorageClass 确保函数/p' "$SCRIPT" >"$huawei_gpssd2_source"
+# shellcheck disable=SC1090
+source "$huawei_gpssd2_source"
+
+MOCK_TE_DISK_PROVISIONER='everest-csi-provisioner'
+MOCK_TE_DISK_TYPE='SAS'
+MOCK_TE_DISK_IOPS=''
+MOCK_TE_DISK_THROUGHPUT=''
+MOCK_TE_DISK_PVC_BOUND=1
+MOCK_TE_DISK_PV_BOUND=0
+MOCK_EVEREST_IMAGE='everest-csi-controller:v2.4.3'
+kubectl() {
+    local cmd="$*"
+    case "$cmd" in
+    "get sc te-disk -o jsonpath="*)
+        case "$cmd" in
+        *'.provisioner'*) printf '%s' "$MOCK_TE_DISK_PROVISIONER" ;;
+        *'disk-volume-type'*) printf '%s' "$MOCK_TE_DISK_TYPE" ;;
+        *'disk-iops'*) printf '%s' "$MOCK_TE_DISK_IOPS" ;;
+        *'disk-throughput'*) printf '%s' "$MOCK_TE_DISK_THROUGHPUT" ;;
+        esac
+        ;;
+    "get pvc -A -o jsonpath="*)
+        [[ "$MOCK_TE_DISK_PVC_BOUND" == 1 ]] && printf 'debug/legacy-pvc\n'
+        ;;
+    "get pv -o jsonpath="*)
+        [[ "$MOCK_TE_DISK_PV_BOUND" == 1 ]] && printf 'legacy-pv\n'
+        ;;
+    "get deploy -A -o jsonpath="*)
+        printf '%s' "$MOCK_EVEREST_IMAGE"
+        ;;
+    *) return 0 ;;
+    esac
+}
+
+inspect_huawei_te_disk
+[[ "$HUAWEI_TE_DISK_STATE" == legacy ]] || fail 'SAS te-disk must be legacy'
+has_te_disk_dependents || fail 'PVC using te-disk must be a dependency'
+if check_huawei_gpssd2_support; then fail 'Everest below 2.4.4 must fail'; fi
+
+MOCK_TE_DISK_TYPE='GPSSD2'
+MOCK_TE_DISK_IOPS='3000'
+MOCK_TE_DISK_THROUGHPUT='125'
+MOCK_TE_DISK_PVC_BOUND=0
+MOCK_TE_DISK_PV_BOUND=0
+MOCK_EVEREST_IMAGE='everest-csi-controller:v2.4.4'
+inspect_huawei_te_disk
+[[ "$HUAWEI_TE_DISK_STATE" == expected ]] || fail 'everest-csi-provisioner GPSSD2/3000/125 te-disk must be expected'
+if has_te_disk_dependents; then fail 'te-disk without PVC or PV use must have no dependency'; fi
+check_huawei_gpssd2_support || fail 'Everest v2.4.4 must support GPSSD2'
+
+MOCK_TE_DISK_TYPE='SAS'
+MOCK_TE_DISK_PV_BOUND=1
+has_te_disk_dependents || fail 'PV using te-disk must be a dependency even without PVC use'
+MOCK_TE_DISK_PV_BOUND=0
+
+MOCK_EVEREST_IMAGE='everest-csi-controller:latest'
+check_huawei_gpssd2_support || fail 'Everest image without a semantic version must warn, not fail'
+[[ "$HUAWEI_GPSSD2_SUPPORT" == warn ]] || fail 'Everest image without a semantic version must set warn'
+
 echo 'PASS: availability-check regression assertions'
