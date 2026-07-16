@@ -312,13 +312,18 @@ inspect_huawei_te_disk
 if has_te_disk_dependents; then fail 'te-disk without PVC or PV use must have no dependency'; fi
 check_huawei_gpssd2_support || fail 'Everest v2.4.4 must support GPSSD2'
 
+MOCK_TE_DISK_PROVISIONER='other-csi-provisioner'
+inspect_huawei_te_disk
+[[ "$HUAWEI_TE_DISK_STATE" == legacy ]] || fail 'GPSSD2 parameters with a non-Everest provisioner must be legacy'
+MOCK_TE_DISK_PROVISIONER='everest-csi-provisioner'
+
 MOCK_TE_DISK_TYPE='SAS'
 MOCK_TE_DISK_PV_BOUND=1
 has_te_disk_dependents || fail 'PV using te-disk must be a dependency even without PVC use'
 MOCK_TE_DISK_PV_BOUND=0
 
 MOCK_EVEREST_IMAGE='everest-csi-controller:latest'
-check_huawei_gpssd2_support || fail 'Everest image without a semantic version must warn, not fail'
+if ! check_huawei_gpssd2_support; then fail 'Everest image without a semantic version must warn, not fail'; fi
 [[ "$HUAWEI_GPSSD2_SUPPORT" == warn ]] || fail 'Everest image without a semantic version must set warn'
 
 echo 'PASS: availability-check regression assertions'
