@@ -207,6 +207,23 @@ _ensure_artifact_dir() {
     fi
 }
 
+# 将失败检查的名称和详情单独保存，避免最终汇总截断排障线索。文件名仅使用安全字符，
+# 详情保留在文件内容中而不参与路径构造。
+write_failure_artifact() {
+    local check_name="$1" detail="${2:-}" safe_name artifact
+    _ensure_artifact_dir
+    safe_name=$(printf '%s' "$check_name" | LC_ALL=C tr -cs 'A-Za-z0-9_.-' '_')
+    safe_name="${safe_name#_}"
+    safe_name="${safe_name%_}"
+    [[ -n "$safe_name" ]] || safe_name="failure"
+    artifact="${ARTIFACT_DIR}/failure_${safe_name}_${RUN_TS}_${RANDOM}.txt"
+    {
+        printf 'check=%s\n' "$check_name"
+        printf 'detail=%s\n' "$detail"
+    } >"$artifact"
+    log_info "失败检查详情已保存至: $artifact"
+}
+
 # ==================== 检查结果登记表 ====================
 # 全程不阻断: 每个检查项执行完调用 record_result 登记结果(不中途 exit),
 # 脚本末尾由 print_summary 统一输出所有检查项的成功/失败总览。
@@ -218,6 +235,7 @@ record_result() {
     RESULT_NAMES+=("$1")
     RESULT_STATUS+=("$2")
     RESULT_DETAIL+=("${3:-}")
+    [[ "$2" == "FAIL" ]] && write_failure_artifact "$1" "${3:-}"
 }
 
 # 打印最终汇总总览(彩色), 并统计 PASS/WARN/FAIL/IMPORTANT/SKIP 数量
@@ -1792,8 +1810,65 @@ parse_mysql_targets() {
 # ==================== 混合部署: Pod -> 集群内 MySQL TCP 连通性 ====================
 # 复用就绪 nginx Pod(debian 基础镜像自带 bash, 支持 /dev/tcp), 三次握手成功即判连通。
 # 只验"网络+端口可达"(安全组/路由是否放行), 不登录、不依赖 mysql 客户端。
+MYSQL_PROBE_FAILURE_REASON=""
+capture_mysql_probe_diagnostics() {
+    local pool="$1" mysql_target="$2" host="${2%:*}" port="${2##*:}"
+    local artifact stdout_file stderr_file tcp_command rc_bash rc_timeout rc_resolv rc_getent rc_tcp
+    local getent_available=0
+
+    _ensure_artifact_dir
+    artifact="${ARTIFACT_DIR}/mysql_probe_${pool//[^A-Za-z0-9_.-]/_}_${host//[^A-Za-z0-9_.-]/_}_${port}_${RUN_TS}_${RANDOM}.txt"
+    stdout_file="${artifact}.stdout"
+    stderr_file="${artifact}.stderr"
+    tcp_command="timeout 5 bash -c 'exec 3<>/dev/tcp/${host}/${port}'"
+
+    {
+        printf 'pool=%s\n' "$pool"
+        printf 'pod=%s\nnamespace=%s\ntarget=%s\n' "$POD_NAME" "$NAMESPACE" "$mysql_target"
+        printf 'raw_tcp_command=%s\n' "$tcp_command"
+        printf '\n[Pod metadata]\n'
+        kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.metadata.name}{" node="}{.spec.nodeName}{" phase="}{.status.phase}{"\n"}'
+        printf '\n[command -v bash]\n'
+    } >"$artifact" 2>&1
+
+    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v bash' >"$stdout_file" 2>"$stderr_file"; then rc_bash=0; else rc_bash=$?; fi
+    { printf 'exit_code=%s\nstdout:\n' "$rc_bash"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
+    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v timeout' >"$stdout_file" 2>"$stderr_file"; then rc_timeout=0; else rc_timeout=$?; fi
+    { printf '\n[command -v timeout]\nexit_code=%s\nstdout:\n' "$rc_timeout"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
+    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'cat /etc/resolv.conf' >"$stdout_file" 2>"$stderr_file"; then rc_resolv=0; else rc_resolv=$?; fi
+    { printf '\n[/etc/resolv.conf]\nexit_code=%s\nstdout:\n' "$rc_resolv"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
+
+    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v getent' >"$stdout_file" 2>"$stderr_file"; then
+        getent_available=1
+        rc_getent=0
+    else
+        rc_getent=$?
+    fi
+    { printf '\n[command -v getent]\nexit_code=%s\nstdout:\n' "$rc_getent"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
+    if [[ $getent_available -eq 1 ]]; then
+        if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- getent hosts "$host" >"$stdout_file" 2>"$stderr_file"; then rc_getent=0; else rc_getent=$?; fi
+        { printf '\n[getent hosts %s]\nexit_code=%s\nstdout:\n' "$host" "$rc_getent"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
+    fi
+    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- bash -c "$tcp_command" >"$stdout_file" 2>"$stderr_file"; then rc_tcp=0; else rc_tcp=$?; fi
+    { printf '\n[TCP result]\nexit_code=%s\nstdout:\n' "$rc_tcp"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
+    rm -f "$stdout_file" "$stderr_file"
+
+    if [[ $rc_bash -ne 0 ]]; then
+        MYSQL_PROBE_FAILURE_REASON="Pod 内缺少 bash，无法执行 TCP 探测"
+    elif [[ $rc_timeout -ne 0 ]]; then
+        MYSQL_PROBE_FAILURE_REASON="Pod 内缺少 timeout，无法执行有时限的 TCP 探测"
+    elif [[ $getent_available -eq 1 && $rc_getent -ne 0 && ! "$host" =~ ^[0-9.]+$ ]]; then
+        MYSQL_PROBE_FAILURE_REASON="Pod DNS 无法解析 MySQL 主机名"
+    elif [[ $rc_tcp -ne 0 ]]; then
+        MYSQL_PROBE_FAILURE_REASON="TCP 探测失败（请结合诊断物料确认路由、安全组、监听端口）"
+    else
+        MYSQL_PROBE_FAILURE_REASON="TCP 诊断复测成功"
+    fi
+    MYSQL_PROBE_DIAGNOSTIC_ARTIFACT="$artifact"
+}
+
 test_pod_to_mysql_connectivity() {
-    local mysql_target="$1"
+    local mysql_target="$1" pool="${2:-unknown}"
     log_step "Pod访问集群内MySQL连通性检查"
     log_info "测试从Pod访问MySQL: ${mysql_target} (配置原始地址)"
 
@@ -1802,10 +1877,9 @@ test_pod_to_mysql_connectivity() {
         log_success "测试Pod访问集群内MySQL正常(TCP ${mysql_target} 可达)"
         return 0
     else
-        log_error "错误：Pod无法连通集群内MySQL(${mysql_target})，可能原因："
-        log_error "  1. Pod DNS 无法解析配置中的 MySQL 域名，或地址不可路由"
-        log_error "  2. MySQL所在云主机安全组未放行Pod网段到目标端口"
-        log_error "  3. MySQL服务未监听或未对外暴露目标端口"
+        capture_mysql_probe_diagnostics "$pool" "$mysql_target"
+        log_error "错误：Pod无法连通集群内MySQL(${mysql_target})：${MYSQL_PROBE_FAILURE_REASON}"
+        log_error "诊断物料已保存至: ${MYSQL_PROBE_DIAGNOSTIC_ARTIFACT}"
         return 1
     fi
 }
@@ -1852,6 +1926,24 @@ test_pod_to_host_latency() {
     fi
 }
 
+# 连通失败时复用诊断物料，禁止再执行延迟采样。
+run_mysql_latency_gate() {
+    local pname="$1" mysql_target="$2"
+    if test_pod_to_mysql_connectivity "$mysql_target" "$pname"; then
+        ((lat_total++))
+        if test_pod_to_host_latency "$mysql_target"; then
+            lat_detail="${lat_detail} ${pname}->${mysql_target}:${HOST_LATENCY_LAST_MS}ms"
+        else
+            ((lat_fail++))
+            lat_failed_pools="${lat_failed_pools} ${pname}->${mysql_target}(${HOST_LATENCY_LAST_MS}ms)"
+        fi
+    else
+        ((mysql_fail++))
+        mysql_failed_pools="${mysql_failed_pools} ${pname}->${mysql_target}"
+        lat_skipped_detail="${lat_skipped_detail} ${pname}->${mysql_target}:未执行（复用连通性失败诊断）"
+    fi
+}
+
 # ==================== 遍历每个就绪节点池做双向网络连通性测试 ====================
 # 用 pod_deploy_check 记录的各就绪池 Pod(PROBE_READY_POOLS / PROBE_POD_NAME / PROBE_POD_IP),
 # 逐池设置全局 POD_NAME/POD_IP 后复用既有 iptables 放行 + 双向连通性检查。
@@ -1877,7 +1969,7 @@ run_network_checks_per_pool() {
     local l2p_total=0 l2p_fail=0 l2s_total=0 l2s_fail=0 p2l_total=0 p2l_fail=0
     local l2p_failed_pools="" l2s_failed_pools="" p2l_failed_pools=""
     local mysql_total=0 mysql_fail=0 lat_total=0 lat_fail=0
-    local mysql_failed_pools="" lat_failed_pools="" lat_detail=""
+    local mysql_failed_pools="" lat_failed_pools="" lat_detail="" lat_skipped_detail=""
     local mysql_target
     for pname in $PROBE_READY_POOLS; do
         POD_NAME="${PROBE_POD_NAME[$pname]}"
@@ -1912,18 +2004,7 @@ run_network_checks_per_pool() {
         if [[ $mysql_ready -eq 1 ]]; then
             for mysql_target in "${MYSQL_PROBE_TARGETS[@]}"; do
                 ((mysql_total++))
-                test_pod_to_mysql_connectivity "$mysql_target" || {
-                    ((mysql_fail++))
-                    mysql_failed_pools="${mysql_failed_pools} ${pname}->${mysql_target}"
-                }
-
-                ((lat_total++))
-                if test_pod_to_host_latency "$mysql_target"; then
-                    lat_detail="${lat_detail} ${pname}->${mysql_target}:${HOST_LATENCY_LAST_MS}ms"
-                else
-                    ((lat_fail++))
-                    lat_failed_pools="${lat_failed_pools} ${pname}->${mysql_target}(${HOST_LATENCY_LAST_MS}ms)"
-                fi
+                run_mysql_latency_gate "$pname" "$mysql_target"
             done
         fi
     done
@@ -1964,9 +2045,9 @@ run_network_checks_per_pool() {
             record_result "Pod访问集群内MySQL连通性" "FAIL" "${mysql_fail}/${mysql_total}个节点池×MySQL目标组合不通:${mysql_failed_pools# }(请检查Pod DNS、路由及安全组)"
         fi
         if [[ $lat_total -eq 0 ]]; then
-            record_result "Pod访问集群内云主机延迟(<${HOST_LATENCY_THRESHOLD_MS}ms)" "SKIP" "无可测试的就绪Pod"
+            record_result "Pod访问集群内云主机延迟(<${HOST_LATENCY_THRESHOLD_MS}ms)" "SKIP" "无TCP连通的节点池×MySQL目标组合:${lat_skipped_detail# }"
         elif [[ $lat_fail -eq 0 ]]; then
-            record_result "Pod访问集群内云主机延迟(<${HOST_LATENCY_THRESHOLD_MS}ms)" "PASS" "${lat_total}个就绪节点池均达标:${lat_detail# }"
+            record_result "Pod访问集群内云主机延迟(<${HOST_LATENCY_THRESHOLD_MS}ms)" "PASS" "${lat_total}个节点池×MySQL目标组合均达标:${lat_detail# }${lat_skipped_detail:+；跳过:${lat_skipped_detail# }}"
         else
             record_result "Pod访问集群内云主机延迟(<${HOST_LATENCY_THRESHOLD_MS}ms)" "FAIL" "${lat_fail}/${lat_total}个节点池延迟超标或不可达:${lat_failed_pools# }(疑似跨可用区/跨域错配)"
         fi

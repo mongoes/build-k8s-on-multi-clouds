@@ -47,7 +47,7 @@
 - Modify: `docs/superpowers/specs/2026-07-16-mysql-probe-diagnostics-design.md`
 - Modify: `docs/superpowers/plans/2026-07-16-mysql-probe-diagnostics.md`
 
-- [ ] In the per-pool target loop, run latency only when TCP connectivity succeeded; otherwise record `未执行（复用连通性失败诊断）` for that pool/target without issuing a latency exec.
-- [ ] Add a mock counter test proving failed TCP does not call the latency helper.
-- [ ] Run `bash -n k8sAvailCheck.sh`, `bash tests/test_k8s_avail_check.sh`, and `git diff --check`; expect exit 0 and `PASS: availability-check regression assertions`.
+- [x] In the per-pool target loop, run latency only when TCP connectivity succeeded; otherwise record `未执行（复用连通性失败诊断）` for that pool/target without issuing a latency exec.
+- [x] Add a mock counter test proving failed TCP does not call the latency helper.
+- [x] Run `bash -n k8sAvailCheck.sh`, `bash tests/test_k8s_avail_check.sh`, and `git diff --check`; expect exit 0 and `PASS: availability-check regression assertions`.
 - [ ] Stage only the script, test, specification, and plan; commit `fix: capture mysql probe diagnostics`. Do not push without explicit authorization.

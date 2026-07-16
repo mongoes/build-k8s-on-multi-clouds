@@ -258,6 +258,73 @@ require_text 'test_pod_to_mysql_connectivity "$mysql_target"'
 require_text 'test_pod_to_host_latency "$mysql_target"'
 forbid_text 'MYSQL_PROBE_IP'
 forbid_text 'MYSQL_HOST_RAW'
+require_text 'capture_mysql_probe_diagnostics()'
+require_text 'write_failure_artifact()'
+require_text 'command -v bash'
+require_text 'command -v timeout'
+require_text '/etc/resolv.conf'
+require_text 'stdout'
+require_text 'stderr'
+require_text 'exit_code'
+forbid_text "tcp_command=\"timeout 5 bash -c 'exec 3<>/dev/tcp/\${host}/\${port}' 2>/dev/null\""
+
+# MySQL TCP 探测失败时必须保留 Pod 内诊断物料，便于区分镜像工具缺失、DNS 与端口不可达。
+mysql_diagnostic_source="$test_tmp/k8sAvailCheck.mysql-diagnostic.functions.sh"
+sed -n '/^capture_mysql_probe_diagnostics()/,/^# ==================== 混合部署: Pod -> MySQL 所在云主机延迟/p' "$SCRIPT" >"$mysql_diagnostic_source"
+log_step() { :; }
+log_info() { :; }
+log_success() { :; }
+log_warning() { :; }
+log_error() { :; }
+_ensure_artifact_dir() { mkdir -p "$ARTIFACT_DIR"; }
+# shellcheck disable=SC1090
+source "$mysql_diagnostic_source"
+
+MYSQL_DIAGNOSTIC_POOL='reserved-4c32g'
+MYSQL_DIAGNOSTIC_TARGET='mysql.example.internal:3306'
+POD_NAME='mysql-probe'
+NAMESPACE='debug'
+RUN_TS='test-run'
+ARTIFACT_DIR="$test_tmp/mysql-diagnostic-artifacts"
+kubectl() {
+    local cmd="$*"
+    case "$cmd" in
+    *'command -v bash'*) printf '/bin/bash\n' ;;
+    *'command -v timeout'*) printf '/usr/bin/timeout\n' ;;
+    *'cat /etc/resolv.conf'*) printf 'nameserver 10.96.0.10\n' ;;
+    *'/dev/tcp/mysql.example.internal/3306'*)
+        printf 'tcp probe stdout\n'
+        printf 'tcp probe stderr\n' >&2
+        return 42
+        ;;
+    *) return 0 ;;
+    esac
+}
+
+capture_mysql_probe_diagnostics "$MYSQL_DIAGNOSTIC_POOL" "$MYSQL_DIAGNOSTIC_TARGET"
+mysql_diagnostic_artifact=$(find "$ARTIFACT_DIR" -type f -print -quit)
+[[ -n "$mysql_diagnostic_artifact" ]] || fail 'failed MySQL exec must create a diagnostic artifact'
+grep -qF "$MYSQL_DIAGNOSTIC_TARGET" "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include the target'
+grep -qF "$MYSQL_DIAGNOSTIC_POOL" "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include the node pool'
+grep -qF "raw_tcp_command=timeout 5 bash -c 'exec 3<>/dev/tcp/mysql.example.internal/3306'" "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must retain the raw TCP command without stderr suppression'
+grep -qF 'tcp probe stdout' "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include failed command stdout'
+grep -qF 'tcp probe stderr' "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include failed command stderr'
+grep -qF 'exit_code=42' "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include failed command exit code'
+
+# 连通失败必须复用诊断物料，不能发起第二次 latency exec。
+mysql_latency_gate_source="$test_tmp/k8sAvailCheck.mysql-latency-gate.functions.sh"
+sed -n '/^run_mysql_latency_gate()/,/^# ==================== 遍历每个就绪节点池/p' "$SCRIPT" >"$mysql_latency_gate_source"
+# shellcheck disable=SC1090
+source "$mysql_latency_gate_source"
+mysql_fail=0 lat_total=0 lat_fail=0
+mysql_failed_pools='' lat_failed_pools='' lat_detail='' lat_skipped_detail=''
+MYSQL_LATENCY_CALLS=0
+test_pod_to_mysql_connectivity() { return 1; }
+test_pod_to_host_latency() { ((MYSQL_LATENCY_CALLS++)); return 0; }
+run_mysql_latency_gate 'reserved-4c32g' 'mysql.example.internal:3306'
+[[ $MYSQL_LATENCY_CALLS -eq 0 ]] || fail 'failed MySQL connectivity must not call the latency helper'
+[[ $lat_total -eq 0 ]] || fail 'failed MySQL connectivity must not count toward latency samples'
+[[ "$lat_skipped_detail" == *'reserved-4c32g->mysql.example.internal:3306:未执行（复用连通性失败诊断）'* ]] || fail 'failed MySQL connectivity must record the reused-diagnostic skip detail'
 require_text 'huawei_te_disk_before_gpssd2.yaml'
 require_text 'record_result "块存储StorageClass就绪检查" "WARN" "发现被PVC/PV依赖的历史te-disk，保留现有盘型以兼容存量应用"'
 forbid_text 'check_huawei_gpssd2_support'
