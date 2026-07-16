@@ -2134,7 +2134,6 @@ label_internal_k8s_nodes() {
 HUAWEI_TE_DISK_STATE="missing"
 HUAWEI_TE_DISK_PVCS=""
 HUAWEI_TE_DISK_PVS=""
-HUAWEI_GPSSD2_SUPPORT="warn"
 
 # 只通过 API 字段判断，避免 kubectl 表格格式或本地化输出影响安全决策。
 inspect_huawei_te_disk() {
@@ -2159,25 +2158,6 @@ has_te_disk_dependents() {
     HUAWEI_TE_DISK_PVCS=$(kubectl get pvc -A -o jsonpath='{range .items[?(@.spec.storageClassName=="te-disk")]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null)
     HUAWEI_TE_DISK_PVS=$(kubectl get pv -o jsonpath='{range .items[?(@.spec.storageClassName=="te-disk")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
     [[ -n "$HUAWEI_TE_DISK_PVCS" || -n "$HUAWEI_TE_DISK_PVS" ]]
-}
-
-check_huawei_gpssd2_support() {
-    local images image major minor patch
-    HUAWEI_GPSSD2_SUPPORT="warn"
-    images=$(kubectl get deploy -A -o jsonpath='{range .items[*].spec.template.spec.containers[*]}{.image}{"\n"}{end}' 2>/dev/null) || true
-    image=$(printf '%s\n' "$images" | grep 'everest-csi-controller' | head -n 1)
-    if [[ -z "$image" || ! "$image" =~ v?([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
-        log_warning "未能识别 everest-csi-controller 的版本，保留现有 te-disk，不自动切换到 GPSSD2"
-        return 1
-    fi
-    major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
-    if (( major < 2 || (major == 2 && minor < 4) || (major == 2 && minor == 4 && patch < 4) )); then
-        HUAWEI_GPSSD2_SUPPORT="fail"
-        log_error "Everest CSI 版本 ${major}.${minor}.${patch} 低于 GPSSD2 所需的 2.4.4"
-        return 1
-    fi
-    HUAWEI_GPSSD2_SUPPORT="pass"
-    return 0
 }
 
 create_huawei_gpssd2_storageclass() {
@@ -2207,7 +2187,12 @@ reconcile_huawei_te_disk() {
     local backup
     inspect_huawei_te_disk
     [[ "$HUAWEI_TE_DISK_STATE" == "expected" ]] && return 0
-    [[ "$HUAWEI_TE_DISK_STATE" == "missing" ]] && return 1
+    if [[ "$HUAWEI_TE_DISK_STATE" == "missing" ]]; then
+        create_huawei_gpssd2_storageclass || return 1
+        inspect_huawei_te_disk
+        [[ "$HUAWEI_TE_DISK_STATE" == "expected" ]]
+        return $?
+    fi
 
     if has_te_disk_dependents; then
         log_warning "te-disk 仍被 PVC(${HUAWEI_TE_DISK_PVCS:-无}) 或 PV(${HUAWEI_TE_DISK_PVS:-无}) 使用；保留旧配置，不执行 apply、patch 或 delete"
@@ -2249,17 +2234,7 @@ ensure_storageclass() {
             log_success "华为 te-disk 已是 GPSSD2 预期配置"
             return 0
             ;;
-        legacy)
-            check_huawei_gpssd2_support || true
-            if [[ "$HUAWEI_GPSSD2_SUPPORT" == "fail" ]]; then
-                record_result "华为GPSSD2支持度检查" "FAIL" "Everest版本低于2.4.4，不支持GPSSD2"
-                return 1
-            fi
-            if [[ "$HUAWEI_GPSSD2_SUPPORT" == "warn" ]]; then
-                log_warning "Everest 版本不可识别，保留旧 te-disk，不自动切换到 GPSSD2"
-                record_result "华为GPSSD2支持度检查" "WARN" "无法从kubectl可靠识别Everest版本；继续以端到端PVC验证为准"
-                return 2
-            fi
+        legacy|missing)
             reconcile_huawei_te_disk
             return $?
             ;;
@@ -3078,7 +3053,7 @@ main() {
         if [[ "$cloud_platform" == *huawei* && ( -n "$HUAWEI_TE_DISK_PVCS" || -n "$HUAWEI_TE_DISK_PVS" ) ]]; then
             record_result "块存储StorageClass就绪检查" "WARN" "发现被PVC/PV依赖的历史te-disk，保留现有盘型以兼容存量应用"
         else
-            record_result "块存储StorageClass就绪检查" "WARN" "为保护现有华为 te-disk 或因 Everest 版本不可识别，未自动修改StorageClass"
+            record_result "块存储StorageClass就绪检查" "WARN" "为保护现有华为 te-disk，未自动修改StorageClass"
         fi
     else
         record_result "块存储StorageClass就绪检查" "FAIL" "默认StorageClass未就绪，请确认CSI插件与手动配置指引"

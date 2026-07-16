@@ -259,11 +259,12 @@ require_text 'test_pod_to_host_latency "$mysql_target"'
 forbid_text 'MYSQL_PROBE_IP'
 forbid_text 'MYSQL_HOST_RAW'
 require_text 'huawei_te_disk_before_gpssd2.yaml'
-require_text 'record_result "华为GPSSD2支持度检查" "FAIL" "Everest版本低于2.4.4，不支持GPSSD2"'
-require_text 'record_result "华为GPSSD2支持度检查" "WARN" "无法从kubectl可靠识别Everest版本；继续以端到端PVC验证为准"'
 require_text 'record_result "块存储StorageClass就绪检查" "WARN" "发现被PVC/PV依赖的历史te-disk，保留现有盘型以兼容存量应用"'
+forbid_text 'check_huawei_gpssd2_support'
+forbid_text 'HUAWEI_GPSSD2_SUPPORT'
+forbid_text 'Everest版本低于'
 
-# 华为 GPSSD2 仅可替换未被 PVC 使用的旧 SAS te-disk，且 Everest 版本至少为 v2.4.4。
+# 华为 GPSSD2 仅可替换未被 PVC/PV 使用的旧 te-disk，CSI 版本不参与决策。
 huawei_gpssd2_source="$test_tmp/k8sAvailCheck.huawei-gpssd2.functions.sh"
 sed -n '/^inspect_huawei_te_disk()/,/^# ==================== StorageClass 确保函数/p' "$SCRIPT" >"$huawei_gpssd2_source"
 # shellcheck disable=SC1090
@@ -272,14 +273,15 @@ source "$huawei_gpssd2_source"
 MOCK_TE_DISK_TYPE='SAS'
 MOCK_TE_DISK_IOPS=''
 MOCK_TE_DISK_THROUGHPUT=''
+MOCK_TE_DISK_EXISTS=1
 MOCK_TE_DISK_PVC_BOUND=1
-MOCK_EVEREST_IMAGE='everest-csi-controller:v2.4.3'
 KUBECTL_CALL_LOG="$test_tmp/huawei-kubectl-calls"
 kubectl() {
     local cmd="$*"
     printf '%s\n' "$cmd" >>"$KUBECTL_CALL_LOG"
     case "$cmd" in
     "get sc te-disk -o jsonpath="*)
+        [[ "$MOCK_TE_DISK_EXISTS" == 1 ]] || return 1
         case "$cmd" in
         *'disk-volume-type'*) printf '%s' "$MOCK_TE_DISK_TYPE" ;;
         *'disk-iops'*) printf '%s' "$MOCK_TE_DISK_IOPS" ;;
@@ -299,18 +301,17 @@ kubectl() {
         printf 'kind: StorageClass\nmetadata:\n  name: te-disk\n'
         ;;
     "delete sc te-disk")
+        MOCK_TE_DISK_EXISTS=0
         MOCK_TE_DISK_TYPE=''
         MOCK_TE_DISK_IOPS=''
         MOCK_TE_DISK_THROUGHPUT=''
         ;;
     "apply -f -")
         cat >/dev/null
+        MOCK_TE_DISK_EXISTS=1
         MOCK_TE_DISK_TYPE='GPSSD2'
         MOCK_TE_DISK_IOPS='3000'
         MOCK_TE_DISK_THROUGHPUT='125'
-        ;;
-    "get deploy -A -o jsonpath="*)
-        printf '%s' "$MOCK_EVEREST_IMAGE"
         ;;
     *) return 0 ;;
     esac
@@ -319,7 +320,6 @@ kubectl() {
 inspect_huawei_te_disk
 [[ "$HUAWEI_TE_DISK_STATE" == legacy ]] || fail 'SAS te-disk must be legacy'
 has_te_disk_dependents || fail 'PVC using te-disk must be a dependency'
-if check_huawei_gpssd2_support; then fail 'Everest below 2.4.4 must fail'; fi
 
 # 依赖中的历史 SC 绝不可被 apply、patch 或 delete。
 : >"$KUBECTL_CALL_LOG"
@@ -335,7 +335,6 @@ fi
 # 无依赖时必须先备份，再删除旧 SC，最后应用 GPSSD2 模板。
 MOCK_TE_DISK_PVC_BOUND=0
 MOCK_TE_DISK_PV_BOUND=0
-MOCK_EVEREST_IMAGE='everest-csi-controller:v2.4.4'
 MOCK_TE_DISK_TYPE='SAS'
 MOCK_TE_DISK_IOPS=''
 MOCK_TE_DISK_THROUGHPUT=''
@@ -348,17 +347,23 @@ apply_index=$(grep -n -m1 '^apply -f -$' "$KUBECTL_CALL_LOG" | cut -d: -f1)
 (( backup_index >= 0 && backup_index < delete_index && delete_index < apply_index )) || fail 'backup must precede delete, followed by GPSSD2 creation'
 [[ -s "$ARTIFACT_DIR/huawei_te_disk_before_gpssd2.yaml" ]] || fail 'legacy te-disk backup must be retained'
 
+# 缺失 te-disk 时直接创建 GPSSD2，不进行备份或删除。
+MOCK_TE_DISK_TYPE=''
+MOCK_TE_DISK_IOPS=''
+MOCK_TE_DISK_THROUGHPUT=''
+MOCK_TE_DISK_EXISTS=0
+: >"$KUBECTL_CALL_LOG"
+ARTIFACT_DIR="$test_tmp/huawei-missing-artifacts"
+reconcile_huawei_te_disk || fail 'missing te-disk must create GPSSD2 directly'
+grep -qx 'apply -f -' "$KUBECTL_CALL_LOG" || fail 'missing te-disk must apply GPSSD2 manifest'
+! grep -Eq '^(get sc te-disk -o yaml|delete sc te-disk)$' "$KUBECTL_CALL_LOG" || fail 'missing te-disk must not back up or delete'
+
 MOCK_TE_DISK_TYPE='GPSSD2'
 MOCK_TE_DISK_IOPS='3000'
 MOCK_TE_DISK_THROUGHPUT='125'
 MOCK_TE_DISK_PVC_BOUND=0
-MOCK_EVEREST_IMAGE='everest-csi-controller:v2.4.4'
 inspect_huawei_te_disk
 [[ "$HUAWEI_TE_DISK_STATE" == expected ]] || fail 'GPSSD2/3000/125 te-disk must be expected'
 if has_te_disk_dependents; then fail 'te-disk without PVC/PV use must have no dependency'; fi
-check_huawei_gpssd2_support || fail 'Everest v2.4.4 must support GPSSD2'
-
-MOCK_EVEREST_IMAGE='everest-csi-controller:latest'
-if check_huawei_gpssd2_support; then fail 'Everest image without a semantic version must fail'; fi
 
 echo 'PASS: availability-check regression assertions'
