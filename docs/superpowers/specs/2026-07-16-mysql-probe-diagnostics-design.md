@@ -2,11 +2,11 @@
 
 ## 目标
 
-保留现有 nginx 探测 Pod 与 curl `--connect-only` 连通性方法；在失败时留下可复现证据，避免把探测工具缺失、DNS 失败和真实 TCP 不通混为网络故障。任何检查项登记为 FAIL 时均保留通用失败物料。
+保留现有 nginx 探测 Pod 与 curl `telnet://` 连通性方法；在失败时留下可复现证据，避免把探测工具缺失、DNS 失败和真实 TCP 不通混为网络故障。任何检查项登记为 FAIL 时均保留通用失败物料。
 
 ## MySQL 失败诊断
 
-`test_pod_to_mysql_connectivity` 的成功路径不变。失败时，在清理探测 Pod 前为每个“节点池 + MySQL 目标”写入物料文件，包含：目标、节点池、Pod、Pod IP、实际执行的 TCP 命令、kubectl exec 退出码、stdout、stderr、`command -v curl`、`/etc/resolv.conf`、`/etc/hosts`、可用时的 `getent hosts` 结果，以及一次不抑制错误的 curl `--connect-only` 尝试。
+`test_pod_to_mysql_connectivity` 的成功路径不变。失败时，在清理探测 Pod 前为每个“节点池 + MySQL 目标”写入物料文件，包含：目标、节点池、Pod、Pod IP、实际执行的 TCP 命令、kubectl exec 退出码、stdout、stderr、`command -v curl`、`/etc/resolv.conf`、`/etc/hosts`、可用时的 `getent hosts` 结果，以及一次不抑制错误的 curl `telnet://` 尝试。
 
 诊断结果将明确归类为工具缺失、DNS 失败、TCP 连接失败或命令执行异常；汇总失败详情引用物料路径，而不把所有情况笼统表述成安全组或路由故障。
 

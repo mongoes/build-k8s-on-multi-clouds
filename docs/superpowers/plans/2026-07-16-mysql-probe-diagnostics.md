@@ -4,14 +4,14 @@
 
 **Goal:** Preserve nginx-based MySQL probing while making failures diagnosable and preventing tool errors from masquerading as network failures.
 
-**Architecture:** Add a generic FAIL-summary writer at `record_result`, plus a MySQL-specific diagnostic capture helper that runs only after a failed nginx-Pod TCP probe. The existing nginx image and target extraction remain unchanged; TCP probing uses curl `--connect-only`, and latency uses curl `%{time_connect}` only after connectivity succeeds.
+**Architecture:** Add a generic FAIL-summary writer at `record_result`, plus a MySQL-specific diagnostic capture helper that runs only after a failed nginx-Pod TCP probe. The existing nginx image and target extraction remain unchanged; TCP probing uses curl `telnet://`, and latency uses curl `%{time_connect}` only after connectivity succeeds.
 
 **Tech Stack:** Bash, kubectl exec, existing shell regression harness.
 
 ## Global Constraints
 
 - Do not add a container, image, service, external tool, cloud API, or JDBC port validation.
-- Keep nginx as the probe container; use curl `--connect-only` for TCP probing and curl `%{time_connect}` for latency.
+- Keep nginx as the probe container; use curl `telnet://` for TCP probing and curl `%{time_connect}` for latency.
 - All FAIL results write a summary under `ARTIFACT_DIR`; K8s failures retain generated YAML and diagnostics.
 - MySQL failure evidence includes command, exit code, stdout/stderr, curl availability, DNS configuration, and target lookup.
 - Latency is not executed after a TCP connectivity failure for the same Pod/target.
@@ -61,4 +61,4 @@
 - [x] Preserve original JDBC hostnames for TCP/latency and capture Pod hosts/DNS evidence in MySQL diagnostics.
 
 
-MySQL TCP 与延迟均使用 curl `--connect-only`；延迟样本通过 `%{time_connect}` 返回秒值并在脚本端转换为毫秒。
+MySQL TCP 与延迟均使用 curl `telnet://`；延迟样本通过 `%{time_connect}` 返回秒值并在脚本端转换为毫秒。

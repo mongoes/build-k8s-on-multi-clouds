@@ -1022,7 +1022,7 @@ spec:
       labels:
         app: ${PROBE_PREFIX}
         probe-pool: "${label_pool}"
-    spec:
+    spec:${node_selector}
 ${host_aliases}
       containers:
       - name: nginx-probe
@@ -1874,69 +1874,55 @@ parse_mysql_targets() {
 }
 
 # ==================== 混合部署: Pod -> 集群内 MySQL TCP 连通性 ====================
-# 复用就绪 nginx Pod，以 curl connect-only 验证三次握手。
+# 复用就绪 nginx Pod，以 curl telnet:// 验证三次握手。
 # 只验"网络+端口可达"(安全组/路由是否放行), 不登录、不依赖 mysql 客户端。
 MYSQL_PROBE_FAILURE_REASON=""
 _mysql_curl_connect() {
-    local host="$1" port="$2" write_out="${3:-}"
-    local args=(curl --connect-only --noproxy '*' --connect-timeout 5 --silent --show-error --output /dev/null)
-    [[ -n "$write_out" ]] && args+=(--write-out "$write_out")
-    args+=("http://${host}:${port}/")
-    kubectl exec "$POD_NAME" -n "$NAMESPACE" -- "${args[@]}"
+    local host="$1" port="$2"
+    kubectl exec "$POD_NAME" -n "$NAMESPACE" -- curl --noproxy '*' --connect-timeout 5 --max-time 5 --silent --show-error --output /dev/null --write-out '%{time_connect}' "telnet://${host}:${port}"
+}
+
+_mysql_valid_time_connect() {
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v seconds="$1" 'BEGIN { exit !(seconds > 0) }'
 }
 
 capture_mysql_probe_diagnostics() {
     local pool="$1" mysql_target="$2" host="${2%:*}" port="${2##*:}"
-    local artifact stdout_file stderr_file curl_command rc_curl rc_resolv rc_hosts rc_getent rc_tcp
+    local artifact stdout_file stderr_file curl_command rc_curl rc_resolv rc_hosts rc_getent rc_tcp tcp_time probe_file
     local getent_available=0
-
     _ensure_artifact_dir
     artifact="${ARTIFACT_DIR}/mysql_probe_${pool//[^A-Za-z0-9_.-]/_}_${host//[^A-Za-z0-9_.-]/_}_${port}_${RUN_TS}_${RANDOM}.txt"
-    stdout_file="${artifact}.stdout"
-    stderr_file="${artifact}.stderr"
-    curl_command="curl --noproxy '*' --connect-only --connect-timeout 5 --silent --show-error --output /dev/null http://${host}:${port}/"
-
-    {
-        printf 'pool=%s\npod=%s\nnamespace=%s\ntarget=%s\n' "$pool" "$POD_NAME" "$NAMESPACE" "$mysql_target"
-        printf 'raw_curl_command=%s\n' "$curl_command"
-        printf '\n[Pod metadata]\n'
-        kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.metadata.name}{" node="}{.spec.nodeName}{" phase="}{.status.phase}{"\n"}'
-    } >"$artifact" 2>&1
-
+    stdout_file="${artifact}.stdout"; stderr_file="${artifact}.stderr"
+    curl_command="curl --noproxy '*' --connect-timeout 5 --max-time 5 --silent --show-error --output /dev/null --write-out '%{time_connect}' telnet://${host}:${port}"
+    { printf 'pool=%s\npod=%s\nnamespace=%s\ntarget=%s\nraw_curl_command=%s\n' "$pool" "$POD_NAME" "$NAMESPACE" "$mysql_target" "$curl_command"; } >"$artifact"
     if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v curl' >"$stdout_file" 2>"$stderr_file"; then rc_curl=0; else rc_curl=$?; fi
     { printf '\n[command -v curl]\nexit_code=%s\nstdout:\n' "$rc_curl"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
-    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'cat /etc/resolv.conf' >"$stdout_file" 2>"$stderr_file"; then rc_resolv=0; else rc_resolv=$?; fi
-    { printf '\n[/etc/resolv.conf]\nexit_code=%s\nstdout:\n' "$rc_resolv"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
-    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'cat /etc/hosts' >"$stdout_file" 2>"$stderr_file"; then rc_hosts=0; else rc_hosts=$?; fi
-    { printf '\n[/etc/hosts]\nexit_code=%s\nstdout:\n' "$rc_hosts"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
-    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v getent' >"$stdout_file" 2>"$stderr_file"; then getent_available=1; rc_getent=0; else rc_getent=$?; fi
-    { printf '\n[command -v getent]\nexit_code=%s\nstdout:\n' "$rc_getent"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
-    if [[ $getent_available -eq 1 ]]; then
-        if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- getent hosts "$host" >"$stdout_file" 2>"$stderr_file"; then rc_getent=0; else rc_getent=$?; fi
-        { printf '\n[getent hosts %s]\nexit_code=%s\nstdout:\n' "$host" "$rc_getent"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
-    fi
+    for probe_file in '/etc/resolv.conf' '/etc/hosts'; do
+      if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c "cat $probe_file" >"$stdout_file" 2>"$stderr_file"; then rc_resolv=0; else rc_resolv=$?; fi
+      { printf '\n[%s]\nexit_code=%s\nstdout:\n' "$probe_file" "$rc_resolv"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
+    done
+    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v getent' >"$stdout_file" 2>"$stderr_file"; then getent_available=1; fi
+    if [[ $getent_available -eq 1 ]]; then kubectl exec "$POD_NAME" -n "$NAMESPACE" -- getent hosts "$host" >>"$artifact" 2>&1 || true; fi
     if _mysql_curl_connect "$host" "$port" >"$stdout_file" 2>"$stderr_file"; then rc_tcp=0; else rc_tcp=$?; fi
-    { printf '\n[curl TCP result]\nexit_code=%s\nstdout:\n' "$rc_tcp"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
+    tcp_time=$(<"$stdout_file")
+    { printf '\n[curl TCP result]\nexit_code=%s\ntime_connect=%s\nstdout:\n' "$rc_tcp" "$tcp_time"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
     rm -f "$stdout_file" "$stderr_file"
-
     case "$rc_tcp" in
-    127) MYSQL_PROBE_FAILURE_REASON="Pod 内缺少 curl，无法执行 TCP 探测" ;;
-    6) MYSQL_PROBE_FAILURE_REASON="Pod DNS 无法解析 MySQL 主机名" ;;
-    7|28) MYSQL_PROBE_FAILURE_REASON="TCP 探测失败（请结合诊断物料确认路由、安全组、监听端口）" ;;
-    0) MYSQL_PROBE_FAILURE_REASON="curl 诊断复测成功" ;;
-    *) MYSQL_PROBE_FAILURE_REASON="curl 执行异常（exit=${rc_tcp}，详见诊断物料）" ;;
+      127) MYSQL_PROBE_FAILURE_REASON='Pod 内缺少 curl，无法执行 TCP 探测' ;;
+      6) MYSQL_PROBE_FAILURE_REASON='Pod DNS 无法解析 MySQL 主机名' ;;
+      2) MYSQL_PROBE_FAILURE_REASON='curl 工具或协议参数异常' ;;
+      7) MYSQL_PROBE_FAILURE_REASON='TCP 探测失败（请结合诊断物料确认路由、安全组、监听端口）' ;;
+      28) if _mysql_valid_time_connect "$tcp_time"; then MYSQL_PROBE_FAILURE_REASON='curl 诊断复测成功'; else MYSQL_PROBE_FAILURE_REASON='TCP 探测超时或未建立连接'; fi ;;
+      0) MYSQL_PROBE_FAILURE_REASON='curl 执行未建立有效连接' ;;
+      *) MYSQL_PROBE_FAILURE_REASON="curl 执行异常（exit=${rc_tcp}，详见诊断物料）" ;;
     esac
     MYSQL_PROBE_DIAGNOSTIC_ARTIFACT="$artifact"
 }
 
 test_pod_to_mysql_connectivity() {
-    local mysql_target="$1" pool="${2:-unknown}" host="${1%:*}" port="${1##*:}"
-    log_step "Pod访问集群内MySQL连通性检查"
-    log_info "测试从Pod访问MySQL: ${mysql_target} (配置原始地址)"
-    if _mysql_curl_connect "$host" "$port" >/dev/null 2>&1; then
-        log_success "测试Pod访问集群内MySQL正常(TCP ${mysql_target} 可达)"
-        return 0
-    fi
+    local mysql_target="$1" pool="${2:-unknown}" host="${1%:*}" port="${1##*:}" out rc
+    if out=$(_mysql_curl_connect "$host" "$port"); then rc=0; else rc=$?; fi
+    if _mysql_valid_time_connect "$out"; then log_success "测试Pod访问集群内MySQL正常(TCP ${mysql_target} 可达)"; return 0; fi
     capture_mysql_probe_diagnostics "$pool" "$mysql_target"
     log_error "错误：Pod无法连通集群内MySQL(${mysql_target})：${MYSQL_PROBE_FAILURE_REASON}"
     log_error "诊断物料已保存至: ${MYSQL_PROBE_DIAGNOSTIC_ARTIFACT}"
@@ -1947,19 +1933,16 @@ test_pod_to_mysql_connectivity() {
 test_pod_to_host_latency() {
     local mysql_target="$1" host="${1%:*}" port="${1##*:}" out sample_ms total=0 ok=0 i
     log_step "Pod访问集群内云主机网络延迟检查"
-    for ((i = 0; i < HOST_LATENCY_SAMPLES; i++)); do
-        if out=$(_mysql_curl_connect "$host" "$port" '%{time_connect}' 2>/dev/null); then
-            sample_ms=$(awk -v seconds="$out" 'BEGIN { if (seconds ~ /^[0-9]+(\.[0-9]+)?$/) printf "%d", seconds * 1000 }')
-            [[ -n "$sample_ms" ]] || continue
-            total=$((total + sample_ms)); ok=$((ok + 1))
-        fi
+    for ((i=0; i<HOST_LATENCY_SAMPLES; i++)); do
+      out=$(_mysql_curl_connect "$host" "$port") || :
+      if _mysql_valid_time_connect "$out"; then
+        sample_ms=$(awk -v seconds="$out" 'BEGIN { printf "%d", seconds * 1000 }')
+        total=$((total + sample_ms)); ok=$((ok + 1))
+      fi
     done
-    if [[ $ok -eq 0 ]]; then HOST_LATENCY_LAST_MS=-1; log_error "错误：Pod到MySQL ${mysql_target} 全部探测失败，无法测得延迟"; return 1; fi
+    if [[ $ok -eq 0 ]]; then HOST_LATENCY_LAST_MS=-1; return 1; fi
     HOST_LATENCY_LAST_MS=$((total / ok))
-    if [[ $HOST_LATENCY_LAST_MS -lt $HOST_LATENCY_THRESHOLD_MS ]]; then
-        log_success "测试Pod到云主机延迟正常(均值 ${HOST_LATENCY_LAST_MS}ms < ${HOST_LATENCY_THRESHOLD_MS}ms, ${ok}/${HOST_LATENCY_SAMPLES}次成功)"; return 0
-    fi
-    log_error "错误：Pod到云主机延迟偏高(均值 ${HOST_LATENCY_LAST_MS}ms >= ${HOST_LATENCY_THRESHOLD_MS}ms)"; return 1
+    [[ $HOST_LATENCY_LAST_MS -lt $HOST_LATENCY_THRESHOLD_MS ]]
 }
 
 # 连通失败时复用诊断物料，禁止再执行延迟采样。
