@@ -1921,8 +1921,10 @@ capture_mysql_probe_diagnostics() {
 
 test_pod_to_mysql_connectivity() {
     local mysql_target="$1" pool="${2:-unknown}" host="${1%:*}" port="${1##*:}" out rc
-    if out=$(_mysql_curl_connect "$host" "$port"); then rc=0; else rc=$?; fi
-    if _mysql_valid_time_connect "$out"; then log_success "测试Pod访问集群内MySQL正常(TCP ${mysql_target} 可达)"; return 0; fi
+    if out=$(_mysql_curl_connect "$host" "$port" 2>/dev/null); then rc=0; else rc=$?; fi
+    if _mysql_valid_time_connect "$out"; then
+        [[ $rc -eq 28 ]] && log_info "MySQL TCP握手已建立，服务保持连接，按连接成功计"
+        log_success "测试Pod访问集群内MySQL正常(TCP ${mysql_target} 可达)"; return 0; fi
     capture_mysql_probe_diagnostics "$pool" "$mysql_target"
     log_error "错误：Pod无法连通集群内MySQL(${mysql_target})：${MYSQL_PROBE_FAILURE_REASON}"
     log_error "诊断物料已保存至: ${MYSQL_PROBE_DIAGNOSTIC_ARTIFACT}"
@@ -1934,7 +1936,7 @@ test_pod_to_host_latency() {
     local mysql_target="$1" host="${1%:*}" port="${1##*:}" out sample_ms total=0 ok=0 i
     log_step "Pod访问集群内云主机网络延迟检查"
     for ((i=0; i<HOST_LATENCY_SAMPLES; i++)); do
-      out=$(_mysql_curl_connect "$host" "$port") || :
+      out=$(_mysql_curl_connect "$host" "$port" 2>/dev/null) || :
       if _mysql_valid_time_connect "$out"; then
         sample_ms=$(awk -v seconds="$out" 'BEGIN { printf "%d", seconds * 1000 }')
         total=$((total + sample_ms)); ok=$((ok + 1))

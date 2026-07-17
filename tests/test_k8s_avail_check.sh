@@ -344,7 +344,7 @@ kubectl() {
     *'telnet://mysql.example.internal:3306'*)
         case "$MYSQL_CURL_MODE" in
         success) printf '0.012\n'; return 0 ;;
-        partial) printf '0.012\n'; return 28 ;;
+        partial) printf '0.012\n'; printf 'curl: (28) Time-out\n' >&2; return 28 ;;
         zero) printf '0.000000\n'; return 0 ;;
         missing) printf 'curl: not found\n' >&2; return 127 ;;
         dns) printf 'curl: (6) Could not resolve host\n' >&2; return 6 ;;
@@ -355,7 +355,11 @@ kubectl() {
     esac
 }
 MYSQL_CURL_MODE=partial
-test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a || fail 'rc=28 with non-zero time_connect must still pass connectivity'
+log_info() { printf '%s\n' "$*"; }
+log_success() { printf '%s\n' "$*"; }
+connectivity_output=$(test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a 2>&1) || fail 'rc=28 with non-zero time_connect must still pass connectivity'
+[[ "$connectivity_output" == *'MySQL TCP握手已建立，服务保持连接，按连接成功计'* ]] || fail 'partial curl success must explain the established TCP handshake'
+[[ "$connectivity_output" != *'Time-out'* && "$connectivity_output" != *'command terminated'* ]] || fail 'partial curl stderr must not leak to connectivity output'
 MYSQL_CURL_MODE=success
 test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a || fail 'curl telnet time_connect success must pass MySQL connectivity'
 for mysql_case in missing dns tcp zero; do
@@ -374,6 +378,9 @@ MYSQL_CURL_MODE=tcp
 MYSQL_CURL_LOG=''
 log_error() { MYSQL_CURL_LOG="${MYSQL_CURL_LOG}$*\n"; }
 test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a && fail 'TCP failure must not pass connectivity'
+tcp_diagnostic_artifact="$MYSQL_PROBE_DIAGNOSTIC_ARTIFACT"
+grep -qF 'curl: (7) Failed to connect' "$tcp_diagnostic_artifact" || fail 'TCP diagnostic artifact must retain curl stderr'
+grep -qF 'exit_code=7' "$tcp_diagnostic_artifact" || fail 'TCP diagnostic artifact must retain curl exit code'
 [[ "$MYSQL_CURL_LOG" == *'诊断物料已保存至:'* && "$MYSQL_CURL_LOG" == *'mysql_probe_'* ]] || fail 'connectivity failure must log its diagnostic artifact path'
 MYSQL_CURL_MODE=partial
 capture_mysql_probe_diagnostics pool-a 'mysql.example.internal:3306'
@@ -391,11 +398,13 @@ HOST_LATENCY_SAMPLES=1
 HOST_LATENCY_THRESHOLD_MS=50
 kubectl() {
     local cmd="$*"
-    [[ "$cmd" == *'telnet://mysql.example.internal:3306'* ]] && { printf '0.012\n'; return 28; }
+    [[ "$cmd" == *'telnet://mysql.example.internal:3306'* ]] && { printf '0.012\n'; printf 'curl: (28) Time-out\ncommand terminated with exit code 28\n' >&2; return 28; }
     return 0
 }
 test_pod_to_host_latency 'mysql.example.internal:3306' || fail 'curl time_connect sample must pass latency probe'
 [[ "$HOST_LATENCY_LAST_MS" == 12 ]] || fail 'curl time_connect 0.012 seconds must become 12ms'
+latency_output=$(test_pod_to_host_latency 'mysql.example.internal:3306' 2>&1) || fail 'partial curl success must pass latency probe'
+[[ "$latency_output" != *'Time-out'* && "$latency_output" != *'command terminated'* ]] || fail 'partial curl stderr must not leak to latency output'
 
 require_text 'capture_mysql_probe_diagnostics()'
 require_text 'write_failure_artifact()'
