@@ -311,10 +311,71 @@ grep -qF 'hostAliases:' "$probe_manifest" || fail 'probe Deployment manifest mus
 grep -qF 'mysql.internal' "$probe_manifest" || fail 'probe Deployment manifest must include inherited hostname'
 grep -A1 -F 'ipv6.internal' "$probe_manifest" | grep -q '^      containers:' || fail 'last hostAlias hostname and containers must be separate YAML lines'
 ! grep -qF 'build_probe_host_aliases' "$probe_manifest" || fail 'probe Deployment manifest must not contain literal command substitution text'
+# MySQL 探测必须使用 curl 的 TCP connect-only 与 time_connect，不能依赖 nginx 镜像中的 bash/timeout/devtcp。
+require_text 'curl --connect-only'
+require_text '%{time_connect}'
+forbid_text '/dev/tcp'
+forbid_text 'command -v bash'
+forbid_text 'command -v timeout'
+
+# curl 成功、缺失、DNS 与 TCP 失败均必须可被 MySQL 探测分类。生产实现需以这些 curl 退出码/输出为准。
+mysql_curl_source="$test_tmp/k8sAvailCheck.mysql-curl.functions.sh"
+sed -n '/^_mysql_curl_connect()/,/^# ==================== 混合部署: Pod -> MySQL 所在云主机延迟/p' "$SCRIPT" >"$mysql_curl_source"
+log_step() { :; }
+log_info() { :; }
+log_success() { :; }
+log_warning() { :; }
+log_error() { :; }
+_ensure_artifact_dir() { mkdir -p "$ARTIFACT_DIR"; }
+# shellcheck disable=SC1090
+source "$mysql_curl_source"
+POD_NAME=mysql-probe NAMESPACE=debug RUN_TS=test ARTIFACT_DIR="$test_tmp/mysql-curl-artifacts"
+MYSQL_CURL_MODE=success
+kubectl() {
+    local cmd="$*"
+    case "$cmd" in
+    *'curl --connect-only'*)
+        case "$MYSQL_CURL_MODE" in
+        success) printf '0.012\n'; return 0 ;;
+        missing) printf 'curl: not found\n' >&2; return 127 ;;
+        dns) printf 'curl: (6) Could not resolve host\n' >&2; return 6 ;;
+        tcp) printf 'curl: (7) Failed to connect\n' >&2; return 7 ;;
+        esac
+        ;;
+    *) return 0 ;;
+    esac
+}
+MYSQL_CURL_MODE=success
+test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a || fail 'curl connect-only success must pass MySQL connectivity'
+for mysql_case in missing dns tcp; do
+    MYSQL_CURL_MODE="$mysql_case"
+    if test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a; then
+        fail "curl ${mysql_case} failure must fail MySQL connectivity"
+    fi
+    case "$mysql_case" in
+    missing) [[ "$MYSQL_PROBE_FAILURE_REASON" == *'缺少 curl'* ]] || fail 'missing curl must be classified as a probe-tool failure' ;;
+    dns) [[ "$MYSQL_PROBE_FAILURE_REASON" == *'DNS'* ]] || fail 'curl DNS failure must be classified as DNS' ;;
+    tcp) [[ "$MYSQL_PROBE_FAILURE_REASON" == *'TCP'* ]] || fail 'curl TCP failure must be classified as TCP' ;;
+    esac
+done
+
+# time_connect 的秒值必须在脚本端转换为毫秒，不能被 awk 正则错误丢弃。
+mysql_latency_source="$test_tmp/k8sAvailCheck.mysql-latency.functions.sh"
+sed -n '/^_mysql_curl_connect()/,/^# 连通失败时复用诊断物料/p' "$SCRIPT" >"$mysql_latency_source"
+# shellcheck disable=SC1090
+source "$mysql_latency_source"
+HOST_LATENCY_SAMPLES=1
+HOST_LATENCY_THRESHOLD_MS=50
+kubectl() {
+    local cmd="$*"
+    [[ "$cmd" == *'curl --connect-only'* ]] && { printf '0.012\n'; return 0; }
+    return 0
+}
+test_pod_to_host_latency 'mysql.example.internal:3306' || fail 'curl time_connect sample must pass latency probe'
+[[ "$HOST_LATENCY_LAST_MS" == 12 ]] || fail 'curl time_connect 0.012 seconds must become 12ms'
+
 require_text 'capture_mysql_probe_diagnostics()'
 require_text 'write_failure_artifact()'
-require_text 'command -v bash'
-require_text 'command -v timeout'
 require_text '/etc/resolv.conf'
 require_text '/etc/hosts'
 require_text 'stdout'
@@ -324,7 +385,7 @@ forbid_text "tcp_command=\"timeout 5 bash -c 'exec 3<>/dev/tcp/\${host}/\${port}
 
 # MySQL TCP 探测失败时必须保留 Pod 内诊断物料，便于区分镜像工具缺失、DNS 与端口不可达。
 mysql_diagnostic_source="$test_tmp/k8sAvailCheck.mysql-diagnostic.functions.sh"
-sed -n '/^capture_mysql_probe_diagnostics()/,/^# ==================== 混合部署: Pod -> MySQL 所在云主机延迟/p' "$SCRIPT" >"$mysql_diagnostic_source"
+sed -n '/^_mysql_curl_connect()/,/^# ==================== 混合部署: Pod -> MySQL 所在云主机延迟/p' "$SCRIPT" >"$mysql_diagnostic_source"
 log_step() { :; }
 log_info() { :; }
 log_success() { :; }
@@ -346,7 +407,7 @@ kubectl() {
     *'command -v bash'*) printf '/bin/bash\n' ;;
     *'command -v timeout'*) printf '/usr/bin/timeout\n' ;;
     *'cat /etc/resolv.conf'*) printf 'nameserver 10.96.0.10\n' ;;
-    *'/dev/tcp/mysql.example.internal/3306'*)
+    *'curl --connect-only'*)
         printf 'tcp probe stdout\n'
         printf 'tcp probe stderr\n' >&2
         return 42
@@ -360,7 +421,7 @@ mysql_diagnostic_artifact=$(find "$ARTIFACT_DIR" -type f -print -quit)
 [[ -n "$mysql_diagnostic_artifact" ]] || fail 'failed MySQL exec must create a diagnostic artifact'
 grep -qF "$MYSQL_DIAGNOSTIC_TARGET" "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include the target'
 grep -qF "$MYSQL_DIAGNOSTIC_POOL" "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include the node pool'
-grep -qF "raw_tcp_command=timeout 5 bash -c 'exec 3<>/dev/tcp/mysql.example.internal/3306'" "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must retain the raw TCP command without stderr suppression'
+grep -qF "raw_curl_command=curl --noproxy '*' --connect-only --connect-timeout 5 --silent --show-error --output /dev/null http://mysql.example.internal:3306/" "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must retain the raw curl command'
 grep -qF 'tcp probe stdout' "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include failed command stdout'
 grep -qF 'tcp probe stderr' "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include failed command stderr'
 grep -qF 'exit_code=42' "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include failed command exit code'

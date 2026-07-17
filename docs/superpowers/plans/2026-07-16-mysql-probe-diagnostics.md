@@ -4,16 +4,16 @@
 
 **Goal:** Preserve nginx-based MySQL probing while making failures diagnosable and preventing tool errors from masquerading as network failures.
 
-**Architecture:** Add a generic FAIL-summary writer at `record_result`, plus a MySQL-specific diagnostic capture helper that runs only after a failed nginx-Pod TCP probe. The existing nginx image, target extraction, and successful `/dev/tcp` path remain unchanged; latency is skipped when connectivity fails.
+**Architecture:** Add a generic FAIL-summary writer at `record_result`, plus a MySQL-specific diagnostic capture helper that runs only after a failed nginx-Pod TCP probe. The existing nginx image and target extraction remain unchanged; TCP probing uses curl `--connect-only`, and latency uses curl `%{time_connect}` only after connectivity succeeds.
 
 **Tech Stack:** Bash, kubectl exec, existing shell regression harness.
 
 ## Global Constraints
 
 - Do not add a container, image, service, external tool, cloud API, or JDBC port validation.
-- Keep nginx as the probe container and retain the existing successful TCP probe command.
+- Keep nginx as the probe container; use curl `--connect-only` for TCP probing and curl `%{time_connect}` for latency.
 - All FAIL results write a summary under `ARTIFACT_DIR`; K8s failures retain generated YAML and diagnostics.
-- MySQL failure evidence includes command, exit code, stdout/stderr, Bash/timeout presence, DNS configuration, and target lookup.
+- MySQL failure evidence includes command, exit code, stdout/stderr, curl availability, DNS configuration, and target lookup.
 - Latency is not executed after a TCP connectivity failure for the same Pod/target.
 
 ---
@@ -24,7 +24,7 @@
 - Modify: `tests/test_k8s_avail_check.sh`
 - Test: `tests/test_k8s_avail_check.sh`
 
-- [ ] Add assertions requiring `capture_mysql_probe_diagnostics`, `write_failure_artifact`, and the diagnostic fields `command -v bash`, `command -v timeout`, `/etc/resolv.conf`, `stdout`, `stderr`, and `exit_code`.
+- [ ] Add assertions requiring `capture_mysql_probe_diagnostics`, `write_failure_artifact`, and the diagnostic fields `command -v curl`, `/etc/resolv.conf`, `stdout`, `stderr`, and `exit_code`.
 - [ ] Mock a failed MySQL exec, invoke the diagnostic helper, and assert an artifact file is created with the target and command failure output.
 - [ ] Run `bash tests/test_k8s_avail_check.sh`; expect failure because the helpers do not yet exist.
 
@@ -35,8 +35,8 @@
 - Modify: `tests/test_k8s_avail_check.sh`
 
 - [ ] Implement `write_failure_artifact(check_name, detail)` using a sanitized filename under `ARTIFACT_DIR`; call it from `record_result` only for `FAIL`.
-- [ ] Implement `capture_mysql_probe_diagnostics(pool, target)` to write one text file before cleanup. It must run unredirected `kubectl exec` commands, capture each output and exit status, and include Pod metadata, target, raw TCP command, tool availability, resolv.conf, optional `getent hosts`, and TCP result.
-- [ ] Change MySQL connectivity failure text to point to the captured artifact and distinguish missing `bash`/`timeout` from DNS/TCP failure where evidence proves it.
+- [ ] Implement `capture_mysql_probe_diagnostics(pool, target)` to write one text file before cleanup. It must run unredirected `kubectl exec` commands, capture each output and exit status, and include Pod metadata, target, raw curl command, curl availability, resolv.conf, hosts, optional `getent hosts`, and curl TCP result.
+- [ ] Change MySQL connectivity failure text to point to the captured artifact and distinguish missing `curl` from DNS/TCP failure where evidence proves it.
 - [ ] Run `bash tests/test_k8s_avail_check.sh`; expect PASS.
 
 ### Task 3: Gate latency and final verification
@@ -59,3 +59,6 @@
 - [x] Strictly validate IPv4/IPv6 and hostname fields before YAML output; reject malformed or injection-shaped values.
 - [x] Inline precomputed aliases in the Deployment manifest and verify the generated YAML contains aliases rather than command-substitution text.
 - [x] Preserve original JDBC hostnames for TCP/latency and capture Pod hosts/DNS evidence in MySQL diagnostics.
+
+
+MySQL TCP 与延迟均使用 curl `--connect-only`；延迟样本通过 `%{time_connect}` 返回秒值并在脚本端转换为毫秒。
