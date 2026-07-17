@@ -919,6 +919,69 @@ check_nodepool_contract() {
 # 探测后由 main 调用 discover_and_check_nodes 枚举节点池现状(弹性池节点此时已可见),
 # 并对每个就绪池的 Pod 做双向网络连通性测试。
 
+# 从执行机 hosts 生成 Pod hostAliases：只保留有效非回环 IP 与有效主机名；同名冲突保留首次映射。
+_valid_probe_host_ip() {
+    local ip="$1" octet normalized group groups=() count=0
+    if [[ "$ip" == *.* ]]; then
+        IFS='.' read -r -a groups <<<"$ip"
+        [[ ${#groups[@]} -eq 4 ]] || return 1
+        for octet in "${groups[@]}"; do
+            [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+            ((10#$octet <= 255)) || return 1
+        done
+        return 0
+    fi
+    [[ "$ip" == *:* && "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" != *:::* ]] || return 1
+    [[ $(grep -o '::' <<<"$ip" | wc -l) -le 1 ]] || return 1
+    normalized="${ip//::/:}"
+    IFS=':' read -r -a groups <<<"$normalized"
+    for group in "${groups[@]:-}"; do
+        [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        ((count++))
+    done
+    if [[ "$ip" == *'::'* ]]; then
+        ((count < 8))
+    else
+        ((count == 8))
+    fi
+}
+
+build_probe_host_aliases() {
+    local hosts_file="${HOST_ALIAS_SOURCE_FILE:-/etc/hosts}" line ip rest name known mapped
+    local -a names=() ips=() aliases=()
+    [[ -r "$hosts_file" ]] || { log_warning "无法读取执行机 hosts: ${hosts_file}"; return 0; }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        read -r ip rest <<<"$line"
+        _valid_probe_host_ip "$ip" || continue
+        [[ "$ip" == 127.* || "$ip" == "::1" ]] && continue
+        read -r -a aliases <<<"$rest"
+        for name in "${aliases[@]:-}"; do
+            [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && "$name" != localhost* ]] || continue
+            known=0
+            for mapped in "${names[@]:-}"; do
+                [[ "${mapped%%|*}" == "$name" ]] || continue
+                known=1
+                [[ "${mapped#*|}" == "$ip" ]] || log_warning "执行机 hosts 主机名冲突: ${name} 首次映射=${mapped#*|}，忽略=${ip}"
+                break
+            done
+            [[ $known -eq 1 ]] && continue
+            names+=("${name}|${ip}")
+            known=0
+            for mapped in "${ips[@]:-}"; do [[ "$mapped" == "$ip" ]] && known=1 && break; done
+            [[ $known -eq 1 ]] || ips+=("$ip")
+        done
+    done <"$hosts_file"
+    [[ ${#ips[@]} -gt 0 ]] || return 0
+    printf '      hostAliases:\n'
+    for ip in "${ips[@]:-}"; do
+        printf '      - ip: "%s"\n        hostnames:\n' "$ip"
+        for mapped in "${names[@]:-}"; do
+            [[ "${mapped#*|}" == "$ip" ]] && printf '        - "%s"\n' "${mapped%%|*}"
+        done
+    done
+}
+
 # 生成单个探测Deployment
 #  label_pool : probe-pool 标签值(始终非空, 物理机占位用 "default"), 供阶段B按 -l probe-pool=<x> 查询
 #  selector_pool : nodeSelector 锁定的真实节点池名; 为空(物理机/自建)则不加 nodeSelector, 任意节点起服
@@ -935,6 +998,8 @@ _apply_probe_deployment() {
       nodeSelector:
         node.k8s.te/nodepool-name: \"${selector_pool}\""
     # 物料落盘: 先写 yaml 到测试物料目录, 再 kubectl apply -f 该文件(资源回收后仍可凭此复现)
+    local host_aliases
+    host_aliases=$(build_probe_host_aliases)
     _ensure_artifact_dir
     local manifest="${ARTIFACT_DIR}/${dname}.yaml"
     cat >"$manifest" <<EOF
@@ -957,7 +1022,8 @@ spec:
       labels:
         app: ${PROBE_PREFIX}
         probe-pool: "${label_pool}"
-    spec:${node_selector}
+    spec:
+${host_aliases}
       containers:
       - name: nginx-probe
         image: ${image}
@@ -1813,7 +1879,7 @@ parse_mysql_targets() {
 MYSQL_PROBE_FAILURE_REASON=""
 capture_mysql_probe_diagnostics() {
     local pool="$1" mysql_target="$2" host="${2%:*}" port="${2##*:}"
-    local artifact stdout_file stderr_file tcp_command rc_bash rc_timeout rc_resolv rc_getent rc_tcp
+    local artifact stdout_file stderr_file tcp_command rc_bash rc_timeout rc_resolv rc_hosts rc_getent rc_tcp
     local getent_available=0
 
     _ensure_artifact_dir
@@ -1837,6 +1903,8 @@ capture_mysql_probe_diagnostics() {
     { printf '\n[command -v timeout]\nexit_code=%s\nstdout:\n' "$rc_timeout"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
     if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'cat /etc/resolv.conf' >"$stdout_file" 2>"$stderr_file"; then rc_resolv=0; else rc_resolv=$?; fi
     { printf '\n[/etc/resolv.conf]\nexit_code=%s\nstdout:\n' "$rc_resolv"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
+    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'cat /etc/hosts' >"$stdout_file" 2>"$stderr_file"; then rc_hosts=0; else rc_hosts=$?; fi
+    { printf '\n[/etc/hosts]\nexit_code=%s\nstdout:\n' "$rc_hosts"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
 
     if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v getent' >"$stdout_file" 2>"$stderr_file"; then
         getent_available=1

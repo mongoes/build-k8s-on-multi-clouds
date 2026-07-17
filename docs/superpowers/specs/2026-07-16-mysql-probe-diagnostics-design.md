@@ -25,3 +25,12 @@
 - TCP 失败后不执行延迟采样。
 - 任意 `record_result(..., FAIL, ...)` 生成通用失败摘要。
 - 现有 nginx、节点池、Service、存储和 JDBC 解析回归保持通过。
+
+
+## 执行机 hosts 继承
+
+临时 `np-probe` Deployment 在 `spec.hostAliases` 内继承执行机 `/etc/hosts` 的映射，且仅输出经过严格校验的 IPv4（每段 0–255）或标准十六进制 IPv6。过滤 `127/8`、`::1`、`localhost`/`localhost*`，主机名只允许字母、数字、点和连字符。按主机名首次映射去重；后续同名不同 IP 记录告警，其他同 IP 别名继续保留。所有 YAML 值均来自此受限字符集并以双引号输出，拒绝引号、冒号伪造和非法 IPv6。
+
+注入发生在 `_apply_probe_deployment` 写入的临时 Deployment 模板 `spec` 下，先计算 `host_aliases` 再内联到 heredoc；生成的 YAML 不得含字面 `build_probe_host_aliases`。MySQL TCP 与延迟继续使用 JDBC 中的原始主机名；失败诊断采集 Pod 的 `/etc/hosts`、`resolv.conf` 和可用的 `getent hosts`，用于验证 hosts/DNS 解析路径。
+
+验收：回归测试必须实际调用 `_apply_probe_deployment` 并检查 manifest 的 `hostAliases`；覆盖回环、localhost、冲突首次映射、非法 IPv4、畸形/注入形 IPv6 的拒绝。

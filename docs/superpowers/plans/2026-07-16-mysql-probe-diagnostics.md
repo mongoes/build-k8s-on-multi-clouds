@@ -51,3 +51,11 @@
 - [x] Add a mock counter test proving failed TCP does not call the latency helper.
 - [x] Run `bash -n k8sAvailCheck.sh`, `bash tests/test_k8s_avail_check.sh`, and `git diff --check`; expect exit 0 and `PASS: availability-check regression assertions`.
 - [ ] Stage only the script, test, specification, and plan; commit `fix: capture mysql probe diagnostics`. Do not push without explicit authorization.
+
+
+### Follow-up: executor hosts inheritance (completed)
+
+- [x] Generate `np-probe` `spec.hostAliases` from valid non-loopback executor `/etc/hosts` entries; filter localhost and loopback mappings, retain first hostname mapping, and warn on conflicts.
+- [x] Strictly validate IPv4/IPv6 and hostname fields before YAML output; reject malformed or injection-shaped values.
+- [x] Inline precomputed aliases in the Deployment manifest and verify the generated YAML contains aliases rather than command-substitution text.
+- [x] Preserve original JDBC hostnames for TCP/latency and capture Pod hosts/DNS evidence in MySQL diagnostics.

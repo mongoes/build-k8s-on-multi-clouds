@@ -258,11 +258,65 @@ require_text 'test_pod_to_mysql_connectivity "$mysql_target"'
 require_text 'test_pod_to_host_latency "$mysql_target"'
 forbid_text 'MYSQL_PROBE_IP'
 forbid_text 'MYSQL_HOST_RAW'
+require_text 'build_probe_host_aliases()'
+require_text 'hostAliases:'
+require_text '/etc/hosts'
+require_text 'localhost*'
+require_text '127.*'
+require_text '::1'
+
+host_alias_source="$test_tmp/k8sAvailCheck.host-alias.functions.sh"
+sed -n '/^_valid_probe_host_ip()/,/^# 删除所有探测Deployment/p' "$SCRIPT" >"$host_alias_source"
+HOST_ALIAS_WARNING_FILE="$test_tmp/host-alias-warnings"
+log_warning() { printf "%s\n" "$*" >>"$HOST_ALIAS_WARNING_FILE"; }
+# shellcheck disable=SC1090
+source "$host_alias_source"
+HOST_ALIAS_SOURCE_FILE="$test_tmp/hosts"
+cat >"$HOST_ALIAS_SOURCE_FILE" <<'EOF'
+10.0.0.10 mysql.internal api.internal localhost localhost.localdomain
+10.0.0.11 mysql.internal duplicate.internal
+127.0.0.1 loopback.internal
+::1 ip6-localhost
+192.168.2.9 valid.internal valid.internal
+2001:db8::8 ipv6.internal
+10.0.0.12 *
+not-an-ip ignored.internal
+EOF
+: >"$HOST_ALIAS_WARNING_FILE"
+probe_host_aliases=$(build_probe_host_aliases)
+[[ "$probe_host_aliases" == *'ip: "10.0.0.10"'* ]] || fail 'valid executor hosts mapping must become a hostAlias'
+[[ "$probe_host_aliases" == *'mysql.internal'* && "$probe_host_aliases" == *'api.internal'* && "$probe_host_aliases" == *'ip: "2001:db8::8"'* ]] || fail 'valid IPv4/IPv6 host mappings must be retained'
+[[ "$probe_host_aliases" != *'localhost'* && "$probe_host_aliases" != *'loopback.internal'* && "$probe_host_aliases" != *'ip6-localhost'* ]] || fail 'localhost and loopback mappings must be filtered'
+[[ "$probe_host_aliases" != *'k8sAvailCheck.sh'* && "$probe_host_aliases" != *'test_k8s_avail_check.sh'* ]] || fail 'glob-shaped hosts aliases must not expand into workspace filenames'
+[[ "$probe_host_aliases" == *'ip: "10.0.0.11"'* && "$probe_host_aliases" == *'duplicate.internal'* ]] || fail 'conflicting hostname must retain non-conflicting aliases'
+[[ $(grep -o 'mysql.internal' <<<"$probe_host_aliases" | wc -l) -eq 1 ]] || fail 'conflicting hostname must keep only its first mapping'
+grep -qF 'mysql.internal' "$HOST_ALIAS_WARNING_FILE" || fail 'conflicting hostname must emit a warning'
+cat >>"$HOST_ALIAS_SOURCE_FILE" <<'EOF'
+999.1.1.1 bad-v4.internal
+2001:db8:::1 malformed-v6.internal
+2001:db8::1" injected.internal
+EOF
+probe_host_aliases=$(build_probe_host_aliases)
+[[ "$probe_host_aliases" != *'bad-v4.internal'* && "$probe_host_aliases" != *'malformed-v6.internal'* && "$probe_host_aliases" != *'injected.internal'* ]] || fail 'malformed or injection-shaped hosts fields must be rejected'
+
+# 真实 Deployment 物料必须内联 hostAliases，而非残留命令替换文本。
+ARTIFACT_DIR="$test_tmp/host-alias-manifest"
+NAMESPACE=debug
+PROBE_PREFIX=np-probe
+_ensure_artifact_dir() { mkdir -p "$ARTIFACT_DIR"; }
+kubectl() { :; }
+_apply_probe_deployment 'np-probe-test' 'test' '' 'nginx:stable'
+probe_manifest="$ARTIFACT_DIR/np-probe-test.yaml"
+grep -qF 'hostAliases:' "$probe_manifest" || fail 'probe Deployment manifest must inject hostAliases'
+grep -qF 'mysql.internal' "$probe_manifest" || fail 'probe Deployment manifest must include inherited hostname'
+grep -A1 -F 'ipv6.internal' "$probe_manifest" | grep -q '^      containers:' || fail 'last hostAlias hostname and containers must be separate YAML lines'
+! grep -qF 'build_probe_host_aliases' "$probe_manifest" || fail 'probe Deployment manifest must not contain literal command substitution text'
 require_text 'capture_mysql_probe_diagnostics()'
 require_text 'write_failure_artifact()'
 require_text 'command -v bash'
 require_text 'command -v timeout'
 require_text '/etc/resolv.conf'
+require_text '/etc/hosts'
 require_text 'stdout'
 require_text 'stderr'
 require_text 'exit_code'
