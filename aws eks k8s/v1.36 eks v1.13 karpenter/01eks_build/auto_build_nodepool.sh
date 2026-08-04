@@ -260,14 +260,14 @@ build_nodepool_for_business() {
     ["8c16g"]="c6a.2xlarge c7a.2xlarge c7i.2xlarge c8a.2xlarge c8i.2xlarge"
     ["8c32g"]="m8g.2xlarge m7i.2xlarge m7a.2xlarge m6i.2xlarge m6a.2xlarge"
     ["8c64g"]="r7i.2xlarge r6a.2xlarge r6i.2xlarge r7a.2xlarge"
-    ["16c64g"]="m6a.4xlarge m6i.4xlarge m6in.4xlarge m7a.4xlarge m8g.4xlarge m9g.4xlarge"
-    ["32c128g"]="m5n.8xlarge m6a.8xlarge m6i.8xlarge m6in.8xlarge m7a.8xlarge m7g.8xlarge m8g.8xlarge m9g.8xlarge"
+    ["16c64g"]="m6a.4xlarge m6i.4xlarge m6in.4xlarge m7a.4xlarge m8g.4xlarge"
+    ["32c128g"]="m6a.8xlarge m6i.8xlarge m6in.8xlarge m7a.8xlarge m8g.8xlarge"
     ["64c256g"]="m6a.16xlarge m6i.16xlarge m6in.16xlarge m7a.16xlarge m8g.16xlarge"
   )
 
   # 获取用户输入的节点组信息，可能需要多个节点组，且组内节点规格配置差异
-  read -p "请输入需要创建的节点组名称（例如:od-4c32g od-8c32g od-32c128g spot-32c128g多组之间空格分隔）: " input_nodepool_names
-  read -p "请为每个节点组选择规格（例如:4c32g 8c32g 32c128g 64c256g,顺序需与节点组名称对应,多规格之间空格分隔）: " input_nodepool_sizes
+  read -p "请输入需要创建的节点组名称（例如:od-4c32g od-32c128g spot-32c128g多组之间空格分隔）: " input_nodepool_names
+  read -p "请为每个节点组选择规格（例如:4c32g 16c64g 32c128g 64c256g,顺序需与节点组名称对应,多规格之间空格分隔）: " input_nodepool_sizes
   read -p "请为每个节点组指定付费类型（支持od spot,顺序需与节点组名称一一对应,多付费类型之间空格分隔）: " input_nodepool_billing_mode
   echo ""
   # 转换为数组

@@ -33,9 +33,147 @@ forbid_text 'record_result "StorageClass就绪检查" "WARN"'
 forbid_text 'record_result "端到端存储验证(块存储 te-disk, RWO)" "WARN"'
 forbid_text 'record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "WARN"'
 forbid_text 'record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "WARN"'
+require_text 'cleanup_historical_test_pvs || true'
+require_text 'HISTORICAL_TEST_PV_CONFIRM_TIMEOUT=30'
+require_text 'HISTORICAL_TEST_PV_DELETE_TIMEOUT=60'
+require_text 'finalize_availability_check()'
 
 test_tmp=$(mktemp -d)
 trap 'rm -rf "$test_tmp"' EXIT
+
+# 历史 PV 清理必须是收尾动作：普通流程和 AWS 提前结束流程都经统一入口执行，
+# 不能在节点组选择和现场检查之前抢占交互或改变集群资源。
+main_source="$test_tmp/k8sAvailCheck.main.sh"
+sed -n '/^main()/,/^# ==================== 资源清理/p' "$SCRIPT" >"$main_source"
+! grep -q 'cleanup_historical_test_pvs || true' "$main_source" || fail 'test PV cleanup must not run before the end of the main flow'
+[[ "$(grep -c 'finalize_availability_check' "$main_source")" -eq 2 ]] || fail 'normal and AWS early-return flows must both finalize through the test PV cleanup step'
+
+# 第二层业务节点组规划：预制方案必须经云厂商规则展开，并允许管理员完整替代默认规划。
+nodepool_plan_source="$test_tmp/k8sAvailCheck.nodepool-plan.functions.sh"
+sed -n '/^get_cloud_default_nodepools()/,/^# Pod探测就绪总超时/p' "$SCRIPT" >"$nodepool_plan_source"
+PLAN_RESULTS=()
+record_result() { PLAN_RESULTS+=("$1|$2|${3:-}"); }
+log_info() { PLAN_LOGS="${PLAN_LOGS:-}$*\n"; }
+log_warning() { PLAN_LOGS="${PLAN_LOGS:-}$*\n"; }
+log_error() { PLAN_LOGS="${PLAN_LOGS:-}$*\n"; }
+log_success() { PLAN_LOGS="${PLAN_LOGS:-}$*\n"; }
+# shellcheck disable=SC1090
+source "$nodepool_plan_source"
+
+NODEPOOL_PLAN_SELECTED=false
+NODEPOOL_PLAN_EFFECTIVE=''
+NODEPOOL_PLAN_LABEL=''
+NODEPOOL_PLAN_BASELINE=''
+NODEPOOL_PLAN_SOURCE=''
+select_predefined_nodepool_plan alibaba 3 || fail 'ACK Trino/SR preset should be selectable'
+[[ "$NODEPOOL_PLAN_EFFECTIVE" == 'reserved-32c128g spot-32c128g' ]] || fail 'ACK high-cost preset must require reserved and spot pools'
+[[ -n "$NODEPOOL_PLAN_LABEL" ]] || fail 'preset must retain a business label for the final summary'
+
+NODEPOOL_PLAN_SELECTED=false
+NODEPOOL_PLAN_EFFECTIVE=''
+select_predefined_nodepool_plan google 1 || fail 'GKE base preset should be selectable'
+[[ "$NODEPOOL_PLAN_EFFECTIVE" == 'reserved-4c32g|od-4c32g' ]] || fail 'GKE base preset must translate regular pools to OR'
+
+NODEPOOL_PLAN_SELECTED=false
+NODEPOOL_PLAN_EFFECTIVE=''
+select_predefined_nodepool_plan tencent 3 || fail 'Tencent high-cost preset should be selectable'
+[[ "$NODEPOOL_PLAN_EFFECTIVE" == 'reserved-32c128g od-32c128g spot-32c128g' ]] || fail 'Tencent preset must preserve high-cost od pool'
+
+NODEPOOL_PLAN_SELECTED=false
+NODEPOOL_PLAN_EFFECTIVE=''
+_nodepool_plan_try_menu_input alibaba 'reserved-4c32g' || fail 'a valid nodepool entered at the first menu prompt should become a custom plan'
+[[ "$NODEPOOL_PLAN_EFFECTIVE" == 'reserved-4c32g' ]] || fail 'direct custom input must not fall back to the cloud default map'
+[[ "$NODEPOOL_PLAN_LABEL" == '管理员自定义' ]] || fail 'direct custom input must be summarized as administrator custom plan'
+
+if _nodepool_plan_try_menu_input alibaba 'not-a-nodepool'; then
+    fail 'an invalid first-menu input must still be rejected for retry handling'
+fi
+
+NODEPOOL_PLAN_SELECTED=false
+NODEPOOL_PLAN_EFFECTIVE=''
+PLAN_LOGS=''
+set_custom_nodepool_plan google 'reserved-8c32g od-8c32g spot-32c128g' || fail 'valid custom plan should be accepted'
+[[ "$NODEPOOL_PLAN_EFFECTIVE" == 'reserved-8c32g|od-8c32g spot-32c128g' ]] || fail 'GKE custom regular pools must be OR-normalized'
+[[ "$(get_expected_nodepools google)" == "$NODEPOOL_PLAN_EFFECTIVE" ]] || fail 'custom plan must replace the cloud default map'
+[[ "$PLAN_LOGS" == *'同规格reserved/od任一可调度即通过'* ]] || fail 'GKE custom plan must explain reserved/od OR semantics'
+
+NODEPOOL_PLAN_SELECTED=false
+NODEPOOL_PLAN_EFFECTIVE=''
+PLAN_LOGS=''
+set_custom_nodepool_plan alibaba 'on-demand-8c32g' || fail 'legacy on-demand custom pool should be accepted'
+[[ "$NODEPOOL_PLAN_EFFECTIVE" == 'on-demand-8c32g' ]] || fail 'Alibaba custom on-demand pool must retain its real nodepool label'
+[[ "$PLAN_LOGS" != *'同规格reserved/od任一可调度即通过'* ]] || fail 'Alibaba custom plan must not print GKE/AWS OR semantics'
+
+NODEPOOL_PLAN_SELECTED=false
+NODEPOOL_PLAN_EFFECTIVE=''
+set_custom_nodepool_plan google 'on-demand-8c32g' || fail 'GKE legacy on-demand custom pool should be accepted'
+[[ "$NODEPOOL_PLAN_EFFECTIVE" == 'reserved-8c32g|od-8c32g|on-demand-8c32g' ]] || fail 'GKE custom on-demand pool must remain a schedulable OR candidate'
+
+NODEPOOL_PLAN_SELECTED=false
+NODEPOOL_PLAN_EFFECTIVE=''
+if set_custom_nodepool_plan alibaba 'reserved-8c32g malformed-pool'; then
+    fail 'malformed custom nodepool name must be rejected'
+fi
+
+# 真实 record_result 在 PASS 时曾返回条件表达式的 1，导致已成功解析的自定义规划被外层误判为非法并循环。
+# 必须加载生产函数，不能再用总是返回 0 的 mock 掩盖返回码回归。
+record_result_source="$test_tmp/k8sAvailCheck.record-result.functions.sh"
+sed -n '/^record_result()/,/^}/p' "$SCRIPT" >"$record_result_source"
+write_failure_artifact() { :; }
+# shellcheck disable=SC1090
+source "$record_result_source"
+NODEPOOL_PLAN_SELECTED=false
+NODEPOOL_PLAN_EFFECTIVE=''
+if ! set_custom_nodepool_plan alibaba 'reserved-4c32g'; then
+    fail 'valid custom nodepool plan must return success after recording PASS'
+fi
+[[ "$NODEPOOL_PLAN_EFFECTIVE" == 'reserved-4c32g' ]] || fail 'custom nodepool plan must remain selected after recording PASS'
+
+NODEPOOL_PLAN_SELECTED=false
+NODEPOOL_PLAN_EFFECTIVE=''
+NODEPOOL_PLAN_LABEL=''
+NODEPOOL_PLAN_SOURCE=''
+RESULT_NAMES=()
+RESULT_STATUS=()
+RESULT_DETAIL=()
+fallback_nodepool_plan alibaba '交互输入超时'
+[[ "$NODEPOOL_PLAN_EFFECTIVE" == 'reserved-4c32g od-4c32g reserved-32c128g spot-32c128g' ]] || fail 'timeout fallback must retain the legacy Alibaba map'
+[[ "$NODEPOOL_PLAN_SOURCE" == fallback ]] || fail 'timeout fallback must be marked as fallback'
+[[ "${RESULT_NAMES[*]}|${RESULT_STATUS[*]}|${RESULT_DETAIL[*]}" == *'节点组业务规划|WARN|交互输入超时'* ]] || fail 'timeout fallback must record WARN'
+require_text '1. Agent / 基础运营：reserved-4c32g od-4c32g'
+require_text '5. 管理员自定义节点组'
+require_text 'select_nodepool_business_plan "$cloud_platform"'
+
+# 自动化/管道执行没有 TTY 时不得卡住，必须回退旧云 map 并登记 WARN。
+NODEPOOL_PLAN_SELECTED=false
+NODEPOOL_PLAN_EFFECTIVE=''
+NODEPOOL_PLAN_SOURCE=''
+select_nodepool_business_plan alibaba
+[[ "$NODEPOOL_PLAN_SOURCE" == fallback ]] || fail 'non-interactive execution must fall back instead of waiting for input'
+
+# 火山云现场会返回 milli-byte 形式的 memory Quantity；修复必须限定在火山云内存展示，
+# 不能改变其他云、通用资源或 CPU 的现有格式化行为。
+resource_format_source="$test_tmp/k8sAvailCheck.resource-format.functions.sh"
+sed -n '/^format_resource()/,/^# ==================== 通用检查函数/p' "$SCRIPT" >"$resource_format_source"
+# shellcheck disable=SC1090
+source "$resource_format_source"
+[[ "$(format_memory_for_platform volcengine 29258405314600m)" == '27.2Gi' ]] || fail 'Volcengine milli-byte memory must be displayed as GiB'
+[[ "$(format_memory_for_platform google 29258405314600m)" == '29258405314.6C' ]] || fail 'non-Volcano memory formatting must retain the existing generic behavior'
+[[ "$(format_resource 31240700Ki)" == '29.8Gi' ]] || fail 'standard Ki memory formatting must remain unchanged'
+[[ "$(format_resource 33634467840)" == '31.3Gi' ]] || fail 'plain-byte memory formatting must remain unchanged'
+[[ "$(format_cpu 3920m)" == '3.9C' ]] || fail 'CPU millicore formatting must remain unchanged'
+
+# 扩容结论只能基于本轮探测前的节点池快照与最终就绪池之差；已有池、自建占位池不得误报0->1。
+probe_scale_source="$test_tmp/k8sAvailCheck.probe-scale.functions.sh"
+awk '/^_probe_newly_available_pools\(\)/ { capture=1 } capture && /^pod_deploy_check\(\)/ { exit } capture { print }' "$SCRIPT" >"$probe_scale_source"
+# shellcheck disable=SC1090
+source "$probe_scale_source"
+[[ -z "$(_probe_newly_available_pools 'od-4c32g' 'od-4c32g')" ]] || fail 'an existing ready pool must not be reported as 0->1'
+[[ "$(_probe_newly_available_pools '' 'od-4c32g')" == 'od-4c32g' ]] || fail 'a newly available pool must be reported as 0->1'
+[[ "$(_probe_newly_available_pools 'reserved-4c32g' 'reserved-4c32g od-4c32g')" == 'od-4c32g' ]] || fail 'mixed existing/new pools must report only the new pool'
+[[ -z "$(_probe_newly_available_pools '' 'default')" ]] || fail 'the self-managed default probe must never be reported as autoscaler 0->1'
+[[ "$(_probe_success_detail 1 'od-4c32g' '')" != *'0节点'* ]] || fail 'success detail for an existing pool must not claim a 0->1 observation'
+[[ "$(_probe_success_detail 1 'od-4c32g' 'od-4c32g')" == *'从0节点变为可调度:od-4c32g'* ]] || fail 'success detail must identify a pool newly made available during this run'
 
 # 仅加载华为 te-nfs 函数，避免 macOS 自带 Bash 不支持脚本其他部分的关联数组。
 # 用 kubectl mock 覆盖华为 te-nfs 分支。
@@ -98,6 +236,13 @@ kubectl() {
     esac
 }
 
+curl() {
+    local url="${*: -1}"
+    [[ "$url" == *'/instance/network-interfaces/0/network' ]] || return 1
+    [[ "${MOCK_GCE_METADATA_FAIL:-0}" != 1 ]] || return 22
+    printf '%s' "${MOCK_GCE_NETWORK:-projects/test-project/networks/test-network}"
+}
+
 run_huawei_case() {
     local csi_vpc="$1" manual_vpc="$2" te_nfs_exists="$3" te_nfs_vpc="$4"
     RESULT_NAMES=() RESULT_STATUS=() RESULT_DETAIL=()
@@ -153,6 +298,45 @@ if ensure_nfs_storageclass huawei; then
 fi
 [[ "${RESULT_STATUS[0]:-}" == FAIL ]] || fail 'failed te-nfs creation must record FAIL'
 MOCK_APPLY_FAIL=0
+
+# GKE 缺失 te-nfs 时必须创建 Filestore Enterprise Multishare StorageClass。
+RESULT_NAMES=() RESULT_STATUS=() RESULT_DETAIL=()
+MOCK_TE_NFS_EXISTS=0
+MOCK_APPLIED_MANIFEST="$test_tmp/google-te-nfs.yaml"
+ARTIFACT_DIR="$test_tmp/google-artifacts"
+LOG_FILE="$test_tmp/google.log"
+MOCK_GCE_METADATA_FAIL=0
+MOCK_GCE_NETWORK='projects/customer-host/networks/customer-vpc'
+ensure_nfs_storageclass google || fail 'GKE should create the Filestore te-nfs StorageClass'
+grep -qF 'provisioner: filestore.csi.storage.gke.io' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must use the Filestore CSI provisioner'
+grep -qF 'tier: enterprise' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must use the Enterprise tier'
+grep -qF 'multishare: "true"' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must enable multishare'
+grep -qF 'instance-storageclass-label: te-nfs' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must retain the instance storageclass label'
+grep -qF 'max-volume-size: "128Gi"' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must limit each Multishare PVC to 128Gi'
+grep -qF 'network: "customer-vpc"' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must pass only the Metadata network name to Filestore'
+! grep -qF 'network: "projects/customer-host/networks/customer-vpc"' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must not pass the Metadata resource path to Filestore'
+! grep -qF 'name: te-nfs-128' "$MOCK_APPLIED_MANIFEST" || fail 'GKE must not create a te-nfs-128 StorageClass'
+grep -qF 'reclaimPolicy: Retain' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must retain the user-selected reclaim policy'
+grep -qF 'volumeBindingMode: Immediate' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must retain immediate binding'
+grep -qF -- '- nolock' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must retain nolock mount option'
+grep -qF -- '- hard' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must retain hard mount option'
+grep -qF -- '- timeo=600' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must retain timeo mount option'
+grep -qF -- '- retrans=3' "$MOCK_APPLIED_MANIFEST" || fail 'GKE te-nfs must retain retrans mount option'
+
+# GCE Metadata 不可用时不得回退 default 或 apply；必须给出 Google Cloud Console 手工模版。
+RESULT_NAMES=() RESULT_STATUS=() RESULT_DETAIL=()
+MOCK_TE_NFS_EXISTS=0
+MOCK_GCE_METADATA_FAIL=1
+MOCK_APPLIED_MANIFEST="$test_tmp/google-te-nfs-metadata-fail.yaml"
+ARTIFACT_DIR="$test_tmp/google-fail-artifacts"
+LOG_FILE="$test_tmp/google-fail.log"
+if ensure_nfs_storageclass google; then
+    fail 'GKE must fail when Metadata does not provide a trusted network'
+fi
+[[ "${RESULT_STATUS[0]:-}" == FAIL ]] || fail 'GKE Metadata failure must record FAIL'
+[[ ! -s "$MOCK_APPLIED_MANIFEST" ]] || fail 'GKE Metadata failure must not apply a StorageClass'
+grep -qF 'Google Cloud控制台确认network信息' "$LOG_FILE" || fail 'GKE Metadata failure must direct the operator to Google Cloud Console'
+grep -qF 'network: "<NETWORK_NAME>"' "$LOG_FILE" || fail 'GKE Metadata failure must print a Filestore-compatible manual network template'
 
 # Service Endpoint 就绪后，数据面可能尚未完成同步；首次失败、下次成功必须重试。
 service_source="$test_tmp/k8sAvailCheck.service.functions.sh"
@@ -472,6 +656,48 @@ run_mysql_latency_gate 'reserved-4c32g' 'mysql.example.internal:3306'
 [[ $MYSQL_LATENCY_CALLS -eq 0 ]] || fail 'failed MySQL connectivity must not call the latency helper'
 [[ $lat_total -eq 0 ]] || fail 'failed MySQL connectivity must not count toward latency samples'
 [[ "$lat_skipped_detail" == *'reserved-4c32g->mysql.example.internal:3306:未执行（复用连通性失败诊断）'* ]] || fail 'failed MySQL connectivity must record the reused-diagnostic skip detail'
+
+# MySQL 连通且延迟达标时，实时输出必须说明节点池、目标和阈值，不能只在最终汇总中可见。
+mysql_fail=0 lat_total=0 lat_fail=0
+mysql_failed_pools='' lat_failed_pools='' lat_detail='' lat_skipped_detail=''
+MYSQL_LATENCY_SUCCESS_LOG=''
+test_pod_to_mysql_connectivity() { return 0; }
+test_pod_to_host_latency() { HOST_LATENCY_LAST_MS=12; return 0; }
+log_success() { MYSQL_LATENCY_SUCCESS_LOG="$*"; }
+run_mysql_latency_gate 'reserved-4c32g' 'mysql.example.internal:3306'
+[[ "$MYSQL_LATENCY_SUCCESS_LOG" == *'节点池[reserved-4c32g]'* ]] || fail 'passing latency must identify the ready node pool in realtime output'
+[[ "$MYSQL_LATENCY_SUCCESS_LOG" == *'mysql.example.internal:3306'* ]] || fail 'passing latency must identify the target in realtime output'
+[[ "$MYSQL_LATENCY_SUCCESS_LOG" == *'12ms'* && "$MYSQL_LATENCY_SUCCESS_LOG" == *"<${HOST_LATENCY_THRESHOLD_MS}ms"* ]] || fail 'passing latency must include measured value and threshold in realtime output'
+
+# te-nfs 的业务 reclaimPolicy 保持 Retain；仅脚本临时 PVC 对应 PV 必须先切换 Delete，随后删除 PVC。
+storage_cleanup_source="$test_tmp/k8sAvailCheck.storage-cleanup.functions.sh"
+awk '/^_storage_e2e_cleanup\(\)/ { capture=1 } capture && /^_storage_e2e_capture_diagnostics\(\)/ { exit } capture { print }' "$SCRIPT" >"$storage_cleanup_source"
+# shellcheck disable=SC1090
+source "$storage_cleanup_source"
+NAMESPACE='debug'
+STORAGE_CLEANUP_CALLS="$test_tmp/storage-cleanup.calls"
+: >"$STORAGE_CLEANUP_CALLS"
+MOCK_STORAGE_PV_EXISTS=1
+kubectl() {
+    local cmd="$*"
+    printf '%s\n' "$cmd" >>"$STORAGE_CLEANUP_CALLS"
+    case "$cmd" in
+    "get pvc te-csi-check-nfs-pvc -n debug -o jsonpath="*) printf 'pvc-temporary-nfs' ;;
+    "patch pv pvc-temporary-nfs --type=merge -p "*) return 0 ;;
+    "delete pvc te-csi-check-nfs-pvc -n debug --ignore-not-found") MOCK_STORAGE_PV_EXISTS=0 ;;
+    "get pv pvc-temporary-nfs") [[ "$MOCK_STORAGE_PV_EXISTS" -eq 1 ]] ;;
+    *) return 0 ;;
+    esac
+}
+log_success() { :; }
+log_error() { :; }
+_storage_e2e_cleanup 'te-csi-check-nfs-pvc' 'te-csi-check-nfs-pod' || fail 'temporary storage cleanup must succeed after PV reclaim policy is switched'
+grep -q '^patch pv pvc-temporary-nfs --type=merge -p ' "$STORAGE_CLEANUP_CALLS" || fail 'temporary test PV must be patched to Delete before PVC deletion'
+patch_index=$(grep -n -m1 '^patch pv pvc-temporary-nfs ' "$STORAGE_CLEANUP_CALLS" | cut -d: -f1)
+delete_index=$(grep -n -m1 '^delete pvc te-csi-check-nfs-pvc ' "$STORAGE_CLEANUP_CALLS" | cut -d: -f1)
+(( patch_index < delete_index )) || fail 'temporary test PV must be patched before its PVC is deleted'
+
+require_text '就绪节点池: ${ready_pools_display}'
 require_text 'huawei_te_disk_before_gpssd2.yaml'
 require_text 'record_result "块存储StorageClass就绪检查" "WARN" "发现被PVC/PV依赖的历史te-disk，保留现有盘型以兼容存量应用"'
 forbid_text 'check_huawei_gpssd2_support'
@@ -638,6 +864,75 @@ MOCK_TE_DISK_PV_BOUND=1
 has_te_disk_dependents || fail 'PV using te-disk must be a dependency even without PVC use'
 MOCK_TE_DISK_PV_BOUND=0
 
+# Kyverno 兼容性检查：Pod 名识别、镜像 tag 版本比较、解析失败兜底与重装失败提示。
+kyverno_source="$test_tmp/k8sAvailCheck.kyverno.functions.sh"
+awk '/^_kyverno_version_lt\(\)/ { capture=1 } capture && /^check_tencent_cloud_features\(\)/ { exit } capture { print }' "$SCRIPT" >"$kyverno_source"
+# shellcheck disable=SC1090
+source "$kyverno_source"
+
+run_kyverno_case() {
+    local server_version="$1" te_rows="$2" kube_rows="$3" query_fail_namespace="${4:-}" install_rc="${5:-0}"
+    RESULT_NAMES=() RESULT_STATUS=() RESULT_DETAIL=()
+    MOCK_KYVERNO_SERVER_VERSION="$server_version"
+    MOCK_KYVERNO_TE_ROWS="$te_rows"
+    MOCK_KYVERNO_KUBE_ROWS="$kube_rows"
+    MOCK_KYVERNO_QUERY_FAIL_NAMESPACE="$query_fail_namespace"
+    MOCK_KYVERNO_INSTALL_RC="$install_rc"
+    KYVERNO_INSTALL_CALLS=0
+    KYVERNO_LAST_ERROR=''
+    kubectl() {
+        local cmd="$*"
+        case "$cmd" in
+        "version -o json") printf '{"serverVersion":{"gitVersion":"%s"}}' "$MOCK_KYVERNO_SERVER_VERSION" ;;
+        "get pods -n te-system -o jsonpath="*)
+            [[ "$MOCK_KYVERNO_QUERY_FAIL_NAMESPACE" != te-system ]] || return 1
+            printf '%b' "$MOCK_KYVERNO_TE_ROWS"
+            ;;
+        "get pods -n kube-system -o jsonpath="*)
+            [[ "$MOCK_KYVERNO_QUERY_FAIL_NAMESPACE" != kube-system ]] || return 1
+            printf '%b' "$MOCK_KYVERNO_KUBE_ROWS"
+            ;;
+        *) return 0 ;;
+        esac
+    }
+    run_kyverno_reinstall() { ((KYVERNO_INSTALL_CALLS++)); return "$MOCK_KYVERNO_INSTALL_RC"; }
+    log_step() { :; }
+    log_info() { :; }
+    log_success() { :; }
+    log_warning() { :; }
+    log_error() { KYVERNO_LAST_ERROR="$*"; }
+    check_kyverno_compatibility
+}
+
+run_kyverno_case 'v1.35.6-gke.1' '' ''
+[[ "${RESULT_STATUS[0]:-}" == SKIP ]] || fail 'Kyverno must skip when no Kyverno Pod exists'
+[[ $KYVERNO_INSTALL_CALLS -eq 0 ]] || fail 'Kyverno absence must not invoke reinstall'
+
+run_kyverno_case 'v1.33.9' $'kyverno-admission\tdocker.example/kyvernopre:v1.10.3\n' ''
+[[ "${RESULT_STATUS[0]:-}" == PASS ]] || fail 'legacy Kyverno on Kubernetes below 1.34 must pass without reinstall'
+[[ $KYVERNO_INSTALL_CALLS -eq 0 ]] || fail 'Kubernetes below 1.34 must not invoke reinstall'
+
+run_kyverno_case 'v1.34.0' $'kyverno-admission\tdocker.example/kyvernopre:v1.18.0\n' $'kyverno-background\tdocker.example/kyverno-background-controller:v1.18.1\n'
+[[ "${RESULT_STATUS[0]:-}" == PASS ]] || fail 'supported Kyverno versions must pass'
+[[ $KYVERNO_INSTALL_CALLS -eq 0 ]] || fail 'supported Kyverno versions must not invoke reinstall'
+
+run_kyverno_case 'v1.34.0' $'kyverno-admission\tdocker.example/kyvernopre:v1.10.3\n' ''
+[[ "${RESULT_STATUS[0]:-}" == PASS ]] || fail 'successful Kyverno reinstall must pass the check'
+[[ $KYVERNO_INSTALL_CALLS -eq 1 ]] || fail 'kyvernopre legacy image must invoke exactly one reinstall'
+
+run_kyverno_case 'v1.34.0' $'kyverno-admission\tdocker.example/kyvernopre:stable\n' $'kyverno-background\tdocker.example/kyverno-background-controller:v1.18.1\n'
+[[ $KYVERNO_INSTALL_CALLS -eq 1 ]] || fail 'an unparseable Kyverno image must invoke the fallback reinstall'
+
+run_kyverno_case 'v1.34.0' $'kyverno-admission\tdocker.example/kyvernopre:v1.18.0-rc.1\n' ''
+[[ $KYVERNO_INSTALL_CALLS -eq 1 ]] || fail 'a prerelease Kyverno image must invoke the stable-version fallback reinstall'
+
+run_kyverno_case 'v1.34.0' $'kyverno-admission\tdocker.example/kyvernopre:v1.10.3\n' '' '' 9
+[[ "${RESULT_STATUS[0]:-}" == FAIL ]] || fail 'failed Kyverno reinstall must record FAIL'
+[[ "$KYVERNO_LAST_ERROR" == *'/data/app/.admin_manager_ta/ta-admin/ta-admin te_k8s install -name kyverno'* ]] || fail 'failed Kyverno reinstall must print the manual command'
+
+run_kyverno_case 'v1.34.0' '' '' te-system
+[[ "${RESULT_STATUS[0]:-}" == WARN ]] || fail 'failed Kyverno discovery must warn instead of reporting absence'
+
 
 # 所有华为路径都必须先做 GPSSD2 支持度检查；FAIL/WARN 均不能创建或迁移 te-disk。
 run_huawei_storageclass_case() {
@@ -659,5 +954,55 @@ run_huawei_storageclass_case() {
     RESULT_NAMES=() RESULT_STATUS=() RESULT_DETAIL=()
     ensure_storageclass huawei
 }
+
+# 历史测试 PV 清理：只有精确命名、debug claim、Released、CSI 动态卷且 PVC 已不存在的候选可删除。
+historical_cleanup_source="$test_tmp/k8sAvailCheck.historical-pv-cleanup.functions.sh"
+awk '/^historical_test_pv_is_candidate\(\)/ { capture=1 } capture && /^_storage_e2e_cleanup\(\)/ { exit } capture { print }' "$SCRIPT" >"$historical_cleanup_source"
+HISTORICAL_CLEANUP_CALLS="$test_tmp/historical-pv-cleanup.calls"
+: >"$HISTORICAL_CLEANUP_CALLS"
+HISTORICAL_TEST_PV_EXISTS=1
+HISTORICAL_TEST_PV_CONFIRM_TIMEOUT=30
+HISTORICAL_TEST_PV_DELETE_TIMEOUT=60
+RESULT_NAMES=() RESULT_STATUS=() RESULT_DETAIL=()
+log_step() { :; }
+log_info() { :; }
+log_success() { :; }
+log_warning() { :; }
+log_error() { :; }
+record_result() {
+    RESULT_NAMES+=("$1")
+    RESULT_STATUS+=("$2")
+    RESULT_DETAIL+=("${3:-}")
+}
+sleep() { :; }
+kubectl() {
+    local cmd="$*"
+    printf '%s\n' "$cmd" >>"$HISTORICAL_CLEANUP_CALLS"
+    case "$cmd" in
+    "get pv -o jsonpath="*)
+        [[ "$HISTORICAL_TEST_PV_EXISTS" == 1 ]] && printf 'test-debug-pv business-released-pv'
+        ;;
+    "get pv test-debug-pv -o jsonpath="*)
+        [[ "$HISTORICAL_TEST_PV_EXISTS" == 1 ]] || return 1
+        printf 'Released|debug|te-csi-check-nfs-pvc|te-nfs|nas.csi.everest.io|everest-csi-provisioner|volume-test'
+        ;;
+    "get pv business-released-pv -o jsonpath="*)
+        printf 'Released|te-agent|home-sandbox-1-business|te-nfs|nas.csi.everest.io|everest-csi-provisioner|volume-business'
+        ;;
+    "get sc te-nfs -o jsonpath="*) printf 'everest-csi-provisioner' ;;
+    "get pvc te-csi-check-nfs-pvc -n debug") return 1 ;;
+    "patch pv test-debug-pv --type=merge -p "*) return 0 ;;
+    "delete pv test-debug-pv --ignore-not-found --wait=false") HISTORICAL_TEST_PV_EXISTS=0 ;;
+    "get pv test-debug-pv") [[ "$HISTORICAL_TEST_PV_EXISTS" == 1 ]] ;;
+    *) return 0 ;;
+    esac
+}
+# shellcheck disable=SC1090
+source "$historical_cleanup_source"
+cleanup_historical_test_pvs || fail 'non-interactive historical cleanup should complete when only an exact test PV qualifies'
+grep -q '^patch pv test-debug-pv ' "$HISTORICAL_CLEANUP_CALLS" || fail 'qualified historical test PV must be switched to Delete before deletion'
+grep -q '^delete pv test-debug-pv ' "$HISTORICAL_CLEANUP_CALLS" || fail 'qualified historical test PV must be deleted'
+! grep -q 'patch pv business-released-pv\|delete pv business-released-pv' "$HISTORICAL_CLEANUP_CALLS" || fail 'Released business PV must never be cleaned'
+[[ "${RESULT_STATUS[*]}" == *PASS* ]] || fail 'successful historical cleanup must record PASS'
 
 echo 'PASS: availability-check regression assertions'

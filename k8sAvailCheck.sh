@@ -4,20 +4,23 @@
 # 检查项包含：
 #1. kubectl检查
 #2. K8S集群连通性检查
-#3. K8S所属环境检查
-#4. 块存储StorageClass就绪检查(te-disk)
-#5. 网络存储StorageClass就绪检查(te-nfs)
-#6. Pod部署启动检查(并发探测所有节点池)
-#7. 节点池与节点配置检查
-#8. 节点组契约校验(规格/付费类型/污点 vs 池名声明)
-#9. 本地服务器访问Pod网络连通性检查(兼容性验证)
-##10. 本地服务器访问Kubernetes Service连通性检查(NodePort)
-#11. Pod访问本地服务器网络连通性检查
-#12. Pod访问集群内MySQL连通性检查(混合部署网络错配探测)
-#13. Pod访问集群内云主机延迟检查(<50ms, TCP握手近似RTT)
-#14. 端到端存储验证(块存储 te-disk, RWO: PVC->单Pod挂载->读写)
-#15. 端到端存储验证(文件存储 te-nfs, RWX: PVC->单Pod挂载->读写)
-#16. 端到端存储验证(文件存储 te-nfs, RWX跨节点共享读写)
+#3. Kyverno K8S兼容性检查
+#4. K8S所属环境检查
+#5. 节点组业务规划选择
+#6. 块存储StorageClass就绪检查(te-disk)
+#7. 网络存储StorageClass就绪检查(te-nfs)
+#8. Pod部署启动检查(并发探测所有节点池)
+#9. 节点池与节点配置检查
+#10. 节点组契约校验(规格/付费类型/污点 vs 池名声明)
+#11. 本地服务器访问Pod网络连通性检查(兼容性验证)
+#12. 本地服务器访问Kubernetes Service连通性检查(NodePort)
+#13. Pod访问本地服务器网络连通性检查
+#14. Pod访问集群内MySQL连通性检查(混合部署网络错配探测)
+#15. Pod访问集群内云主机延迟检查(<50ms, TCP握手近似RTT)
+#16. 端到端存储验证(块存储 te-disk, RWO: PVC->单Pod挂载->读写)
+#18. 端到端存储验证(文件存储 te-nfs, RWX: PVC->单Pod挂载->读写)
+#18. 端到端存储验证(文件存储 te-nfs, RWX跨节点共享读写)
+#19. 测试PV清理(精确识别，可确认后回收)
 #    (端到端 SC->PVC->Pod 起服为存储服务就绪的唯一金标准)
 
 # ==================== 配置部分 ====================
@@ -60,7 +63,9 @@ IMAGE_PULL_FAIL_HINT="从 docker-ta.thinkingdata.cn 仓库拉取镜像失败，�
 #  - 未覆盖云平台    : 用 google 风格的 od 三池兜底
 #  - 物理机/自建     : 不检查节点池(映射为空),仅起一个无 nodeSelector 的 Pod
 # OR 组语法: 同一档的多个候选用 | 连接(无空格),如 reserved-4c32g|od-4c32g;不同档用空格分隔。
-get_expected_nodepools() {
+# 云厂商默认规划仅作为未选择业务方案、输入超时或物理机环境时的来源；托管云在运行时
+# 由第二层业务规划覆写 get_expected_nodepools，确保探测与契约对账使用同一份标准。
+get_cloud_default_nodepools() {
     case "$1" in
     *alibaba* | *ali* | *huawei*)
         echo "reserved-4c32g od-4c32g reserved-32c128g spot-32c128g"
@@ -77,6 +82,227 @@ get_expected_nodepools() {
     *) # 未覆盖云平台(azure 等)用 google 风格 od 三池兜底
         echo "od-4c32g od-32c128g spot-32c128g" ;;
     esac
+}
+
+# 本次运行的业务节点组规划上下文。只在内存中生效，不写入任何集群或本地配置文件。
+NODEPOOL_PLAN_SELECTED=false
+NODEPOOL_PLAN_EFFECTIVE=""
+NODEPOOL_PLAN_LABEL=""
+NODEPOOL_PLAN_BASELINE=""
+NODEPOOL_PLAN_SOURCE=""
+NODEPOOL_PLAN_INPUT_TIMEOUT=30
+NODEPOOL_PLAN_MAX_ATTEMPTS=3
+
+get_expected_nodepools() {
+    if [[ "$NODEPOOL_PLAN_SELECTED" == true ]]; then
+        printf '%s\n' "$NODEPOOL_PLAN_EFFECTIVE"
+    else
+        get_cloud_default_nodepools "$1"
+    fi
+}
+
+_nodepool_plan_is_managed_platform() {
+    case "$1" in
+    vmware | kvm | qemu | baremetal) return 1 ;;
+    *) return 0 ;;
+    esac
+}
+
+_nodepool_plan_normalize_input() {
+    local raw="$1" token billing spec
+    local tokens=() normalized=()
+    read -r -a tokens <<<"$raw"
+    [[ ${#tokens[@]} -gt 0 ]] || return 1
+
+    for token in "${tokens[@]}"; do
+        if [[ "$token" =~ ^(reserved|od|on-demand|spot)-([0-9]+c[0-9]+g)$ ]]; then
+            billing="${BASH_REMATCH[1]}"
+            spec="${BASH_REMATCH[2]}"
+            token="${billing}-${spec}"
+            [[ " ${normalized[*]-} " == *" ${token} "* ]] || normalized+=("$token")
+        else
+            return 1
+        fi
+    done
+    printf '%s\n' "${normalized[*]}"
+}
+
+_nodepool_plan_expand_for_platform() {
+    local platform="$1" raw="$2" token candidate billing spec candidate_billing candidate_spec
+    local tokens=() effective=() regular_specs=()
+    read -r -a tokens <<<"$raw"
+
+    for token in "${tokens[@]}"; do
+        [[ "$token" =~ ^(reserved|od|on-demand|spot)-([0-9]+c[0-9]+g)$ ]] || return 1
+        billing="${BASH_REMATCH[1]}"
+        spec="${BASH_REMATCH[2]}"
+        if [[ "$platform" == *google* || "$platform" == *aws* ]] && [[ "$billing" == reserved || "$billing" == od || "$billing" == on-demand ]]; then
+            if [[ " ${regular_specs[*]-} " != *" ${spec} "* ]]; then
+                # 自定义输入若沿用历史 on-demand 池名，则把它保留为 OR 候选；
+                # 预制和仅含 reserved/od 的输入维持既有两候选展示。
+                local has_on_demand=false
+                for candidate in "${tokens[@]}"; do
+                    [[ "$candidate" =~ ^(reserved|od|on-demand|spot)-([0-9]+c[0-9]+g)$ ]] || continue
+                    candidate_billing="${BASH_REMATCH[1]}"
+                    candidate_spec="${BASH_REMATCH[2]}"
+                    [[ "$candidate_billing" == on-demand && "$candidate_spec" == "$spec" ]] && has_on_demand=true
+                done
+                if $has_on_demand; then
+                    effective+=("reserved-${spec}|od-${spec}|on-demand-${spec}")
+                else
+                    effective+=("reserved-${spec}|od-${spec}")
+                fi
+                regular_specs+=("$spec")
+            fi
+        else
+            effective+=("$token")
+        fi
+    done
+
+    # 腾讯/火山的高开销预制方案保留原有 od-32c128g 要求；自定义输入不擅自追加池。
+    if [[ "$NODEPOOL_PLAN_SOURCE" == preset ]] && [[ "$platform" == *tencent* || "$platform" == *volc* ]] &&
+        [[ " ${effective[*]-} " == *' reserved-32c128g '* ]] && [[ " ${effective[*]-} " == *' spot-32c128g '* ]] &&
+        [[ " ${effective[*]-} " != *' od-32c128g '* ]]; then
+        local expanded=()
+        for token in "${effective[@]}"; do
+            expanded+=("$token")
+            [[ "$token" == reserved-32c128g ]] && expanded+=("od-32c128g")
+        done
+        effective=("${expanded[@]}")
+    fi
+    printf '%s\n' "${effective[*]}"
+}
+
+_nodepool_plan_record_selection() {
+    local status="$1" detail="$2"
+    record_result "节点组业务规划" "$status" "$detail"
+}
+
+_log_nodepool_plan_platform_semantics() {
+    local platform="$1"
+    [[ "$platform" == *google* || "$platform" == *aws* ]] &&
+        log_info "  说明：该云无原生reserved容器实例，同规格reserved/od任一可调度即通过"
+    return 0
+}
+
+_nodepool_plan_apply() {
+    local platform="$1" raw="$2" label="$3" source="$4" normalized
+    normalized=$(_nodepool_plan_normalize_input "$raw") || return 1
+    NODEPOOL_PLAN_SOURCE="$source"
+    NODEPOOL_PLAN_BASELINE="$normalized"
+    NODEPOOL_PLAN_EFFECTIVE=$(_nodepool_plan_expand_for_platform "$platform" "$normalized")
+    NODEPOOL_PLAN_LABEL="$label"
+    NODEPOOL_PLAN_SELECTED=true
+    return 0
+}
+
+select_predefined_nodepool_plan() {
+    local platform="$1" choice="$2" raw label
+    case "$choice" in
+    1)
+        label="Agent基础服务"
+        raw="reserved-4c32g od-4c32g"
+        ;;
+    2)
+        label="运营 / 数据开发"
+        raw="reserved-8c32g od-8c32g"
+        ;;
+    3)
+        label="Trino / StarRocks等高开销服务"
+        raw="reserved-32c128g spot-32c128g"
+        ;;
+    4)
+        label="基础服务 + 高开销服务"
+        raw="reserved-4c32g od-4c32g reserved-32c128g spot-32c128g"
+        ;;
+    *) return 1 ;;
+    esac
+    _nodepool_plan_apply "$platform" "$raw" "$label" preset || return 1
+    log_success "已选择业务规划：${NODEPOOL_PLAN_LABEL}"
+    log_info "  业务基准节点组：${NODEPOOL_PLAN_BASELINE}"
+    log_info "  本云实际检查节点组：${NODEPOOL_PLAN_EFFECTIVE}"
+    _log_nodepool_plan_platform_semantics "$platform"
+    _nodepool_plan_record_selection "PASS" "${NODEPOOL_PLAN_LABEL}；业务基准:${NODEPOOL_PLAN_BASELINE}；实际检查:${NODEPOOL_PLAN_EFFECTIVE}"
+}
+
+_nodepool_plan_try_menu_input() {
+    local platform="$1" input="$2"
+    case "$input" in
+    1 | 2 | 3 | 4)
+        select_predefined_nodepool_plan "$platform" "$input"
+        ;;
+    5)
+        # 由调用方继续读取第二次自定义输入；2 仅表示该交互分支，不是错误。
+        return 2
+        ;;
+    *)
+        # 首层同时接受管理员直接输入的完整节点组规划，避免要求其先额外输入一次 5。
+        set_custom_nodepool_plan "$platform" "$input"
+        ;;
+    esac
+}
+
+set_custom_nodepool_plan() {
+    local platform="$1" raw="$2"
+    _nodepool_plan_apply "$platform" "$raw" "管理员自定义" custom || return 1
+    log_success "已选择业务规划：管理员自定义"
+    log_info "  本云实际检查节点组：${NODEPOOL_PLAN_EFFECTIVE}"
+    _log_nodepool_plan_platform_semantics "$platform"
+    _nodepool_plan_record_selection "PASS" "管理员自定义；实际检查:${NODEPOOL_PLAN_EFFECTIVE}"
+}
+
+fallback_nodepool_plan() {
+    local platform="$1" reason="$2"
+    local fallback
+    fallback=$(get_cloud_default_nodepools "$platform")
+    NODEPOOL_PLAN_SELECTED=true
+    NODEPOOL_PLAN_EFFECTIVE="$fallback"
+    NODEPOOL_PLAN_BASELINE="$fallback"
+    NODEPOOL_PLAN_LABEL="未选择业务规划（云厂商默认）"
+    NODEPOOL_PLAN_SOURCE=fallback
+    log_warning "节点组业务规划${reason}，回退云厂商默认节点组：${fallback:-无}"
+    _nodepool_plan_record_selection "WARN" "${reason}；回退云厂商默认节点组:${fallback:-无}"
+}
+
+select_nodepool_business_plan() {
+    local platform="$1" choice custom attempt=1 selection_rc
+    _nodepool_plan_is_managed_platform "$platform" || return 0
+
+    if [[ ! -t 0 ]]; then
+        fallback_nodepool_plan "$platform" "检测到非交互执行环境"
+        return 0
+    fi
+
+    log_info "请选择当前环境需满足的业务节点组规划："
+    log_info "  1. Agent / 基础运营：reserved-4c32g od-4c32g"
+    log_info "  2. 复杂运营 / 数据开发：reserved-8c32g od-8c32g"
+    log_info "  3. Trino 云计算 / SR：reserved-32c128g spot-32c128g"
+    log_info "  4. 基础服务 + 高开销服务：reserved-4c32g od-4c32g reserved-32c128g spot-32c128g"
+    log_info "  5. 管理员自定义节点组"
+
+    while [[ $attempt -le $NODEPOOL_PLAN_MAX_ATTEMPTS ]]; do
+        if ! read -r -t "$NODEPOOL_PLAN_INPUT_TIMEOUT" -p "请输入选项 [1-5]，或直接输入自定义节点组（${NODEPOOL_PLAN_INPUT_TIMEOUT} 秒后回退默认规划）: " choice; then
+            fallback_nodepool_plan "$platform" "交互输入超时"
+            return 0
+        fi
+        if _nodepool_plan_try_menu_input "$platform" "$choice"; then
+            return 0
+        else
+            selection_rc=$?
+        fi
+        if [[ $selection_rc -eq 2 ]]; then
+            if ! read -r -t "$NODEPOOL_PLAN_INPUT_TIMEOUT" -p "请输入节点组（空格分隔，例如 reserved-8c32g od-8c32g）: " custom; then
+                fallback_nodepool_plan "$platform" "自定义节点组输入超时"
+                return 0
+            fi
+            if set_custom_nodepool_plan "$platform" "$custom"; then
+                return 0
+            fi
+        fi
+        log_error "输入无效。请输入选项1-5，或直接输入 reserved|od|on-demand|spot-\${CPU}c\${内存}g（剩余 $((NODEPOOL_PLAN_MAX_ATTEMPTS - attempt)) 次）"
+        ((attempt++))
+    done
+    fallback_nodepool_plan "$platform" "连续${NODEPOOL_PLAN_MAX_ATTEMPTS}次输入无效"
 }
 # Pod探测就绪总超时(秒)。云资源扩容通常1~2分钟内完成,超过3分钟多半是
 # 节点池异常或未打标签,不再傻等;另结合 Pod events 提前识别"无匹配节点池"。
@@ -236,6 +462,9 @@ record_result() {
     RESULT_STATUS+=("$2")
     RESULT_DETAIL+=("${3:-}")
     [[ "$2" == "FAIL" ]] && write_failure_artifact "$1" "${3:-}"
+    # 结果登记不能把“非 FAIL”条件表达式的退出码(1)泄漏给调用者；
+    # 调用方会据此判断业务操作是否成功，例如自定义节点组输入。
+    return 0
 }
 
 # 打印最终汇总总览(彩色), 并统计 PASS/WARN/FAIL/IMPORTANT/SKIP 数量
@@ -380,6 +609,19 @@ format_resource() {
     esac
 }
 
+# 火山 VKE 的 memory Quantity 可能以 milli-byte 返回（例如 29258405314600m）。
+# 该兼容只用于火山云内存展示；其他云和其他资源继续保持通用格式化行为。
+format_memory_for_platform() {
+    local platform="$1"
+    local value="$2"
+    if [[ "$platform" == *volc* && "$value" =~ ^[0-9]+m$ ]]; then
+        local milli_bytes="${value%m}"
+        awk "BEGIN {printf \"%.1fGi\", $milli_bytes/1000/1024/1024/1024}"
+        return
+    fi
+    format_resource "$value"
+}
+
 # 将CPU值转为可读格式
 format_cpu() {
     local cpu="$1"
@@ -506,6 +748,7 @@ ensure_namespace() {
 #   3. 再统一打印节点池汇总信息
 discover_and_check_nodes() {
     log_step "节点池与节点配置检查"
+    local platform="$1"
 
     local all_nodes=$(kubectl get nodes --no-headers 2>/dev/null)
     if [[ -z "$all_nodes" ]]; then
@@ -616,8 +859,8 @@ discover_and_check_nodes() {
                     local cpu=$(kubectl get node "$node" -o jsonpath='{.status.capacity.cpu}' 2>/dev/null)
                     local mem=$(kubectl get node "$node" -o jsonpath='{.status.capacity.memory}' 2>/dev/null)
                     local sys_disk=$(kubectl get node "$node" -o jsonpath='{.status.capacity.ephemeral-storage}' 2>/dev/null)
-                    echo -e "    ${YELLOW}    - $node: CPU=$(format_cpu $cpu) / 内存=$(format_resource $mem) / 磁盘空间=$(format_resource $sys_disk)${NC}"
-                    echo "    - $node: CPU=$(format_cpu $cpu) / 内存=$(format_resource $mem) / 磁盘空间=$(format_resource $sys_disk)" >>${LOG_FILE}
+                    echo -e "    ${YELLOW}    - $node: CPU=$(format_cpu $cpu) / 内存=$(format_memory_for_platform "$platform" "$mem") / 磁盘空间=$(format_resource $sys_disk)${NC}"
+                    echo "    - $node: CPU=$(format_cpu $cpu) / 内存=$(format_memory_for_platform "$platform" "$mem") / 磁盘空间=$(format_resource $sys_disk)" >>${LOG_FILE}
                 done
             fi
 
@@ -702,9 +945,9 @@ discover_and_check_nodes() {
         for ((r = 0; r < nrows; r++)); do
             local vals=()
             if [[ $r -eq 0 ]]; then
-                vals=("$pool_name" "$node_count" "$(format_cpu ${cpu})" "$(format_resource ${mem})"
+                vals=("$pool_name" "$node_count" "$(format_cpu ${cpu})" "$(format_memory_for_platform "$platform" "$mem")"
                 "$(format_resource ${sys_disk})" "$(format_cpu ${alloc_cpu})"
-                "$(format_resource ${alloc_mem})" "$(format_resource ${alloc_disk})"
+                "$(format_memory_for_platform "$platform" "$alloc_mem")" "$(format_resource ${alloc_disk})"
                 "${label_arr[0]:-}" "${taint_arr[0]:-}")
             else
                 vals=("" "" "" "" "" "" "" "" "${label_arr[r]:-}" "${taint_arr[r]:-}")
@@ -949,7 +1192,10 @@ _valid_probe_host_ip() {
 build_probe_host_aliases() {
     local hosts_file="${HOST_ALIAS_SOURCE_FILE:-/etc/hosts}" line ip rest name known mapped
     local -a names=() ips=() aliases=()
-    [[ -r "$hosts_file" ]] || { log_warning "无法读取执行机 hosts: ${hosts_file}"; return 0; }
+    [[ -r "$hosts_file" ]] || {
+        log_warning "无法读取执行机 hosts: ${hosts_file}"
+        return 0
+    }
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%%#*}"
         read -r ip rest <<<"$line"
@@ -1233,6 +1479,32 @@ IPTABLES_PERSIST_CIDR=""
 IPTABLES_PERSIST_POD_IP=""
 IPTABLES_PERSIST_LOCAL_IP=""
 
+# 根据探测启动前的 nodepool-name 快照，找出本轮从“无节点”变为“Pod 可调度”的节点池。
+# 这里只证明状态变化；不把节点出现的原因武断归结为 autoscaler。
+_probe_newly_available_pools() {
+    local existing_snapshot="$1"
+    local ready_pools="$2"
+    local newly_available=""
+    local pool
+    for pool in $ready_pools; do
+        [[ "$pool" == "default" ]] && continue
+        if ! grep -qxF "$pool" <<<"$existing_snapshot"; then
+            newly_available="${newly_available} ${pool}"
+        fi
+    done
+    echo "${newly_available# }"
+}
+
+_probe_success_detail() {
+    local expected="$1"
+    local ready_pools="$2"
+    local newly_available_pools="$3"
+    local detail="全部${expected}档节点池均可调度；就绪节点池:${ready_pools}"
+    [[ -n "$newly_available_pools" ]] &&
+        detail="${detail}；本次观察到从0节点变为可调度:${newly_available_pools}"
+    echo "$detail"
+}
+
 pod_deploy_check() {
     log_step "Pod部署启动检查(并发探测所有节点池)"
     ensure_namespace
@@ -1249,6 +1521,10 @@ pod_deploy_check() {
     declare -A SLOT_MEMBERS
     declare -A POOL_SLOT
     local pool_order=()
+    local existing_np=""
+    if [[ -n "$pools_str" ]]; then
+        existing_np=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.labels.node\.k8s\.te/nodepool-name}{"\n"}{end}' 2>/dev/null)
+    fi
 
     if [[ -z "$pools_str" ]]; then
         # 物理机/自建: 无节点池规划, 用占位池名 default 起一个无 nodeSelector 的 Pod
@@ -1261,7 +1537,6 @@ pod_deploy_check() {
     else
         read -r -a slot_order <<<"$pools_str"
         # OR 组裁决: 先按现存节点的 nodepool-name 标签选"存在的那个", 都不存在则回退探测全部候选
-        local existing_np=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.labels.node\.k8s\.te/nodepool-name}{"\n"}{end}' 2>/dev/null)
         local i token
         for i in "${!slot_order[@]}"; do
             token="${slot_order[$i]}"
@@ -1439,19 +1714,27 @@ pod_deploy_check() {
             [[ "$token" == *"|"* ]] && log_error "  (二选一档[${token}]的候选均未就绪，该档判未通过)"
         fi
     done
-    log_info "阶段性结论: 预期 ${expected} 档节点池可调度，实际 ${ready} 档可调度"
+    local ready_pools_display="${PROBE_READY_POOLS# }"
+    local newly_available_pools
+    newly_available_pools=$(_probe_newly_available_pools "$existing_np" "$ready_pools_display")
+    log_info "阶段性结论: 预期 ${expected} 档节点池可调度，实际 ${ready} 档可调度；就绪节点池: ${ready_pools_display:-无}"
 
     if [[ $ready -lt $expected ]]; then
         log_error "Pod部署启动检查: 存在未通过节点池档[${failed_slots# }]，原因已红色标注于上。按非阻断策略不中断流程，继续对 ${ready} 档就绪节点池执行后续检查"
         log_error "请到控制台检查修复节点池配置(污点/标签/采购)，并重试确认所有节点池就绪后再进行业务服部署！如客户需求仅需部分节点池就绪可忽略本提示。"
         if [[ $ready -eq 0 ]]; then
-            record_result "Pod部署启动检查(节点池可调度性)" "FAIL" "预期${expected}档节点池，0档可调度，全部未通过:${failed_slots# }"
+            record_result "Pod部署启动检查(节点池可调度性)" "FAIL" "预期${expected}档节点池，0档可调度；就绪节点池:无；全部未通过:${failed_slots# }"
         else
-            record_result "Pod部署启动检查(节点池可调度性)" "FAIL" "预期${expected}档，仅${ready}档可调度；未通过:${failed_slots# }"
+            record_result "Pod部署启动检查(节点池可调度性)" "FAIL" "预期${expected}档，仅${ready}档可调度；就绪节点池:${ready_pools_display}；未通过:${failed_slots# }"
         fi
     else
-        log_success "Pod部署启动检查通过：全部${expected}档节点池均可调度起Pod(弹性池autoscaler 0->1已验证)"
-        record_result "Pod部署启动检查(节点池可调度性)" "PASS" "全部${expected}档节点池均可调度(弹性池0->1已验证)"
+        log_success "Pod部署启动检查通过：全部${expected}档节点池均可调度起Pod(就绪节点池: ${ready_pools_display})"
+        local success_detail
+        success_detail=$(_probe_success_detail "$expected" "$ready_pools_display" "$newly_available_pools")
+        if [[ -n "$newly_available_pools" ]]; then
+            log_success "本次观察到节点池从0节点变为可调度: ${newly_available_pools}（符合autoscaler 0->1扩容结果）"
+        fi
+        record_result "Pod部署启动检查(节点池可调度性)" "PASS" "$success_detail"
     fi
     # 注意: 不在此清理探测资源——就绪池的探测Deployment需存活到 run_network_checks_per_pool 做完网络测试后统一清理
     return 0
@@ -1892,29 +2175,45 @@ capture_mysql_probe_diagnostics() {
     local getent_available=0
     _ensure_artifact_dir
     artifact="${ARTIFACT_DIR}/mysql_probe_${pool//[^A-Za-z0-9_.-]/_}_${host//[^A-Za-z0-9_.-]/_}_${port}_${RUN_TS}_${RANDOM}.txt"
-    stdout_file="${artifact}.stdout"; stderr_file="${artifact}.stderr"
+    stdout_file="${artifact}.stdout"
+    stderr_file="${artifact}.stderr"
     curl_command="curl --noproxy '*' --connect-timeout 5 --max-time 5 --silent --show-error --output /dev/null --write-out '%{time_connect}' telnet://${host}:${port}"
     { printf 'pool=%s\npod=%s\nnamespace=%s\ntarget=%s\nraw_curl_command=%s\n' "$pool" "$POD_NAME" "$NAMESPACE" "$mysql_target" "$curl_command"; } >"$artifact"
     if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v curl' >"$stdout_file" 2>"$stderr_file"; then rc_curl=0; else rc_curl=$?; fi
-    { printf '\n[command -v curl]\nexit_code=%s\nstdout:\n' "$rc_curl"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
+    {
+        printf '\n[command -v curl]\nexit_code=%s\nstdout:\n' "$rc_curl"
+        cat "$stdout_file"
+        printf 'stderr:\n'
+        cat "$stderr_file"
+    } >>"$artifact"
     for probe_file in '/etc/resolv.conf' '/etc/hosts'; do
-      if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c "cat $probe_file" >"$stdout_file" 2>"$stderr_file"; then rc_resolv=0; else rc_resolv=$?; fi
-      { printf '\n[%s]\nexit_code=%s\nstdout:\n' "$probe_file" "$rc_resolv"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
+        if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c "cat $probe_file" >"$stdout_file" 2>"$stderr_file"; then rc_resolv=0; else rc_resolv=$?; fi
+        {
+            printf '\n[%s]\nexit_code=%s\nstdout:\n' "$probe_file" "$rc_resolv"
+            cat "$stdout_file"
+            printf 'stderr:\n'
+            cat "$stderr_file"
+        } >>"$artifact"
     done
     if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v getent' >"$stdout_file" 2>"$stderr_file"; then getent_available=1; fi
     if [[ $getent_available -eq 1 ]]; then kubectl exec "$POD_NAME" -n "$NAMESPACE" -- getent hosts "$host" >>"$artifact" 2>&1 || true; fi
     if _mysql_curl_connect "$host" "$port" >"$stdout_file" 2>"$stderr_file"; then rc_tcp=0; else rc_tcp=$?; fi
     tcp_time=$(<"$stdout_file")
-    { printf '\n[curl TCP result]\nexit_code=%s\ntime_connect=%s\nstdout:\n' "$rc_tcp" "$tcp_time"; cat "$stdout_file"; printf 'stderr:\n'; cat "$stderr_file"; } >>"$artifact"
+    {
+        printf '\n[curl TCP result]\nexit_code=%s\ntime_connect=%s\nstdout:\n' "$rc_tcp" "$tcp_time"
+        cat "$stdout_file"
+        printf 'stderr:\n'
+        cat "$stderr_file"
+    } >>"$artifact"
     rm -f "$stdout_file" "$stderr_file"
     case "$rc_tcp" in
-      127) MYSQL_PROBE_FAILURE_REASON='Pod 内缺少 curl，无法执行 TCP 探测' ;;
-      6) MYSQL_PROBE_FAILURE_REASON='Pod DNS 无法解析 MySQL 主机名' ;;
-      2) MYSQL_PROBE_FAILURE_REASON='curl 工具或协议参数异常' ;;
-      7) MYSQL_PROBE_FAILURE_REASON='TCP 探测失败（请结合诊断物料确认路由、安全组、监听端口）' ;;
-      28) if _mysql_valid_time_connect "$tcp_time"; then MYSQL_PROBE_FAILURE_REASON='curl 诊断复测成功'; else MYSQL_PROBE_FAILURE_REASON='TCP 探测超时或未建立连接'; fi ;;
-      0) MYSQL_PROBE_FAILURE_REASON='curl 执行未建立有效连接' ;;
-      *) MYSQL_PROBE_FAILURE_REASON="curl 执行异常（exit=${rc_tcp}，详见诊断物料）" ;;
+    127) MYSQL_PROBE_FAILURE_REASON='Pod 内缺少 curl，无法执行 TCP 探测' ;;
+    6) MYSQL_PROBE_FAILURE_REASON='Pod DNS 无法解析 MySQL 主机名' ;;
+    2) MYSQL_PROBE_FAILURE_REASON='curl 工具或协议参数异常' ;;
+    7) MYSQL_PROBE_FAILURE_REASON='TCP 探测失败（请结合诊断物料确认路由、安全组、监听端口）' ;;
+    28) if _mysql_valid_time_connect "$tcp_time"; then MYSQL_PROBE_FAILURE_REASON='curl 诊断复测成功'; else MYSQL_PROBE_FAILURE_REASON='TCP 探测超时或未建立连接'; fi ;;
+    0) MYSQL_PROBE_FAILURE_REASON='curl 执行未建立有效连接' ;;
+    *) MYSQL_PROBE_FAILURE_REASON="curl 执行异常（exit=${rc_tcp}，详见诊断物料）" ;;
     esac
     MYSQL_PROBE_DIAGNOSTIC_ARTIFACT="$artifact"
 }
@@ -1924,7 +2223,9 @@ test_pod_to_mysql_connectivity() {
     if out=$(_mysql_curl_connect "$host" "$port" 2>/dev/null); then rc=0; else rc=$?; fi
     if _mysql_valid_time_connect "$out"; then
         [[ $rc -eq 28 ]] && log_info "MySQL TCP握手已建立，服务保持连接，按连接成功计"
-        log_success "测试Pod访问集群内MySQL正常(TCP ${mysql_target} 可达)"; return 0; fi
+        log_success "测试Pod访问集群内MySQL正常(TCP ${mysql_target} 可达)"
+        return 0
+    fi
     capture_mysql_probe_diagnostics "$pool" "$mysql_target"
     log_error "错误：Pod无法连通集群内MySQL(${mysql_target})：${MYSQL_PROBE_FAILURE_REASON}"
     log_error "诊断物料已保存至: ${MYSQL_PROBE_DIAGNOSTIC_ARTIFACT}"
@@ -1935,14 +2236,18 @@ test_pod_to_mysql_connectivity() {
 test_pod_to_host_latency() {
     local mysql_target="$1" host="${1%:*}" port="${1##*:}" out sample_ms total=0 ok=0 i
     log_step "Pod访问集群内云主机网络延迟检查"
-    for ((i=0; i<HOST_LATENCY_SAMPLES; i++)); do
-      out=$(_mysql_curl_connect "$host" "$port" 2>/dev/null) || :
-      if _mysql_valid_time_connect "$out"; then
-        sample_ms=$(awk -v seconds="$out" 'BEGIN { printf "%d", seconds * 1000 }')
-        total=$((total + sample_ms)); ok=$((ok + 1))
-      fi
+    for ((i = 0; i < HOST_LATENCY_SAMPLES; i++)); do
+        out=$(_mysql_curl_connect "$host" "$port" 2>/dev/null) || :
+        if _mysql_valid_time_connect "$out"; then
+            sample_ms=$(awk -v seconds="$out" 'BEGIN { printf "%d", seconds * 1000 }')
+            total=$((total + sample_ms))
+            ok=$((ok + 1))
+        fi
     done
-    if [[ $ok -eq 0 ]]; then HOST_LATENCY_LAST_MS=-1; return 1; fi
+    if [[ $ok -eq 0 ]]; then
+        HOST_LATENCY_LAST_MS=-1
+        return 1
+    fi
     HOST_LATENCY_LAST_MS=$((total / ok))
     [[ $HOST_LATENCY_LAST_MS -lt $HOST_LATENCY_THRESHOLD_MS ]]
 }
@@ -1954,9 +2259,11 @@ run_mysql_latency_gate() {
         ((lat_total++))
         if test_pod_to_host_latency "$mysql_target"; then
             lat_detail="${lat_detail} ${pname}->${mysql_target}:${HOST_LATENCY_LAST_MS}ms"
+            log_success "节点池[${pname}]Pod访问集群内云主机延迟正常: ${mysql_target} ${HOST_LATENCY_LAST_MS}ms (<${HOST_LATENCY_THRESHOLD_MS}ms)"
         else
             ((lat_fail++))
             lat_failed_pools="${lat_failed_pools} ${pname}->${mysql_target}(${HOST_LATENCY_LAST_MS}ms)"
+            log_error "节点池[${pname}]Pod访问集群内云主机延迟异常: ${mysql_target} ${HOST_LATENCY_LAST_MS}ms (阈值<${HOST_LATENCY_THRESHOLD_MS}ms)"
         fi
     else
         ((mysql_fail++))
@@ -2081,7 +2388,7 @@ run_network_checks_per_pool() {
             "Pod IP(${IPTABLES_PERSIST_POD_IP})与本机IP(${IPTABLES_PERSIST_LOCAL_IP})不在同一/8网段，建议将 cloud.intranet.segment=${IPTABLES_PERSIST_CIDR} 持久化到 install.properties 确保全集群内网放行"
     fi
 
-    log_info "清理探测Deployment/Service(弹性池节点将被autoscaler缩回0，请关注计费窗口)..."
+    log_info "清理探测Deployment/Service(本轮可能拉起的弹性节点将由autoscaler按平台策略缩容，请关注计费窗口)..."
     _clean_probe_deployments
 }
 
@@ -2139,7 +2446,7 @@ detect_cloud_platform() {
     elif echo "$labels" | grep -Eq 'cloud\.google\.com'; then
         cloud_provider="google"
     fi
-    [[ "$cloud_provider" != "unknown" ]] && log_info "  [主判据] 节点标签厂商域名命中: ${cloud_provider}"
+    [[ "$cloud_provider" != "unknown" ]] && log_info "K8S节点标签厂商域名命中: ${cloud_provider}"
 
     # —— ② serverVersion.gitVersion 厂商后缀(第二层, 5/6; 华为无厂商后缀靠①) ——
     if [[ "$cloud_provider" == "unknown" ]]; then
@@ -2183,7 +2490,7 @@ detect_cloud_platform() {
     if command -v dmidecode &>/dev/null || [[ -x /usr/sbin/dmidecode ]]; then
         local manufacturer=$(/usr/sbin/dmidecode -q 2>/dev/null | grep "Manufacturer" | head -1 |
             awk -F'[:]' '{print $2}' | sed 's/^ //g')
-        [[ -n "$manufacturer" ]] && log_info "  [底层基础设施信息] 宿主机制造商: ${manufacturer}(仅供参考, 不参与云平台裁决)"
+        [[ -n "$manufacturer" ]] && log_info "宿主机制造商: ${manufacturer}"
     fi
 
     log_info "检测到k8s所属环境: ${BOLD}${cloud_provider}${NC}"
@@ -2249,7 +2556,7 @@ inspect_huawei_te_disk() {
     throughput=$(kubectl get sc te-disk -o jsonpath='{.parameters.everest\.io/disk-throughput}' 2>/dev/null)
     # 空 provisioner 只会出现在兼容旧 kubectl mock 的检测输出中；真实 StorageClass
     # 必有该字段，非空时仍必须精确匹配 Everest provisioner。
-    if [[ ( -z "$provisioner" || "$provisioner" == "everest-csi-provisioner" ) && "$disk_type" == "GPSSD2" && "$iops" == "3000" && "$throughput" == "125" ]]; then
+    if [[ (-z "$provisioner" || "$provisioner" == "everest-csi-provisioner") && "$disk_type" == "GPSSD2" && "$iops" == "3000" && "$throughput" == "125" ]]; then
         HUAWEI_TE_DISK_STATE="expected"
     else
         HUAWEI_TE_DISK_STATE="legacy"
@@ -2336,7 +2643,7 @@ ensure_storageclass() {
             log_success "华为 te-disk 已是 GPSSD2 预期配置"
             return 0
             ;;
-        legacy|missing)
+        legacy | missing)
             reconcile_huawei_te_disk
             return $?
             ;;
@@ -2598,6 +2905,22 @@ get_huawei_cce_vpc_id() {
     HUAWEI_CCE_VPC_ID_ERROR="未发现csi-nas或其everest.io/share-access-to为空，且未提供HUAWEI_CCE_VPC_ID"
     return 1
 }
+get_gce_primary_network() {
+    local metadata_url='http://metadata.google.internal/computeMetadata/v1'
+    local network_resource network_name
+
+    network_resource=$(curl -fsS \
+        -H 'Metadata-Flavor: Google' \
+        --connect-timeout 2 \
+        --max-time 5 \
+        "${metadata_url}/instance/network-interfaces/0/network") || return 1
+
+    [[ "$network_resource" =~ ^projects/[^/]+/networks/[^/]+$ ]] || return 1
+    network_name="${network_resource##*/}"
+    [[ "$network_name" =~ ^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$ ]] || return 1
+    printf '%s\n' "$network_name"
+}
+
 ensure_nfs_storageclass() {
     local cloud_platform="$1"
     log_step "网络存储StorageClass就绪检查(te-nfs)"
@@ -2666,10 +2989,10 @@ parameters:
   pgroupid: pgroupbasic
   storagetype: SD
   subdir-share: "true"
-  subnetid: subnet-40a7tsls
+  subnetid: subnet-REPLACE_ME
   vers: "3"
-  vpcid: vpc-48n29yeb
-  zone: ap-guangzhou-6
+  vpcid: vpc-REPLACE_ME
+  zone: REGION-AZ-REPLACE_ME
 provisioner: com.tencent.cloud.csi.tcfs.te-nfs
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
@@ -2691,9 +3014,9 @@ mountOptions:
 - vers=3
 parameters:
   ChargeType: PostPaid
-  fsId: enas-cngzc0e5ba70650337
+  fsId: enas-REPLACE_ME
   fsType: Extreme
-  server: cngzc0e5ba70650337.vpc-36td87hux629s383g0w6ff785.nas.ivolces.com
+  server: NAS_SERVER_REPLACE_ME
   subPath: /
   volumeAs: subpath
 provisioner: nas.csi.volcengine.com
@@ -2744,10 +3067,58 @@ EOF
         return 1
         ;;
     *google*)
-        # TODO: Google GCP 网络存储(Filestore/GCS FUSE) te-nfs 模版待补充, 下次完善
-        log_error "Google GCP 网络存储 te-nfs 模版暂缺，文件存储可用性检查未完成"
-        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "Google GCP te-nfs 模版待补充，文件存储可用性未完成"
-        return 1
+        local gce_network
+        if ! gce_network=$(get_gce_primary_network); then
+            log_error "无法从GCE Metadata获取可信network；请到Google Cloud控制台确认network信息后，使用下方te-nfs.yaml手动创建"
+            cat <<'EOF_GCP_NFS_MANUAL' | tee -a "$LOG_FILE"
+---------------- GKE Filestore te-nfs.yaml (请到Google Cloud控制台确认network信息后替换占位符) ----------------
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: te-nfs
+provisioner: filestore.csi.storage.gke.io
+parameters:
+  tier: enterprise
+  multishare: "true"
+  instance-storageclass-label: te-nfs
+  max-volume-size: "128Gi"
+  network: "<NETWORK_NAME>"
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+mountOptions:
+- nolock
+- hard
+- timeo=600
+- retrans=3
+--------------------------------------------------------------------------------------------------------
+EOF_GCP_NFS_MANUAL
+            record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "无法从GCE Metadata取得可信network；已打印Google Cloud控制台确认后的手工创建模版"
+            return 1
+        fi
+
+        log_info "创建 Google GKE 网络存储StorageClass: te-nfs (Filestore Enterprise Multishare)"
+        cat <<EOF_GCP_NFS | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: te-nfs
+provisioner: filestore.csi.storage.gke.io
+parameters:
+  tier: enterprise
+  multishare: "true"
+  instance-storageclass-label: te-nfs
+  max-volume-size: "128Gi"
+  network: "${gce_network}"
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+mountOptions:
+- nolock
+- hard
+- timeo=600
+- retrans=3
+EOF_GCP_NFS
         ;;
     vmware | kvm | qemu | baremetal)
         # 内置K8S: nfs-provisioner, 模版自洽, 自动创建
@@ -2794,14 +3165,151 @@ EOF
 #   故不再做组件级预检查, 直接以端到端建 PVC 为准。
 # 显式按 StorageClass 与 accessMode 验证存储，不回退至其他默认 SC。
 # 单 Pod 读写用于验证 PVC 供给、挂载及实际可写性；RWX 跨节点共享由独立函数验证。
+HISTORICAL_TEST_PV_CONFIRM_TIMEOUT=30
+HISTORICAL_TEST_PV_DELETE_TIMEOUT=60
+HISTORICAL_TEST_PVS=()
+
+# 只识别历史版本留下的固定测试 PVC；不使用宽泛的 Released/te-nfs 条件，避免触及业务卷。
+historical_test_pv_is_candidate() {
+    local pv="$1" data phase claim_ns claim_name storage_class csi_driver provisioner volume_handle sc_provisioner
+    data=$(kubectl get pv "$pv" -o jsonpath='{.status.phase}|{.spec.claimRef.namespace}|{.spec.claimRef.name}|{.spec.storageClassName}|{.spec.csi.driver}|{.metadata.annotations.pv\.kubernetes\.io/provisioned-by}|{.spec.csi.volumeHandle}' 2>/dev/null) || return 1
+    IFS='|' read -r phase claim_ns claim_name storage_class csi_driver provisioner volume_handle <<<"$data"
+
+    [[ "$phase" == Released && "$claim_ns" == debug ]] || return 1
+    case "$claim_name" in
+    te-csi-check-disk-pvc | te-csi-check-nfs-pvc | te-csi-check-nfs-rwx-pvc) ;;
+    *) return 1 ;;
+    esac
+    [[ "$storage_class" == te-disk || "$storage_class" == te-nfs ]] || return 1
+    [[ -n "$csi_driver" && -n "$provisioner" && -n "$volume_handle" ]] || return 1
+    sc_provisioner=$(kubectl get sc "$storage_class" -o jsonpath='{.provisioner}' 2>/dev/null) || return 1
+    [[ "$provisioner" == "$sc_provisioner" ]] || return 1
+    # Released PV 应无可用 PVC；若 PVC 仍存在，绝不作为历史残留处理。
+    kubectl get pvc "$claim_name" -n "$claim_ns" &>/dev/null && return 1
+
+    HISTORICAL_TEST_PV_CLAIM="${claim_ns}/${claim_name}"
+    HISTORICAL_TEST_PV_STORAGE_CLASS="$storage_class"
+    HISTORICAL_TEST_PV_CSI_DRIVER="$csi_driver"
+    HISTORICAL_TEST_PV_VOLUME_HANDLE="$volume_handle"
+    return 0
+}
+
+scan_historical_test_pvs() {
+    local pv
+    HISTORICAL_TEST_PVS=()
+    for pv in $(kubectl get pv -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+        historical_test_pv_is_candidate "$pv" && HISTORICAL_TEST_PVS+=("$pv")
+    done
+}
+
+cleanup_historical_test_pvs() {
+    local pv answer elapsed cleaned=0 failed=0 skipped=0
+    scan_historical_test_pvs
+    if [[ ${#HISTORICAL_TEST_PVS[@]} -eq 0 ]]; then
+        record_result "测试PV清理" "SKIP" "未发现符合精确门槛的历史测试PV"
+        return 0
+    fi
+
+    log_warning "发现 ${#HISTORICAL_TEST_PVS[@]} 个历史测试残留PV，候选仅包含 Released/debug/te-csi-check 白名单/CSI 动态卷且PVC已不存在的资源："
+    for pv in "${HISTORICAL_TEST_PVS[@]}"; do
+        historical_test_pv_is_candidate "$pv" || continue
+        log_warning "  - ${pv} claim=${HISTORICAL_TEST_PV_CLAIM} sc=${HISTORICAL_TEST_PV_STORAGE_CLASS} driver=${HISTORICAL_TEST_PV_CSI_DRIVER} volumeHandle=${HISTORICAL_TEST_PV_VOLUME_HANDLE}"
+    done
+
+    if [[ -t 0 ]]; then
+        if read -r -t "$HISTORICAL_TEST_PV_CONFIRM_TIMEOUT" -p "是否清理以上历史测试PV？[Y/n]（${HISTORICAL_TEST_PV_CONFIRM_TIMEOUT}秒后默认清理）: " answer; then
+            case "$answer" in
+            n | N | no | NO | No)
+                record_result "测试PV清理" "SKIP" "管理员选择跳过，候选数:${#HISTORICAL_TEST_PVS[@]}"
+                return 0
+                ;;
+            y | Y | yes | YES | Yes | '') ;;
+            *) log_warning "未识别的确认输入[${answer}]，按默认策略开始清理历史测试PV" ;;
+            esac
+        else
+            log_warning "历史测试PV清理确认超时，按默认策略开始清理"
+        fi
+    else
+        log_warning "检测到非交互执行环境，按默认策略开始清理历史测试PV"
+    fi
+
+    for pv in "${HISTORICAL_TEST_PVS[@]}"; do
+        # 删除前再次获取并完整核验，防止扫描到删除之间资源状态变化。
+        if ! historical_test_pv_is_candidate "$pv"; then
+            ((skipped += 1))
+            log_warning "历史测试PV[${pv}]在删除前未再满足门槛，已跳过"
+            continue
+        fi
+        if ! kubectl patch pv "$pv" --type=merge -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}' >/dev/null 2>&1; then
+            ((failed += 1))
+            log_error "历史测试PV[${pv}]无法切换为Delete，已保留"
+            continue
+        fi
+        if ! kubectl delete pv "$pv" --ignore-not-found --wait=false >/dev/null 2>&1; then
+            ((failed += 1))
+            log_error "历史测试PV[${pv}]删除请求失败"
+            continue
+        fi
+        elapsed=0
+        while kubectl get pv "$pv" &>/dev/null; do
+            if [[ $elapsed -ge $HISTORICAL_TEST_PV_DELETE_TIMEOUT ]]; then
+                ((failed += 1))
+                log_error "历史测试PV[${pv}]在删除请求后${HISTORICAL_TEST_PV_DELETE_TIMEOUT}s仍存在，请检查CSI回收"
+                break
+            fi
+            sleep 2
+            ((elapsed += 2))
+        done
+        if ! kubectl get pv "$pv" &>/dev/null; then
+            ((cleaned += 1))
+            log_success "历史测试PV已回收: ${pv}"
+        fi
+    done
+
+    if [[ $failed -gt 0 ]]; then
+        record_result "测试PV清理" "FAIL" "已清理:${cleaned}，跳过:${skipped}，失败:${failed}；详见日志"
+        return 1
+    fi
+    record_result "测试PV清理" "PASS" "已清理:${cleaned}，跳过:${skipped}"
+    return 0
+}
+
+# 所有正常结束路径都从这里收尾：先处理经严格门槛识别的历史测试 PV，再输出最终总览。
+# 异常退出不调用该函数，避免在脚本中断时扩大删除范围。
+finalize_availability_check() {
+    cleanup_historical_test_pvs || true
+    print_summary
+}
+
 _storage_e2e_cleanup() {
     local pvc="$1"
     shift
-    local pod
+    local pod pv_name elapsed=0 reclaim_timeout=60
+    pv_name=$(kubectl get pvc "$pvc" -n "$NAMESPACE" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
     for pod in "$@"; do
         kubectl delete pod "$pod" -n "$NAMESPACE" --force --grace-period=0 --ignore-not-found &>/dev/null
     done
+    # 业务 StorageClass 保持 Retain，避免影响业务数据；仅脚本本次临时 PVC 已绑定的 PV
+    # 在删除 PVC 前改为 Delete，使 CSI 回收动态创建的卷/Filestore share。
+    if [[ -n "$pv_name" ]]; then
+        if ! kubectl patch pv "$pv_name" --type=merge -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}' >/dev/null 2>&1; then
+            log_error "无法将临时探测PV ${pv_name} 切换为 Delete，已保留PVC ${pvc} 以避免产生 Released PV"
+            return 1
+        fi
+    fi
     kubectl delete pvc "$pvc" -n "$NAMESPACE" --ignore-not-found &>/dev/null
+    if [[ -z "$pv_name" ]]; then
+        return 0
+    fi
+    while kubectl get pv "$pv_name" &>/dev/null; do
+        if [[ $elapsed -ge $reclaim_timeout ]]; then
+            log_error "临时探测PV ${pv_name} 在删除PVC ${pvc} 后${reclaim_timeout}s仍未回收，请检查CSI并手动处理"
+            return 1
+        fi
+        sleep 2
+        ((elapsed += 2))
+    done
+    log_success "临时存储探测PV已回收: ${pv_name}"
 }
 
 _storage_e2e_capture_diagnostics() {
@@ -2908,7 +3416,7 @@ verify_storage_e2e() {
         return 1
     fi
 
-    _storage_e2e_cleanup "$pvc_name" "$pod_name"
+    _storage_e2e_cleanup "$pvc_name" "$pod_name" || return 1
     _ensure_artifact_dir
     cat >"${ARTIFACT_DIR}/${pvc_name}.yaml" <<EOF_PVC
 apiVersion: v1
@@ -2961,7 +3469,10 @@ EOF_PVC
     fi
 
     log_success "${category}验证通过: ${storage_class}/${access_mode} PVC已挂载且单Pod读写成功"
-    _storage_e2e_cleanup "$pvc_name" "$pod_name"
+    if ! _storage_e2e_cleanup "$pvc_name" "$pod_name"; then
+        log_error "${category}验证通过后临时存储资源回收失败，本项按失败处理"
+        return 1
+    fi
     return 0
 }
 
@@ -2974,7 +3485,7 @@ verify_nfs_rwx_cross_node() {
     log_step "端到端存储验证(文件存储 te-nfs: RWX跨节点共享读写)"
     ensure_namespace
 
-    _storage_e2e_cleanup "$pvc_name" "$writer" "$reader"
+    _storage_e2e_cleanup "$pvc_name" "$writer" "$reader" || return 1
     _ensure_artifact_dir
     cat >"${ARTIFACT_DIR}/${pvc_name}.yaml" <<EOF_RWX_PVC
 apiVersion: v1
@@ -3046,11 +3557,132 @@ EOF_RWX_PVC
     fi
 
     log_success "te-nfs RWX跨节点共享验证通过: Writer=${writer_node}, Reader=${reader_node}"
-    _storage_e2e_cleanup "$pvc_name" "$writer" "$reader"
+    if ! _storage_e2e_cleanup "$pvc_name" "$writer" "$reader"; then
+        log_error "te-nfs RWX跨节点共享验证通过后临时存储资源回收失败，本项按失败处理"
+        return 1
+    fi
     return 0
 }
 
 # ==================== 云平台特性检查函数(CSI 之外的平台专属附加项) ====================
+_kyverno_version_lt() {
+    local left="${1#v}" right="${2#v}"
+    local l_major l_minor l_patch r_major r_minor r_patch
+    IFS=. read -r l_major l_minor l_patch <<<"$left"
+    IFS=. read -r r_major r_minor r_patch <<<"$right"
+    l_patch="${l_patch:-0}"
+    r_patch="${r_patch:-0}"
+    ((10#$l_major < 10#$r_major)) && return 0
+    ((10#$l_major > 10#$r_major)) && return 1
+    ((10#$l_minor < 10#$r_minor)) && return 0
+    ((10#$l_minor > 10#$r_minor)) && return 1
+    ((10#$l_patch < 10#$r_patch))
+}
+
+_kyverno_server_version() {
+    local version_json server_version
+    version_json=$(kubectl version -o json 2>/dev/null) || return 1
+    server_version=$(printf '%s\n' "$version_json" | grep -oE '"gitVersion": *"v[0-9]+\.[0-9]+(\.[0-9]+)?[^" ]*"' | tail -1 | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?')
+    [[ "$server_version" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 1
+    printf '%s\n' "$server_version"
+}
+
+_kyverno_collect_images() {
+    KYVERNO_POD_COUNT=0
+    KYVERNO_IMAGES=()
+    local namespace rows pod images image
+    for namespace in te-system kube-system; do
+        # te-system 不是所有集群都安装；命名空间不存在不代表查询异常。
+        kubectl get namespace "$namespace" &>/dev/null || continue
+        rows=$(kubectl get pods -n "$namespace" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.containers[*]}{.image}{" "}{end}{"\n"}{end}' 2>/dev/null) || return 1
+        while IFS=$'\t' read -r pod images; do
+            [[ "$pod" == *kyverno* ]] || continue
+            ((KYVERNO_POD_COUNT++))
+            if [[ -z "${images// /}" ]]; then
+                KYVERNO_IMAGES+=("${namespace}/${pod}:<未发现常规容器镜像>")
+                continue
+            fi
+            for image in $images; do
+                KYVERNO_IMAGES+=("${namespace}/${pod}:${image}")
+            done
+        done <<<"$rows"
+    done
+}
+
+_kyverno_image_version() {
+    local image="$1"
+    if [[ "$image" =~ :v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+        return 0
+    fi
+    return 1
+}
+
+run_kyverno_reinstall() {
+    /data/app/.admin_manager_ta/ta-admin/ta-admin te_k8s install -name kyverno
+}
+
+check_kyverno_compatibility() {
+    local required_k8s="1.34.0" required_kyverno="1.18.0"
+    local reinstall_command='/data/app/.admin_manager_ta/ta-admin/ta-admin te_k8s install -name kyverno'
+    local server_version image_ref image version versions_display="" needs_reinstall=false unparseable=false
+
+    log_step "Kyverno K8S兼容性检查"
+    if ! _kyverno_collect_images; then
+        log_warning "无法查询 te-system/kube-system 中的 Kyverno Pod，无法确认 Kyverno 兼容性"
+        record_result "Kyverno K8S兼容性检查" "WARN" "查询目标命名空间失败，未将其误判为未安装"
+        return 0
+    fi
+    if [[ "$KYVERNO_POD_COUNT" -eq 0 ]]; then
+        log_info "未发现预装 Kyverno Pod，跳过兼容性检查"
+        record_result "Kyverno K8S兼容性检查" "SKIP" "te-system/kube-system 未发现名称含 kyverno 的 Pod"
+        return 0
+    fi
+    if ! server_version=$(_kyverno_server_version); then
+        log_warning "已发现 ${KYVERNO_POD_COUNT} 个 Kyverno Pod，但无法获取 Kubernetes 服务端版本，未执行重装"
+        record_result "Kyverno K8S兼容性检查" "WARN" "已发现Kyverno但无法确认Kubernetes版本，未自动重装"
+        return 0
+    fi
+
+    for image_ref in "${KYVERNO_IMAGES[@]}"; do
+        image="${image_ref#*:}" # 去掉 namespace/pod 前缀；镜像仓库端口不会影响末尾 tag 解析。
+        if version=$(_kyverno_image_version "$image"); then
+            versions_display="${versions_display} ${image_ref}=${version}"
+            if _kyverno_version_lt "$version" "$required_kyverno"; then
+                needs_reinstall=true
+            fi
+        else
+            versions_display="${versions_display} ${image_ref}=未解析"
+            unparseable=true
+        fi
+    done
+
+    if _kyverno_version_lt "$server_version" "$required_k8s"; then
+        log_success "Kyverno兼容性检查通过: Kubernetes ${server_version} < v${required_k8s}，无需因版本阈值重装；发现镜像:${versions_display# }"
+        record_result "Kyverno K8S兼容性检查" "PASS" "Kubernetes ${server_version}低于v${required_k8s}，未重装；镜像:${versions_display# }"
+        return 0
+    fi
+
+    if $needs_reinstall || $unparseable; then
+        if $unparseable; then
+            log_warning "Kyverno镜像版本存在无法解析项；Kubernetes ${server_version} >= v${required_k8s}，执行重装兜底：${versions_display# }"
+        else
+            log_warning "发现 Kyverno 版本低于 v${required_kyverno}；Kubernetes ${server_version} >= v${required_k8s}，执行重装：${versions_display# }"
+        fi
+        if run_kyverno_reinstall; then
+            log_success "Kyverno重装完成，已满足 Kubernetes ${server_version} 的兼容性处理要求"
+            record_result "Kyverno K8S兼容性检查" "PASS" "已执行Kyverno重装；Kubernetes=${server_version}；镜像:${versions_display# }"
+        else
+            log_error "Kyverno重装失败，请手动执行：${reinstall_command}"
+            record_result "Kyverno K8S兼容性检查" "FAIL" "自动重装失败；请手动执行: ${reinstall_command}"
+        fi
+        return 0
+    fi
+
+    log_success "Kyverno兼容性检查通过: Kubernetes ${server_version}，全部已解析镜像版本不低于 v${required_kyverno}：${versions_display# }"
+    record_result "Kyverno K8S兼容性检查" "PASS" "Kubernetes=${server_version}；全部Kyverno镜像>=v${required_kyverno}"
+}
+
 check_tencent_cloud_features() {
     echo "当前云平台：腾讯云(TKE)，开始执行特性检查"
 
@@ -3115,20 +3747,23 @@ main() {
 
     log_info "1. kubectl检查"
     log_info "2. K8S集群连通性检查"
-    log_info "3. K8S所属环境检查"
-    log_info "4. 块存储StorageClass就绪检查(te-disk)"
-    log_info "5. 网络存储StorageClass就绪检查(te-nfs)"
-    log_info "6. Pod部署启动检查(并发探测所有节点池)"
-    log_info "7. 节点池与节点配置检查"
-    log_info "8. 节点组契约校验(规格/付费类型/污点 vs 池名声明)"
-    log_info "9. 本地服务器访问Pod网络连通性检查(兼容性验证)"
-    log_info "10. 本地服务器访问Kubernetes Service连通性检查(NodePort)"
-    log_info "11. Pod访问本地服务器网络连通性检查"
-    log_info "12. Pod访问集群内MySQL连通性检查(混合部署网络错配探测)"
-    log_info "13. Pod访问集群内云主机延迟检查(<${HOST_LATENCY_THRESHOLD_MS}ms, TCP握手近似RTT)"
-    log_info "14. 端到端存储验证(块存储 te-disk, RWO: PVC->单Pod挂载->读写)"
-    log_info "15. 端到端存储验证(文件存储 te-nfs, RWX: PVC->单Pod挂载->读写)"
-    log_info "16. 端到端存储验证(文件存储 te-nfs, RWX跨节点共享读写)"
+    log_info "3. Kyverno K8S兼容性检查"
+    log_info "4. K8S所属环境检查"
+    log_info "5. 节点组业务规划选择"
+    log_info "6. 块存储StorageClass就绪检查(te-disk)"
+    log_info "7. 网络存储StorageClass就绪检查(te-nfs)"
+    log_info "8. Pod部署启动检查(并发探测所有节点池)"
+    log_info "9. 节点池与节点配置检查"
+    log_info "10. 节点组契约校验(规格/付费类型/污点 vs 池名声明)"
+    log_info "11. 本地服务器访问Pod网络连通性检查(兼容性验证)"
+    log_info "12. 本地服务器访问Kubernetes Service连通性检查(NodePort)"
+    log_info "13. Pod访问本地服务器网络连通性检查"
+    log_info "14. Pod访问集群内MySQL连通性检查(混合部署网络错配探测)"
+    log_info "15. Pod访问集群内云主机延迟检查(<${HOST_LATENCY_THRESHOLD_MS}ms, TCP握手近似RTT)"
+    log_info "16. 端到端存储验证(块存储 te-disk, RWO: PVC->单Pod挂载->读写)"
+    log_info "17. 端到端存储验证(文件存储 te-nfs, RWX: PVC->Pod挂载->读写)"
+    log_info "18. 端到端存储验证(文件存储 te-nfs, RWX跨节点共享读写)"
+    log_info "19. 测试PV清理(精确识别，可确认后回收)"
     log_info "    (端到端 SC->PVC->Pod 起服为 CSI 就绪的唯一金标准)"
     echo ""
 
@@ -3137,9 +3772,11 @@ main() {
     record_result "kubectl检查" "PASS" "kubectl已就绪(版本匹配目标${K8S_VERSION})"
     test_k8s_connection
     record_result "K8S集群连通性检查" "PASS" "集群连接正常"
+    check_kyverno_compatibility
 
     cloud_platform=$(detect_cloud_platform)
     record_result "K8S所属环境检查" "PASS" "识别到环境: ${cloud_platform}"
+    select_nodepool_business_plan "$cloud_platform"
 
     # 内置K8S(自建, 节点名含 te-k8s): 自动为节点补打 billing-mode=reserved, 统一各平台语义。
     # 须在 ensure_storageclass / pod_deploy_check 之前, 以便下游节点池归类/契约校验看到该标签。
@@ -3152,7 +3789,7 @@ main() {
     if [[ $storageclass_rc -eq 0 ]]; then
         record_result "块存储StorageClass就绪检查" "PASS" "默认StorageClass(te-disk)就绪"
     elif [[ $storageclass_rc -eq 2 ]]; then
-        if [[ "$cloud_platform" == *huawei* && ( -n "$HUAWEI_TE_DISK_PVCS" || -n "$HUAWEI_TE_DISK_PVS" ) ]]; then
+        if [[ "$cloud_platform" == *huawei* && (-n "$HUAWEI_TE_DISK_PVCS" || -n "$HUAWEI_TE_DISK_PVS") ]]; then
             record_result "块存储StorageClass就绪检查" "WARN" "发现被PVC/PV依赖的历史te-disk，保留现有盘型以兼容存量应用"
         else
             record_result "块存储StorageClass就绪检查" "WARN" "为保护现有华为 te-disk，未自动修改StorageClass"
@@ -3179,7 +3816,7 @@ main() {
         check_aws_cloud_features
         log_info "AWS EKS环境经由特殊流程(auto_build_nodepool.sh)处理，不再进行其他检测"
         record_result "AWS EKS特殊流程(auto_build_nodepool)" "PASS" "已执行auto_build_nodepool.sh"
-        print_summary
+        finalize_availability_check
         SCRIPT_COMPLETED=true
         return 0
         ;;
@@ -3190,7 +3827,7 @@ main() {
     pod_deploy_check "$cloud_platform"
 
     # 节点池和节点配置检查: 探测之后调用, 弹性池节点此时已拉起可见, 枚举规格/标签/污点
-    if discover_and_check_nodes; then
+    if discover_and_check_nodes "$cloud_platform"; then
         record_result "节点池与节点配置检查(池内一致性)" "PASS" "节点池归类与规格/标签/污点一致性通过"
     else
         record_result "节点池与节点配置检查(池内一致性)" "WARN" "部分节点池内存在规格/标签/污点不一致，详见日志"
@@ -3244,7 +3881,7 @@ main() {
         record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "SKIP" "te-nfs 未就绪，跳过跨节点共享验证"
     fi
 
-    print_summary
+    finalize_availability_check
 
     log_info "K8S可用性检查结束  $(date '+%Y-%m-%d %H:%M:%S')"
     log_info "如有异常信息提示请跟进确认处理！完整日志已保存至: $LOG_FILE"
