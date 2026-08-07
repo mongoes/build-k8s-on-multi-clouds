@@ -37,16 +37,29 @@ require_text 'cleanup_historical_test_pvs || true'
 require_text 'HISTORICAL_TEST_PV_CONFIRM_TIMEOUT=30'
 require_text 'HISTORICAL_TEST_PV_DELETE_TIMEOUT=60'
 require_text 'finalize_availability_check()'
+require_text 'check_aws_nodepool_gate()'
+require_text 'K8S_VERSION="1.34"'
+require_text 'K8S_MINOR_VERSION="34"'
+require_text 'kubectl get crd nodepools.karpenter.sh -o name'
+require_text "kubectl get nodepools.karpenter.sh -o jsonpath="
+require_text 'AWS_TOOL_BASE_URL='
+require_text 'bash -n "$script_path"'
+require_text 'bash "$script_path"'
+require_text 'storage_ready_for_existing_eks.sh'
+require_text 'check_aws_consolidation_policy()'
+forbid_text 'sh "${script_path}"'
+forbid_text 'AWS EKS环境经由特殊流程(auto_build_nodepool.sh)处理，不再进行其他检测'
 
 test_tmp=$(mktemp -d)
 trap 'rm -rf "$test_tmp"' EXIT
 
-# 历史 PV 清理必须是收尾动作：普通流程和 AWS 提前结束流程都经统一入口执行，
-# 不能在节点组选择和现场检查之前抢占交互或改变集群资源。
+# 历史 PV 清理必须只在完成现场标准检查后执行；AWS NodePool 前置门禁失败时不得
+# 顺带扫描或删除历史 PV，以免一个只读门禁扩大为无关资源变更。
 main_source="$test_tmp/k8sAvailCheck.main.sh"
 sed -n '/^main()/,/^# ==================== 资源清理/p' "$SCRIPT" >"$main_source"
 ! grep -q 'cleanup_historical_test_pvs || true' "$main_source" || fail 'test PV cleanup must not run before the end of the main flow'
-[[ "$(grep -c 'finalize_availability_check' "$main_source")" -eq 2 ]] || fail 'normal and AWS early-return flows must both finalize through the test PV cleanup step'
+[[ "$(grep -c 'finalize_availability_check' "$main_source")" -eq 1 ]] || fail 'only the completed standard flow may enter historical test PV cleanup'
+grep -q 'check_aws_nodepool_gate' "$main_source" || fail 'AWS NodePool gate must run before nodepool plan and storage checks'
 
 # 第二层业务节点组规划：预制方案必须经云厂商规则展开，并允许管理员完整替代默认规划。
 nodepool_plan_source="$test_tmp/k8sAvailCheck.nodepool-plan.functions.sh"
@@ -143,6 +156,8 @@ fallback_nodepool_plan alibaba '交互输入超时'
 require_text '1. Agent / 基础运营：reserved-4c32g od-4c32g'
 require_text '5. 管理员自定义节点组'
 require_text 'select_nodepool_business_plan "$cloud_platform"'
+require_text 'NODEPOOL_PLAN_INPUT_TIMEOUT=300'
+! grep -q '^NODEPOOL_PLAN_INPUT_TIMEOUT=30$' "$SCRIPT" || fail 'legacy 30-second nodepool timeout must not remain'
 
 # 自动化/管道执行没有 TTY 时不得卡住，必须回退旧云 map 并登记 WARN。
 NODEPOOL_PLAN_SELECTED=false
@@ -206,7 +221,7 @@ kubectl() {
     "describe sc csi-nas"*)
         printf 'Name: csi-nas\n'
         ;;
-    "get sc te-nfs -o jsonpath="*)
+    *'get sc te-nfs'*'jsonpath='*)
         [[ "${MOCK_TE_NFS_EXISTS:-0}" == 1 || -s "${MOCK_APPLIED_MANIFEST:-/nonexistent}" ]] || return 1
         printf '%s' "${MOCK_TE_NFS_VPC:-}"
         ;;
@@ -338,6 +353,82 @@ fi
 grep -qF 'Google Cloud控制台确认network信息' "$LOG_FILE" || fail 'GKE Metadata failure must direct the operator to Google Cloud Console'
 grep -qF 'network: "<NETWORK_NAME>"' "$LOG_FILE" || fail 'GKE Metadata failure must print a Filestore-compatible manual network template'
 
+# 华为不合规且仍被引用的 te-nfs 只能经明确确认替换同名 StorageClass；PV/PVC/Pod
+# 只允许读取，绝不能成为删除目标。
+HUAWEI_CCE_VPC_ID_RESOLVED='trusted-vpc'
+MOCK_REPLACE_CALLS="$test_tmp/huawei-te-nfs-replace.calls"
+: >"$MOCK_REPLACE_CALLS"
+MOCK_REPLACE_SC_EXISTS=1
+MOCK_REPLACE_APPLY_FAIL=0
+MOCK_REPLACE_PROVISIONER='nfs-provisioner'
+MOCK_REPLACE_VPC=''
+REPLACE_LOG="$test_tmp/huawei-te-nfs-replace.log"
+: >"$REPLACE_LOG"
+log_error() { printf '%s\n' "$*" >>"$REPLACE_LOG"; }
+kubectl() {
+    local cmd="$*"
+    printf '%s\n' "$cmd" >>"$MOCK_REPLACE_CALLS"
+    if [[ "$cmd" == *provisioner* ]]; then
+        [[ "$MOCK_REPLACE_SC_EXISTS" == 1 || -s "$test_tmp/huawei-te-nfs-replaced.yaml" ]] || return 1
+        if [[ -s "$test_tmp/huawei-te-nfs-replaced.yaml" ]]; then
+            printf '%s' everest-csi-provisioner
+        else
+            printf '%s' "$MOCK_REPLACE_PROVISIONER"
+        fi
+        return 0
+    fi
+    if [[ "$cmd" == *share-access-to* ]]; then
+        [[ "$MOCK_REPLACE_SC_EXISTS" == 1 || -s "$test_tmp/huawei-te-nfs-replaced.yaml" ]] || return 1
+        if [[ -s "$test_tmp/huawei-te-nfs-replaced.yaml" ]]; then
+            printf '%s' trusted-vpc
+        else
+            printf '%s' "$MOCK_REPLACE_VPC"
+        fi
+        return 0
+    fi
+    case "$cmd" in
+    "get pv -o jsonpath="*) printf 'pvc-legacy-nfs|te-agent/pvc-nfs-share|Bound\n' ;;
+    "get sc te-nfs -o yaml") printf 'kind: StorageClass\nmetadata:\n  name: te-nfs\n' ;;
+    "delete sc te-nfs") MOCK_REPLACE_SC_EXISTS=0 ;;
+    "get pod storage-image -n debug -o jsonpath={.status.phase}") printf 'Pending' ;;
+    "get pod storage-image -n debug -o jsonpath={.status.containerStatuses[0].state.waiting.reason}") printf 'ImagePullBackOff' ;;
+    "apply -f -")
+        cat >"$test_tmp/huawei-te-nfs-replaced.yaml"
+        [[ "$MOCK_REPLACE_APPLY_FAIL" == 0 ]] || return 1
+        MOCK_REPLACE_SC_EXISTS=1
+        MOCK_REPLACE_PROVISIONER='everest-csi-provisioner'
+        MOCK_REPLACE_VPC='trusted-vpc'
+        ;;
+    *) return 0 ;;
+    esac
+}
+read_huawei_te_nfs_replacement_confirmation() { [[ "${MOCK_REPLACE_CONFIRM:-}" == yes ]]; }
+forbid_text '$(read_huawei_te_nfs_replacement_confirmation)'
+
+MOCK_REPLACE_CONFIRM=''
+if huawei_te_nfs_replace_after_confirmation; then
+    fail 'blank confirmation must not replace te-nfs'
+fi
+! grep -q '^delete sc te-nfs$' "$MOCK_REPLACE_CALLS" || fail 'blank confirmation must not delete te-nfs'
+
+: >"$MOCK_REPLACE_CALLS"
+MOCK_REPLACE_CONFIRM='yes'
+huawei_te_nfs_replace_after_confirmation || fail 'exact yes must replace incompatible te-nfs'
+grep -q '^delete sc te-nfs$' "$MOCK_REPLACE_CALLS" || fail 'confirmed replacement must delete only te-nfs StorageClass'
+grep -q '^apply -f -$' "$MOCK_REPLACE_CALLS" || fail 'confirmed replacement must create standard te-nfs'
+! grep -Eq '^delete (pv|pvc|pod) ' "$MOCK_REPLACE_CALLS" || fail 'te-nfs replacement must never delete PV PVC or Pod'
+grep -qF 'provisioner: everest-csi-provisioner' "$test_tmp/huawei-te-nfs-replaced.yaml" || fail 'replacement must apply the Everest CCE template'
+
+: >"$MOCK_REPLACE_CALLS"
+MOCK_REPLACE_CONFIRM='yes'
+MOCK_REPLACE_APPLY_FAIL=1
+rm -f "$test_tmp/huawei-te-nfs-replaced.yaml"
+if huawei_te_nfs_replace_after_confirmation; then
+    fail 'failed te-nfs recreation must fail'
+fi
+grep -qF '手动恢复' "$REPLACE_LOG" || fail 'failed recreation must print manual restore guidance'
+MOCK_REPLACE_APPLY_FAIL=0
+
 # Service Endpoint 就绪后，数据面可能尚未完成同步；首次失败、下次成功必须重试。
 service_source="$test_tmp/k8sAvailCheck.service.functions.sh"
 sed -n '/^_capture_service_diagnostics()/,/^# 为指定节点池创建临时/p' "$SCRIPT" >"$service_source"
@@ -388,13 +479,15 @@ fi
 
 # 所有有效 JDBC MySQL URL 都必须作为目标；同一主机端口仅探测一次，且域名/IP 保持原样。
 mysql_source="$test_tmp/k8sAvailCheck.mysql.functions.sh"
-sed -n '/^parse_mysql_targets()/,/^# ==================== 混合部署: Pod -> 集群内 MySQL TCP 连通性/p' "$SCRIPT" >"$mysql_source"
+sed -n '/^_parse_mysql_targets_from_file()/,/^# ==================== 混合部署: Pod -> 集群内 MySQL TCP 连通性/p' "$SCRIPT" >"$mysql_source"
 log_warning() { MYSQL_WARNINGS="${MYSQL_WARNINGS:-}$*\n"; }
+log_info() { MYSQL_INFOS="${MYSQL_INFOS:-}$*\n"; }
 MYSQL_PROBE_TARGETS=()
 # shellcheck disable=SC1090
 source "$mysql_source"
 
-APP_CONFIG_FILE="$test_tmp/application.yml"
+APP_CONFIG_FILE="$test_tmp/base-application.yml"
+LEGACY_APP_CONFIG_FILE="$test_tmp/etl-application.yml"
 cat >"$APP_CONFIG_FILE" <<'EOF'
 spring:
   datasource:
@@ -407,36 +500,74 @@ secondary:
   url: "jdbc:mysql://10.10.0.25/report"
 # ignored: jdbc:mysql://commented.mysql.example:3307/ignored
 EOF
+cat >"$LEGACY_APP_CONFIG_FILE" <<'EOF'
+spring:
+  datasource:
+    url: jdbc:mysql://legacy.mysql.example:3306/ta
+EOF
 MYSQL_WARNINGS=''
 parse_mysql_targets || fail 'valid JDBC MySQL targets should parse'
 [[ " ${MYSQL_PROBE_TARGETS[*]} " == *' primary.mysql.example:3306 '* ]] || fail 'hostname target must be retained'
 [[ " ${MYSQL_PROBE_TARGETS[*]} " == *' 10.10.0.25:3306 '* ]] || fail 'IP target must retain default port'
 [[ ${#MYSQL_PROBE_TARGETS[@]} -eq 2 ]] || fail 'same host and port must be deduplicated'
 [[ " ${MYSQL_PROBE_TARGETS[*]} " != *' commented.mysql.example:3307 '* ]] || fail 'commented JDBC URL must be ignored'
+[[ " ${MYSQL_PROBE_TARGETS[*]} " != *' legacy.mysql.example:3306 '* ]] || fail 'valid standard config must prevent legacy fallback'
+[[ "$MYSQL_CONFIG_SELECTED" == "$APP_CONFIG_FILE" ]] || fail 'standard config must be recorded as selected'
 
+# 标准文件含有效和损坏URL时，继续使用有效地址并告警，不得回退。
 cat >"$APP_CONFIG_FILE" <<'EOF'
+spring:
+  datasource:
+    url: jdbc:mysql://primary.mysql.example:3306/ta
+broken:
+    url: jdbc:mysql:///missing-host
+EOF
+MYSQL_WARNINGS=''
+parse_mysql_targets || fail 'valid JDBC target must remain usable alongside a malformed URL'
+[[ "${MYSQL_PROBE_TARGETS[*]}" == 'primary.mysql.example:3306' ]] || fail 'mixed standard config must keep only its valid endpoint'
+[[ "$MYSQL_WARNINGS" == *'无法解析'* ]] || fail 'malformed JDBC URL alongside valid target must warn'
+[[ "$MYSQL_CONFIG_SELECTED" == "$APP_CONFIG_FILE" ]] || fail 'mixed standard config must not fall back to legacy'
+
+# 标准文件无有效目标时，回退历史配置；相同host:port必须去重。
+cat >"$APP_CONFIG_FILE" <<'EOF'
+spring:
+  datasource:
+    username: ta
+EOF
+cat >"$LEGACY_APP_CONFIG_FILE" <<'EOF'
+spring:
+  datasource:
+    url: jdbc:mysql://ta3:3306/ta?useSSL=false
+hive:
+  mysql:
+    url: jdbc:mysql://ta3:3306/hive?useSSL=false
+EOF
+MYSQL_WARNINGS=''
+parse_mysql_targets || fail 'standard config without a valid target must fall back to historical config'
+[[ "${MYSQL_PROBE_TARGETS[*]}" == 'ta3:3306' ]] || fail 'historical spring/hive URLs on same endpoint must deduplicate'
+[[ "$MYSQL_CONFIG_SELECTED" == "$LEGACY_APP_CONFIG_FILE" ]] || fail 'historical config must be recorded as selected'
+[[ "$MYSQL_WARNINGS" == *'回退历史配置'* ]] || fail 'historical fallback must be disclosed'
+
+# 标准文件不存在时也回退；两者均无有效目标时必须给出完整人工处理提示。
+rm "$APP_CONFIG_FILE"
+MYSQL_WARNINGS=''
+parse_mysql_targets || fail 'missing standard config must fall back to historical config'
+[[ "$MYSQL_CONFIG_SELECTED" == "$LEGACY_APP_CONFIG_FILE" ]] || fail 'missing standard config must select historical config'
+
+cat >"$LEGACY_APP_CONFIG_FILE" <<'EOF'
 spring:
   datasource:
     url: jdbc:mysql:///missing-host
 EOF
 MYSQL_WARNINGS=''
 if parse_mysql_targets; then
-    fail 'malformed JDBC MySQL URL must fail parsing'
+    fail 'two configs without any valid endpoint must fail'
 fi
-[[ "$MYSQL_WARNINGS" == *'无法解析'* ]] || fail 'malformed JDBC URL must report a parse reason'
-
-cat >"$APP_CONFIG_FILE" <<'EOF'
-spring:
-  datasource:
-    username: ta
-EOF
-MYSQL_WARNINGS=''
-if parse_mysql_targets; then
-    fail 'missing JDBC MySQL URL must fail parsing'
-fi
-[[ "$MYSQL_WARNINGS" == *'未找到 jdbc:mysql://'* ]] || fail 'missing JDBC URL must report a parse reason'
+[[ "$MYSQL_PARSE_ERROR" == *"$APP_CONFIG_FILE"* && "$MYSQL_PARSE_ERROR" == *"$LEGACY_APP_CONFIG_FILE"* ]] || fail 'final failure must name both attempted config paths'
+[[ "$MYSQL_PARSE_ERROR" == *'自行测试MySQL地址'* ]] || fail 'final failure must instruct manual MySQL testing'
 
 require_text 'parse_mysql_targets()'
+require_text 'LEGACY_APP_CONFIG_FILE="/data/home/ta/data_etl_ta/application.yml"'
 require_text 'for mysql_target in "${MYSQL_PROBE_TARGETS[@]}"'
 require_text 'test_pod_to_mysql_connectivity "$mysql_target"'
 require_text 'test_pod_to_host_latency "$mysql_target"'
@@ -464,8 +595,14 @@ cat >"$HOST_ALIAS_SOURCE_FILE" <<'EOF'
 192.168.2.9 valid.internal valid.internal
 2001:db8::8 ipv6.internal
 10.0.0.12 *
+10.0.0.13 MixedCase.INTERNAL valid-on-mixed-line.internal bad_name bad..dots trailing- .leading trailing.
+10.0.0.14 mixedcase.internal second-valid.internal
 not-an-ip ignored.internal
 EOF
+long_host_label="$(printf 'a%.0s' {1..64})"
+long_host_total="$(printf 'a%.0s' {1..63}).$(printf 'b%.0s' {1..63}).$(printf 'c%.0s' {1..63}).$(printf 'd%.0s' {1..62})"
+printf '10.0.0.15 %s valid-with-long-label.internal\n' "$long_host_label" >>"$HOST_ALIAS_SOURCE_FILE"
+printf '10.0.0.16 %s valid-with-long-total.internal\n' "$long_host_total" >>"$HOST_ALIAS_SOURCE_FILE"
 : >"$HOST_ALIAS_WARNING_FILE"
 probe_host_aliases=$(build_probe_host_aliases)
 [[ "$probe_host_aliases" == *'ip: "10.0.0.10"'* ]] || fail 'valid executor hosts mapping must become a hostAlias'
@@ -474,7 +611,16 @@ probe_host_aliases=$(build_probe_host_aliases)
 [[ "$probe_host_aliases" != *'k8sAvailCheck.sh'* && "$probe_host_aliases" != *'test_k8s_avail_check.sh'* ]] || fail 'glob-shaped hosts aliases must not expand into workspace filenames'
 [[ "$probe_host_aliases" == *'ip: "10.0.0.11"'* && "$probe_host_aliases" == *'duplicate.internal'* ]] || fail 'conflicting hostname must retain non-conflicting aliases'
 [[ $(grep -o 'mysql.internal' <<<"$probe_host_aliases" | wc -l) -eq 1 ]] || fail 'conflicting hostname must keep only its first mapping'
+[[ "$probe_host_aliases" == *'mixedcase.internal'* && "$probe_host_aliases" != *'MixedCase.INTERNAL'* ]] || fail 'uppercase hostname must be normalized to lowercase'
+[[ $(grep -o 'mixedcase.internal' <<<"$probe_host_aliases" | wc -l) -eq 1 ]] || fail 'case-folded cross-IP conflict must keep only the first mapping'
+[[ "$probe_host_aliases" == *'valid-on-mixed-line.internal'* && "$probe_host_aliases" == *'second-valid.internal'* ]] || fail 'invalid aliases must not discard valid aliases on the same IP'
+[[ "$probe_host_aliases" == *'valid-with-long-label.internal'* && "$probe_host_aliases" == *'valid-with-long-total.internal'* ]] || fail 'invalid long aliases must not discard valid siblings'
+[[ "$probe_host_aliases" != *'bad_name'* && "$probe_host_aliases" != *'bad..dots'* && "$probe_host_aliases" != *'trailing-'* && "$probe_host_aliases" != *'.leading'* && "$probe_host_aliases" != *'trailing.'* ]] || fail 'RFC1123-invalid aliases must never enter hostAliases'
+[[ "$probe_host_aliases" != *"$long_host_label"* && "$probe_host_aliases" != *"$long_host_total"* ]] || fail 'overlong RFC1123 label/subdomain must be discarded'
 grep -qF 'mysql.internal' "$HOST_ALIAS_WARNING_FILE" || fail 'conflicting hostname must emit a warning'
+grep -qF 'MixedCase.INTERNAL' "$HOST_ALIAS_WARNING_FILE" || fail 'uppercase normalization must be disclosed'
+grep -qF 'bad_name' "$HOST_ALIAS_WARNING_FILE" || fail 'discarded illegal hostname must warn'
+grep -qF "$long_host_label" "$HOST_ALIAS_WARNING_FILE" || fail 'discarded overlong label must warn'
 cat >>"$HOST_ALIAS_SOURCE_FILE" <<'EOF'
 999.1.1.1 bad-v4.internal
 2001:db8:::1 malformed-v6.internal
@@ -493,7 +639,7 @@ _apply_probe_deployment 'np-probe-test' 'test' '' 'nginx:stable'
 probe_manifest="$ARTIFACT_DIR/np-probe-test.yaml"
 grep -qF 'hostAliases:' "$probe_manifest" || fail 'probe Deployment manifest must inject hostAliases'
 grep -qF 'mysql.internal' "$probe_manifest" || fail 'probe Deployment manifest must include inherited hostname'
-grep -A1 -F 'ipv6.internal' "$probe_manifest" | grep -q '^      containers:' || fail 'last hostAlias hostname and containers must be separate YAML lines'
+grep -A1 -F 'valid-with-long-total.internal' "$probe_manifest" | grep -q '^      containers:' || fail 'last hostAlias hostname and containers must be separate YAML lines'
 ! grep -qF 'build_probe_host_aliases' "$probe_manifest" || fail 'probe Deployment manifest must not contain literal command substitution text'
 _apply_probe_deployment 'np-probe-selector' 'spot' 'spot-32c128g' 'nginx:stable'
 selector_manifest="$ARTIFACT_DIR/np-probe-selector.yaml"
@@ -699,7 +845,9 @@ delete_index=$(grep -n -m1 '^delete pvc te-csi-check-nfs-pvc ' "$STORAGE_CLEANUP
 
 require_text '就绪节点池: ${ready_pools_display}'
 require_text 'huawei_te_disk_before_gpssd2.yaml'
-require_text 'record_result "块存储StorageClass就绪检查" "WARN" "发现被PVC/PV依赖的历史te-disk，保留现有盘型以兼容存量应用"'
+require_text '旧SC仍被业务PVC/PV使用，因此不会更新为GPSSD2'
+require_text '已绑定卷和现有Pod不受影响'
+require_text 'record_result "块存储StorageClass就绪检查" "PASS" "旧SC仍被业务PVC/PV使用，因此不会更新为GPSSD2；已绑定卷和现有Pod不受影响"'
 forbid_text 'check_huawei_gpssd2_support'
 forbid_text 'HUAWEI_GPSSD2_SUPPORT'
 forbid_text 'Everest版本低于'

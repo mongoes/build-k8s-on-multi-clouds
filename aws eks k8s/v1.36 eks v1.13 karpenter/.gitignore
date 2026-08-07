@@ -1,0 +1,8 @@
+nodepool_configs/
+*.log
+template-file-eks*.yaml
+awscliv2.zip
+eksctl.tar.gz
+get_helm.sh
+.DS_Store
+*_bak_*

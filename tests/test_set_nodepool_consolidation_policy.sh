@@ -2,119 +2,122 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-script="$repo_root/aws eks k8s/v1.36 eks v1.13 karpenter/01eks_build/set_nodepool_consolidation_policy.sh"
+script="$repo_root/k8sAvailCheck.sh"
 tmp_dir="$(mktemp -d)"
-mock_bin="$tmp_dir/bin"
-calls="$tmp_dir/kubectl.calls"
-state="$tmp_dir/nodepools.state"
-readback_override="$tmp_dir/readback.override"
-mkdir -p "$mock_bin"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-fail() {
-  echo "FAIL: $*" >&2
-  exit 1
+fail() { echo "FAIL: $*" >&2; exit 1; }
+functions="$tmp_dir/aws-functions.sh"
+sed -n '/^_aws_mark_storage_repair_needed()/,/^# ==================== 主执行流程/p' "$script" >"$functions"
+
+RESULTS=""
+LOGS=""
+record_result() { RESULTS="${RESULTS}$1|$2|${3:-}\n"; }
+log_info() { LOGS="${LOGS}$*\n"; }
+log_warning() { LOGS="${LOGS}$*\n"; }
+log_error() { LOGS="${LOGS}$*\n"; }
+log_success() { LOGS="${LOGS}$*\n"; }
+# shellcheck disable=SC1090
+source "$functions"
+AWS_STORAGE_REPAIR_NEEDED=false
+AWS_STORAGE_REPAIR_REASONS=""
+AWS_CONSOLIDATION_CANDIDATES=""
+AWS_SPECIAL_ACTION_TIMEOUT=30
+AWS_TOOL_BASE_URL="https://example.invalid"
+YELLOW="" BOLD="" NC=""
+
+kubectl() {
+    local cmd="$*"
+    case "$cmd" in
+    "get crd nodepools.karpenter.sh -o name")
+        case "${MOCK_CRD:-ok}" in
+        notfound) echo 'Error from server (NotFound): customresourcedefinitions.apiextensions.k8s.io "nodepools.karpenter.sh" not found' >&2; return 1 ;;
+        forbidden) echo 'Error from server (Forbidden): cannot get resource customresourcedefinitions' >&2; return 1 ;;
+        *) printf 'customresourcedefinition.apiextensions.k8s.io/nodepools.karpenter.sh\n' ;;
+        esac
+        ;;
+    "get nodepools.karpenter.sh -o jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+        [[ "${MOCK_LIST_FAIL:-0}" != 1 ]] || { echo 'Forbidden' >&2; return 1; }
+        printf '%b' "${MOCK_NODEPOOLS:-}"
+        ;;
+    "get nodepools.karpenter.sh -o jsonpath="*)
+        printf '%b' "${MOCK_LINES:-}"
+        ;;
+    "get nodepools.karpenter.sh risky-pool -o jsonpath="*)
+        if [[ "${MOCK_PATCHED:-0}" == 1 && "${MOCK_READBACK_BAD:-0}" != 1 ]]; then
+            printf 'WhenEmpty'
+        else
+            printf '%s' "${MOCK_CURRENT:-WhenEmptyOrUnderutilized}"
+        fi
+        ;;
+    "patch nodepools.karpenter.sh risky-pool --type=merge "*)
+        [[ "${MOCK_PATCH_FAIL:-0}" != 1 ]] || return 1
+        MOCK_PATCHED=1
+        ;;
+    *)
+        return 1
+        ;;
+    esac
 }
 
-assert_contains() {
-  local haystack="$1"
-  local needle="$2"
-  [[ "$haystack" == *"$needle"* ]] || fail "expected output to contain: $needle"
-}
+# AWS NodePool前置门禁必须区分CRD缺失、查询失败、零对象和已有对象。
+MOCK_CRD=notfound RESULTS=""
+if check_aws_nodepool_gate; then fail 'missing CRD must stop the AWS standard flow'; fi
+[[ "$RESULTS" == *'缺少nodepools.karpenter.sh CRD'* ]] || fail 'missing CRD must have a precise failure'
 
-assert_not_contains() {
-  local haystack="$1"
-  local needle="$2"
-  [[ "$haystack" != *"$needle"* ]] || fail "expected output not to contain: $needle"
-}
+MOCK_CRD=forbidden RESULTS=""
+if check_aws_nodepool_gate; then fail 'Forbidden CRD query must not be treated as zero NodePools'; fi
+[[ "$RESULTS" == *'CRD查询失败'* ]] || fail 'Forbidden CRD query must retain the permission diagnosis'
 
-write_state() {
-  printf '%s\n' \
-    'risky-pool=WhenEmptyOrUnderutilized' \
-    'safe-pool=WhenEmpty' \
-    'custom-pool=Never' \
-    'unset-pool=' >"$state"
-  : >"$calls"
-  : >"$readback_override"
-}
+MOCK_CRD=ok MOCK_LIST_FAIL=0 MOCK_NODEPOOLS=$'base-pool\n' RESULTS=""
+check_aws_nodepool_gate || fail 'an existing NodePool must continue the standard flow'
+[[ "$RESULTS" == *'已存在NodePool，继续标准可用性检查'* ]] || fail 'existing NodePool must record PASS'
 
-cat >"$mock_bin/kubectl" <<'MOCK'
-#!/usr/bin/env bash
-set -euo pipefail
+MOCK_NODEPOOLS="" RESULTS="" MOCK_TOOL_RUN=0
+_aws_interactive_tty_available() { return 1; }
+_download_and_run_aws_tool() { MOCK_TOOL_RUN=1; }
+if check_aws_nodepool_gate; then fail 'zero NodePools without consent must stop'; fi
+[[ "$MOCK_TOOL_RUN" == 0 ]] || fail 'non-interactive zero-NodePool gate must not run a privileged tool'
 
-printf '%s\n' "$*" >>"$MOCK_CALLS"
+MOCK_TOOL_RUN=0 RESULTS=""
+_aws_interactive_tty_available() { return 0; }
+_aws_confirm_short_yes() { return 0; }
+set +e
+check_aws_nodepool_gate
+gate_rc=$?
+set -e
+[[ $gate_rc -eq 10 ]] || fail 'authorized zero-NodePool flow must request a rerun after tool success'
+[[ "$MOCK_TOOL_RUN" == 1 ]] || fail 'authorized zero-NodePool flow must run auto_build_nodepool.sh once'
 
-get_policy() {
-  local name="$1"
-  local source="$MOCK_READBACK_OVERRIDE"
-  local value
-  value="$(awk -F= -v name="$name" '$1 == name {print $2; exit}' "$source")"
-  if [[ -z "$value" ]] && ! grep -q "^${name}=$" "$source"; then
-    value="$(awk -F= -v name="$name" '$1 == name {print $2; exit}' "$MOCK_STATE")"
-  fi
-  printf '%s' "$value"
-}
+MOCK_LINES=$'safe-pool\tWhenEmpty\ncustom-pool\tNever\nunset-pool\t\n'
+AWS_CONSOLIDATION_CANDIDATES=""
+check_aws_consolidation_policy
+[[ -z "$AWS_CONSOLIDATION_CANDIDATES" ]] || fail 'safe/custom/unset policies must not become repair candidates'
+[[ "$RESULTS" == *'AWS NodePool驱逐策略检查|PASS|'* ]] || fail 'no risky policy must record PASS'
 
-if [[ "$1 $2" == 'get nodepool' ]]; then
-  if [[ $# -ge 4 && "$3" == '-o' ]]; then
-    while IFS='=' read -r name policy; do
-      printf '%s\t%s\n' "$name" "$policy"
-    done <"$MOCK_STATE"
-    exit 0
-  fi
+RESULTS="" LOGS=""
+MOCK_LINES=$'risky-pool\tWhenEmptyOrUnderutilized\nsafe-pool\tWhenEmpty\n'
+check_aws_consolidation_policy
+[[ "$AWS_CONSOLIDATION_CANDIDATES" == 'risky-pool' ]] || fail 'only WhenEmptyOrUnderutilized must be selected'
+[[ "$RESULTS" == *'AWS NodePool驱逐策略检查|WARN|'* ]] || fail 'risky policy must record WARN'
 
-  if [[ $# -ge 5 && "$4" == '-o' ]]; then
-    get_policy "$3"
-    exit 0
-  fi
-fi
+# 非TTY测试环境不得修改集群。
+MOCK_PATCHED=0
+_aws_interactive_tty_available() { return 1; }
+run_aws_postcheck_actions
+[[ "$MOCK_PATCHED" == 0 ]] || fail 'non-interactive run must not patch NodePools'
 
-if [[ "$1 $2" == 'patch nodepool' ]]; then
-  name="$3"
-  grep -q -- '--type=merge' <<<"$*"
-  grep -q -- '"consolidationPolicy":"WhenEmpty"' <<<"$*"
-  awk -F= -v name="$name" 'BEGIN {OFS="="} $1 == name {$2="WhenEmpty"} {print}' "$MOCK_STATE" >"$MOCK_STATE.next"
-  mv "$MOCK_STATE.next" "$MOCK_STATE"
-  exit 0
-fi
+AWS_CONSOLIDATION_CANDIDATES="risky-pool"
+MOCK_PATCHED=0 MOCK_READBACK_BAD=0
+_aws_confirm_full_yes() { return 0; }
+run_aws_postcheck_actions || fail 'confirmed safe patch with successful readback must pass'
+[[ "$MOCK_PATCHED" == 1 ]] || fail 'full yes must patch the precise risky NodePool'
 
-echo "unexpected kubectl invocation: $*" >&2
-exit 99
-MOCK
-chmod +x "$mock_bin/kubectl"
+MOCK_PATCHED=0 MOCK_READBACK_BAD=1
+if run_aws_postcheck_actions; then fail 'unchanged readback after patch must fail'; fi
 
-run_script() {
-  local input="$1"
-  printf '%s\n' "$input" | \
-    MOCK_CALLS="$calls" MOCK_STATE="$state" MOCK_READBACK_OVERRIDE="$readback_override" \
-    PATH="$mock_bin:$PATH" bash "$script"
-}
+grep -qF '_aws_confirm_full_yes' "$script" || fail 'repair must require full yes confirmation'
+grep -qF "current=\$(kubectl get nodepools.karpenter.sh" "$script" || fail 'repair must re-read each candidate before patch'
+grep -qF "actual=\$(kubectl get nodepools.karpenter.sh" "$script" || fail 'repair must read back the patched policy'
 
-[[ -f "$script" ]] || fail "nodepool consolidation policy script must exist"
-
-printf '%s\n' 'safe-pool=WhenEmpty' 'custom-pool=Never' >"$state"
-: >"$calls"
-no_match_output="$(run_script '')"
-assert_contains "$no_match_output" 'No NodePool uses WhenEmptyOrUnderutilized. No changes made.'
-assert_not_contains "$(cat "$calls")" 'patch nodepool'
-
-write_state
-cancel_output="$(run_script 'no')"
-assert_contains "$cancel_output" 'will change: risky-pool'
-assert_contains "$cancel_output" 'Cancelled. No NodePool was modified.'
-assert_not_contains "$(cat "$calls")" 'patch nodepool'
-
-write_state
-confirmed_output="$(run_script 'yes')"
-assert_contains "$confirmed_output" 'Modified: risky-pool'
-assert_contains "$(cat "$calls")" 'patch nodepool risky-pool --type=merge'
-assert_not_contains "$(cat "$calls")" 'patch nodepool safe-pool'
-assert_not_contains "$(cat "$calls")" 'patch nodepool custom-pool'
-
-write_state
-printf '%s\n' 'risky-pool=WhenEmptyOrUnderutilized' >"$readback_override"
-if run_script 'yes' >/dev/null 2>&1; then
-  fail 'script must fail when read-back policy remains WhenEmptyOrUnderutilized'
-fi
-
-echo 'PASS: nodepool consolidation policy regression assertions'
+echo 'PASS: integrated nodepool consolidation policy regression assertions'

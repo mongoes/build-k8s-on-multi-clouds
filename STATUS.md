@@ -2,6 +2,18 @@
 
 ## 当前阶段
 
+2026-08-07 Serverless专项检查已实施、待双云现场回灌：`k8sServerlessAvailCheck.sh` 从Node强指纹识别腾讯EKlet与阿里Virtual Kubelet，区分`Serverless-only`、`Hybrid`、`Standard-only`；云厂商证据冲突或标准节点云归属不足时FAIL停止，不猜测。腾讯首次实测发现探测对象名超63字符、时间戳下划线违反RFC1123、以及生成YAML时误执行存储容器命令替换，现已改为短哈希RFC1123资源ID并修正转义；AZ优先展示`eks.tke.cloud.tencent.com/zone-name`。ClusterIP失败现保留命令输出、Service、EndpointSlice、Endpoints和Pod物料；探测镜像缺少HTTP客户端时仅WARN。`te-nfs` 现先在每个健康调度域以两个Pod共享同一PVC验证RWX，再在至少两个健康调度域时做跨域Writer/Reader验证；虚拟CPU、内存、Pod容量、InternalIP和Lease不参与结论。下一步：用同一腾讯单EKlet集群确认同域双Pod RWX与ClusterIP诊断，再用多EKlet集群验证跨域RWX，随后回灌阿里多Virtual Kubelet、混合模式及未知/冲突模式。
+
+2026-08-07 华为CCE存储回灌已真实验证：历史`te-disk`被业务PVC/PV引用时，检查按通过呈现且未改变SC。旧`te-nfs`（`nfs-provisioner`、无VPC授权）在人工确认后已仅替换同名StorageClass，未触碰PV/PVC/Pod；后续临时RWX PVC由`everest-csi-provisioner`成功供给并Bound，证明脚本改造与SC参数生效。Pod失败于节点对SFS地址的NFS挂载（`FailedMount`），现场已确认CCE缺少VPCEP，属于云侧文件存储访问通路前置条件，不是脚本逻辑误判。
+
+2026-08-06 节点组交互与hostAliases健壮性已实施、待现场回灌：业务规划菜单及自定义输入等待由30秒延长到300秒；`/etc/hosts`别名进入Pod前统一做RFC1123校验。合法大写DNS名称转小写并披露，无法可靠处理的非法别名逐条WARN并丢弃，同一行其他合法别名不受影响；规范化后再去重和判断跨IP冲突，确保单条非法hosts记录不会导致探测Deployment整体apply失败。
+
+2026-08-06 MySQL历史环境兼容已实施、待现场回灌：混合部署网络探测优先从`/data/home/ta/base_server_ta/application.yml`解析全部非注释JDBC MySQL目标；标准文件不存在或零有效目标时，回退`/data/home/ta/data_etl_ta/application.yml`。标准文件只要存在一个有效目标就不回退，损坏URL按文件路径和行号WARN，其余有效目标继续检测；两个文件均无有效目标时FAIL并提示管理员自行测试MySQL地址。
+
+2026-08-04 P0 已实施、待真实 EKS 回灌：通用检查的kubectl目标版本继续保持多云共同基线Kubernetes 1.34；EKS 1.36仅用于AWS专用建设物料，待所有云平台支持1.36后再统一升级通用检查。AWS EKS 已移除识别后无条件下载 `auto_build_nodepool.sh` 并提前 PASS 的旧路径。现在平台识别后精确检查 `nodepools.karpenter.sh` CRD和资源对象；CRD缺失、Forbidden/查询失败分别报错，零NodePool仅在TTY输入Y/y后执行外部创建脚本并要求重跑，已有NodePool继续节点规划、存储、调度、网络和端到端存储的完整标准流程。AWS工具限定白名单、统一下载目录、非空及`bash -n`校验并用Bash执行。
+
+AWS存储缺失不再由通用脚本静默创建：`te-disk`、`te-nfs`、EBS/EFS CSI或存储端到端失败会聚合原因，在总览后按需提供`storage_ready_for_existing_eks.sh`入口。NodePool `WhenEmptyOrUnderutilized` 已迁入通用脚本只读审计；总览后仅完整输入`yes`才执行重读、字段级patch和读回验证，原独立`set_nodepool_consolidation_policy.sh`已移除。
+
 新增P0设计：AWS EKS不得再自动进入 `auto_build_nodepool.sh` 并提前结束。已确定Kubernetes 1.36 / Karpenter 1.13物料以 `aws eks k8s/v1.36 eks v1.13 karpenter/01eks_build/` 为权威源；AWS识别后先精确检查 `nodepools.karpenter.sh` CRD和NodePool对象，零NodePool立即交互式进入创建流程，已有NodePool则执行完整标准检查。存储修复和内置consolidation治理仅在对应问题出现时于总览后提供。
 
 原独立 consolidation policy 治理脚本的精确筛选、完整确认、字段级patch和回读逻辑已经过本地测试；根据2026-08-04 P0新边界，该逻辑将在实施时迁入通用检查的AWS特性环节，`01eks_build/set_nodepool_consolidation_policy.sh` 不再作为独立入口维护。
@@ -34,6 +46,15 @@ P0 设计确认：GKE Filestore `te-nfs` 不能隐式依赖 `default` VPC；需�
 
 ## 下一步
 
+- [ ] P0：在腾讯多EKlet环境复跑已修复的Serverless专项脚本，再在阿里多Virtual Kubelet环境回灌：逐域Pod/网络/RWO/RWX、双域RWX共享、纯Serverless/混合/Standard-only/未知冲突拒绝路径；确认Tencent EKlet toleration和Alibaba无污点节点均可起服。
+- [ ] P0：华为CCE已完成SC替换实测；待在控制台补齐SFS所需VPCEP后，重跑RWX基础与跨节点共享验证，并同时复核`od-4c32g`节点池缺失问题。
+- [ ] P1：在含大写及非法`/etc/hosts`别名的环境回灌，确认生成物料只含小写RFC1123名称且Deployment可apply；确认节点组提示显示300秒。
+- [ ] P1：在只有`data_etl_ta/application.yml`的历史环境回灌MySQL目标解析、Pod TCP连通性及延迟检查结果。
+- [ ] P0：针对 garena-新物理机内置 K8S，API Server 已确认正常，根因收敛为 `FORWARD` 中客户无条件 DROP 位于 `FLANNEL-FWD` 之前、截断 Pod 转发。管理员不允许改动 DROP：立即恢复仅在该 DROP 前插入一条 `-j FLANNEL-FWD`，原 DROP 与其后的历史 Flannel 跳转均不动。每次策略刷新、Flannel/kube-proxy 重建后回读顺序与 Pod 到 `10.96.0.1:443` 连通性；若客户刷新会整表 restore，则必须由其维护方提供不覆盖 K8S/CNI 链的集成方式，否则本侧插入无法持久。
+- [ ] P0：garena-新暂停 `kruise-daemon` 后，残留的集群级 validating webhook `vpod.kb.io` 仍指向无 Endpoints 的 `kruise-webhook-service.kruise-system:443`，导致包括删除 Pod 在内的 Admission 请求失败。需先对该精确 webhook 临时设 `failurePolicy: Ignore` 或恢复 webhook endpoint，删除/修复工作负载后按原值恢复；不可把 `--force` 当成绕过 Admission 的方案。
+- [ ] P0：ACK `te-agent` 的 Agent Sandbox `sandbox-1-*` CrashLoop 已排除 Kruise、驱逐和 OOM：Pod 由 `Sandbox` CR 控制，Kruise 仅注入 promtail sidecar；kubelet Event 明确为 `Container sandbox failed liveness probe, will be restarted`。现场 `node dist/main` 实际监听 `*:80`，`te-agent-sandbox` ConfigMap 亦为 `app.port: 80`，但 Pod liveness/readiness 固定探测 `:8080/health`，是确定的配置/控制器模板不一致。npm 中 SIGTERM 是 kubelet 终止后的表象。需修正生成 Sandbox Pod 的 liveness/readiness port 为 80（并以新 Pod 验证）；不应先改重启策略或误停 Kruise。
+- [ ] P0：华为 `te-system/kubete-controller-manager:6.0.8` 在 node `192.168.0.170` CrashLoop 的根因已定位：`metricscollection-controller` 初始化 DB client 时连接 `192.168.0.16:3306` 超时，随后构建全部 controller context 失败并 Exit 1。它已成功解析 `te-global-config`、监听 `8443` 且 liveness 曾多次 Healthy；不是探针、OOM、驱逐或 Kruise。下一步以宿主机/POD 双向 TCP 测试和 node tcpdump 验证 MySQL 本身、Pod 出站 SNAT/路由、以及已知 FORWARD DROP 的实际命中；修复网络路径后重启 Deployment 验收。
+- [ ] P0：按AWS EKS验收矩阵回灌：CRD不存在、CRD Forbidden、零NodePool的Y/拒绝/非TTY、已有NodePool完整标准流程、存储缺失入口、consolidation合规/不合规。
 - [ ] P0：在至少一个 Serverless 集群完成独立脚本回归，证明不依赖 Node / NodePool 假设。
 - [ ] P1：在真实存在旧版 Kyverno 且 K8S>=1.34 的环境回灌升级成功路径，并验证重装失败时的人工指令提示。
 - [ ] P1：在含历史 `debug/te-csi-check-*` Released PV 的隔离集群逐项验收 `Y` 清理、`N` 跳过、30 秒超时默认清理和业务 PV 排除。

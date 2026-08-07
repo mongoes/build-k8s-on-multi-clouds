@@ -33,6 +33,11 @@ ARTIFACT_DIR="$(pwd)/k8sAvailCheckArtifacts_${RUN_TS}"
 NAMESPACE="debug"
 # 脚本完成标志：用于EXIT trap判断是否异常退出，异常退出时清理残留测试资源
 SCRIPT_COMPLETED=false
+AWS_TOOL_BASE_URL="https://download-thinkingdata.oss-cn-shanghai.aliyuncs.com/ta/tools"
+AWS_SPECIAL_ACTION_TIMEOUT=30
+AWS_STORAGE_REPAIR_NEEDED=false
+AWS_STORAGE_REPAIR_REASONS=""
+AWS_CONSOLIDATION_CANDIDATES=""
 
 # ==================== 版本配置（跟随K8S社区迭代更新） ====================
 K8S_VERSION="1.34"
@@ -90,7 +95,7 @@ NODEPOOL_PLAN_EFFECTIVE=""
 NODEPOOL_PLAN_LABEL=""
 NODEPOOL_PLAN_BASELINE=""
 NODEPOOL_PLAN_SOURCE=""
-NODEPOOL_PLAN_INPUT_TIMEOUT=30
+NODEPOOL_PLAN_INPUT_TIMEOUT=300
 NODEPOOL_PLAN_MAX_ATTEMPTS=3
 
 get_expected_nodepools() {
@@ -321,6 +326,7 @@ SPEC_TOLERANCE=0.06
 # 目的: 验证 Pod -> 集群内 MySQL 的 TCP 可达性, 以及 Pod -> MySQL 所在云主机的网络延迟,
 # 提前暴露混合部署下安全组/路由错配(典型: Pod 网段未被云主机侧安全组放行)。
 APP_CONFIG_FILE="/data/home/ta/base_server_ta/application.yml"
+LEGACY_APP_CONFIG_FILE="/data/home/ta/data_etl_ta/application.yml"
 # Pod -> 云主机延迟阈值(毫秒)。混合部署要求同 VPC 低延迟内网, >50ms 多为跨可用区/跨域错配。
 HOST_LATENCY_THRESHOLD_MS=50
 # 延迟采样次数(取均值, 削峰抖动)。TCP 握手计时近似 RTT(略高于 ICMP 但同量级)。
@@ -720,10 +726,12 @@ test_k8s_connection() {
     log_step "K8S集群连通性检查"
     if [[ -z "${KUBECONFIG}" ]] || [[ ! -f "${KUBECONFIG}" ]]; then
         log_error "未找到KUBECONFIG文件，请参考SOP配置K8S访问凭证"
+        log_info "若目标是AWS EKS：请先确认已使用build_eks_v1.36.sh完成集群创建，并完成AWS密钥授权及 aws eks update-kubeconfig 后重试；本脚本不会自动创建EKS"
         exit 1
     fi
     if ! kubectl cluster-info &>/dev/null; then
         log_error "无法连接到Kubernetes集群，请检查配置"
+        log_info "若目标是AWS EKS：请确认EKS已创建、AWS凭证有访问权限，并重新执行 aws eks update-kubeconfig 后重试"
         exit 1
     fi
     log_success "K8S集群连接正常"
@@ -1189,8 +1197,26 @@ _valid_probe_host_ip() {
     fi
 }
 
+_normalize_probe_hostname() {
+    local original="$1" normalized label
+    local -a labels=()
+    [[ -n "$original" ]] || return 1
+
+    normalized=$(printf '%s' "$original" | tr '[:upper:]' '[:lower:]')
+    [[ ${#normalized} -le 253 ]] || return 1
+    [[ "$normalized" != .* && "$normalized" != *. && "$normalized" != *..* ]] || return 1
+
+    IFS='.' read -r -a labels <<<"$normalized"
+    [[ ${#labels[@]} -gt 0 ]] || return 1
+    for label in "${labels[@]}"; do
+        [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+        [[ "$label" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || return 1
+    done
+    printf '%s\n' "$normalized"
+}
+
 build_probe_host_aliases() {
-    local hosts_file="${HOST_ALIAS_SOURCE_FILE:-/etc/hosts}" line ip rest name known mapped
+    local hosts_file="${HOST_ALIAS_SOURCE_FILE:-/etc/hosts}" line ip rest name original_name normalized_name known mapped
     local -a names=() ips=() aliases=()
     [[ -r "$hosts_file" ]] || {
         log_warning "无法读取执行机 hosts: ${hosts_file}"
@@ -1203,7 +1229,16 @@ build_probe_host_aliases() {
         [[ "$ip" == 127.* || "$ip" == "::1" ]] && continue
         read -r -a aliases <<<"$rest"
         for name in "${aliases[@]:-}"; do
-            [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && "$name" != localhost* ]] || continue
+            original_name="$name"
+            if ! normalized_name=$(_normalize_probe_hostname "$original_name"); then
+                log_warning "执行机hosts主机名不符合Kubernetes RFC1123要求，已丢弃该别名: ${original_name}"
+                continue
+            fi
+            name="$normalized_name"
+            if [[ "$name" != "$original_name" ]]; then
+                log_warning "执行机hosts主机名含大写字符，已按Kubernetes RFC1123要求转换: ${original_name} -> ${name}"
+            fi
+            [[ "$name" != localhost* ]] || continue
             known=0
             for mapped in "${names[@]:-}"; do
                 [[ "${mapped%%|*}" == "$name" ]] || continue
@@ -2101,17 +2136,22 @@ test_pod_to_localhost_connectivity() {
 # 的 DNS、路由和安全组。仅做 TCP 可达探测，不解析账密、不登录 MySQL。
 MYSQL_PROBE_TARGETS=()
 MYSQL_PARSE_ERROR=""
-parse_mysql_targets() {
+MYSQL_PARSE_WARNINGS=""
+MYSQL_CONFIG_SELECTED=""
+MYSQL_FILE_PARSE_REASON=""
+
+_parse_mysql_targets_from_file() {
+    local config_file="$1"
     MYSQL_PROBE_TARGETS=()
-    MYSQL_PARSE_ERROR=""
-    if [[ ! -r "$APP_CONFIG_FILE" ]]; then
-        MYSQL_PARSE_ERROR="未找到业务配置文件 ${APP_CONFIG_FILE}"
-        log_warning "$MYSQL_PARSE_ERROR"
+    MYSQL_FILE_PARSE_REASON=""
+    if [[ ! -r "$config_file" ]]; then
+        MYSQL_FILE_PARSE_REASON="配置文件不存在或不可读: ${config_file}"
         return 1
     fi
 
-    local line remainder hostport host port target target_seen known found=0 invalid=0
+    local line remainder hostport host port target target_seen known found=0 invalid=0 valid=0 line_no=0
     while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_no += 1))
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" == *"jdbc:mysql://"* ]] || continue
         found=1
@@ -2127,33 +2167,61 @@ parse_mysql_targets() {
         port="${hostport##*:}"
         [[ "$port" == "$hostport" || -z "$port" ]] && port="3306"
         if [[ -z "$host" || "$host" == *:* || ! "$port" =~ ^[0-9]+$ ]]; then
-            log_warning "无法解析 MySQL JDBC 地址: ${line}"
+            log_warning "无法解析 ${config_file} 第${line_no}行的MySQL JDBC地址，请检查文件配置"
+            MYSQL_PARSE_WARNINGS="${MYSQL_PARSE_WARNINGS:+${MYSQL_PARSE_WARNINGS};}${config_file}第${line_no}行JDBC地址损坏"
             invalid=1
             continue
         fi
 
         target="${host}:${port}"
+        valid=1
         known=0
         for target_seen in "${MYSQL_PROBE_TARGETS[@]:-}"; do
             [[ "$target_seen" == "$target" ]] && known=1 && break
         done
         [[ $known -eq 1 ]] || MYSQL_PROBE_TARGETS+=("$target")
-    done <"$APP_CONFIG_FILE"
+    done <"$config_file"
 
     if [[ $found -eq 0 ]]; then
-        MYSQL_PARSE_ERROR="${APP_CONFIG_FILE} 中未找到 jdbc:mysql:// 地址"
-    elif [[ $invalid -ne 0 ]]; then
-        MYSQL_PARSE_ERROR="${APP_CONFIG_FILE} 中存在无法解析的 MySQL JDBC 地址"
-    elif [[ ${#MYSQL_PROBE_TARGETS[@]} -eq 0 ]]; then
-        MYSQL_PARSE_ERROR="${APP_CONFIG_FILE} 中未解析到有效 MySQL 探测目标"
-    fi
-    if [[ -n "$MYSQL_PARSE_ERROR" ]]; then
-        log_warning "$MYSQL_PARSE_ERROR"
+        MYSQL_FILE_PARSE_REASON="${config_file} 中未找到 jdbc:mysql:// 地址"
+        return 1
+    elif [[ $valid -eq 0 || ${#MYSQL_PROBE_TARGETS[@]} -eq 0 ]]; then
+        MYSQL_FILE_PARSE_REASON="${config_file} 中未解析到有效 MySQL 探测目标"
         return 1
     fi
 
-    log_info "解析到 ${#MYSQL_PROBE_TARGETS[@]} 个去重后的 MySQL 探测目标: ${MYSQL_PROBE_TARGETS[*]}"
+    # 同一文件内只要存在有效目标就继续检测；损坏URL已逐行WARN，不得清除有效目标。
+    if [[ $invalid -ne 0 ]]; then
+        log_warning "${config_file} 中部分MySQL JDBC地址损坏，将使用其余有效地址继续检查"
+    fi
     return 0
+}
+
+parse_mysql_targets() {
+    local standard_reason legacy_reason
+    MYSQL_PROBE_TARGETS=()
+    MYSQL_PARSE_ERROR=""
+    MYSQL_PARSE_WARNINGS=""
+    MYSQL_CONFIG_SELECTED=""
+
+    if _parse_mysql_targets_from_file "$APP_CONFIG_FILE"; then
+        MYSQL_CONFIG_SELECTED="$APP_CONFIG_FILE"
+        log_info "从标准配置 ${MYSQL_CONFIG_SELECTED} 解析到 ${#MYSQL_PROBE_TARGETS[@]} 个去重后的MySQL探测目标: ${MYSQL_PROBE_TARGETS[*]}"
+        return 0
+    fi
+    standard_reason="$MYSQL_FILE_PARSE_REASON"
+    log_warning "${standard_reason}，尝试回退历史配置 ${LEGACY_APP_CONFIG_FILE}"
+
+    if _parse_mysql_targets_from_file "$LEGACY_APP_CONFIG_FILE"; then
+        MYSQL_CONFIG_SELECTED="$LEGACY_APP_CONFIG_FILE"
+        log_warning "已回退历史配置 ${MYSQL_CONFIG_SELECTED} 获取MySQL测试目标"
+        log_info "从历史配置解析到 ${#MYSQL_PROBE_TARGETS[@]} 个去重后的MySQL探测目标: ${MYSQL_PROBE_TARGETS[*]}"
+        return 0
+    fi
+    legacy_reason="$MYSQL_FILE_PARSE_REASON"
+    MYSQL_PARSE_ERROR="标准配置解析失败(${standard_reason})；历史配置解析失败(${legacy_reason})；无法解析MySQL地址，请确认后自行测试MySQL地址"
+    log_warning "$MYSQL_PARSE_ERROR"
+    return 1
 }
 
 # ==================== 混合部署: Pod -> 集群内 MySQL TCP 连通性 ====================
@@ -2604,8 +2672,9 @@ reconcile_huawei_te_disk() {
     fi
 
     if has_te_disk_dependents; then
-        log_warning "te-disk 仍被 PVC(${HUAWEI_TE_DISK_PVCS:-无}) 或 PV(${HUAWEI_TE_DISK_PVS:-无}) 使用；保留旧配置，不执行 apply、patch 或 delete"
-        record_result "华为 te-disk GPSSD2 迁移" "WARN" "检测到 PVC: ${HUAWEI_TE_DISK_PVCS:-无}; PV: ${HUAWEI_TE_DISK_PVS:-无}。为保护已绑定存储，保留旧 te-disk"
+        log_success "旧SC仍被业务PVC/PV使用，因此不会更新为GPSSD2；已绑定卷和现有Pod不受影响"
+        log_info "te-disk 依赖明细: PVC=${HUAWEI_TE_DISK_PVCS:-无}; PV=${HUAWEI_TE_DISK_PVS:-无}。保留旧配置，不执行 apply、patch 或 delete"
+        record_result "华为 te-disk GPSSD2 迁移" "PASS" "旧SC仍被业务PVC/PV使用，因此不会更新为GPSSD2；已绑定卷和现有Pod不受影响"
         return 2
     fi
 
@@ -2648,6 +2717,16 @@ ensure_storageclass() {
             return $?
             ;;
         esac
+    fi
+
+    if [[ "$cloud_platform" == *aws* ]]; then
+        if kubectl get sc te-disk &>/dev/null; then
+            log_success "已存在AWS块存储StorageClass: te-disk"
+            return 0
+        fi
+        _aws_mark_storage_repair_needed "缺少te-disk StorageClass"
+        log_error "未发现te-disk；AWS标准检查阶段不自动创建存储资源，将在结果总览后提供存量EKS存储准备入口"
+        return 1
     fi
 
     # 默认SC统一逻辑: 已有 te-disk 则就绪; 否则按现有默认SC命名决定处置:
@@ -2767,32 +2846,6 @@ reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer
 EOF
         ;;
-    *aws*)
-        # AWS需先验证EBS CSI Driver是否已安装
-        local csi_driver_exists=$(kubectl get csidrivers ebs.csi.aws.com 2>/dev/null)
-        if [[ -z "$csi_driver_exists" ]]; then
-            log_warning "未检测到EBS CSI Driver (ebs.csi.aws.com)，请先在EKS控制台安装Amazon EBS CSI Driver插件"
-            log_info "参考文档: https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html"
-            log_info "仍将创建StorageClass定义，但PVC将无法正常绑定直至CSI插件就绪"
-        fi
-        log_info "创建AWS默认StorageClass: te-disk (gp3块存储)"
-        cat <<'EOF' | kubectl apply -f -
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
-  name: te-disk
-parameters:
-  fsType: ext4
-  type: gp3
-provisioner: ebs.csi.aws.com
-reclaimPolicy: Delete
-volumeBindingMode: WaitForFirstConsumer
-allowVolumeExpansion: true
-EOF
-        # te-nfs(EFS文件存储)由 ensure_nfs_storageclass 统一处理(依赖控制台 fileSystemId, 打印模版供手动创建)
-        ;;
     vmware | kvm | qemu | baremetal)
         # 内置K8S(自建, 基于 Longhorn): 统一创建默认StorageClass te-disk(provisioner driver.longhorn.io)
         log_info "创建内置K8S(Longhorn)默认StorageClass: te-disk (driver.longhorn.io, 3副本)"
@@ -2905,6 +2958,87 @@ get_huawei_cce_vpc_id() {
     HUAWEI_CCE_VPC_ID_ERROR="未发现csi-nas或其everest.io/share-access-to为空，且未提供HUAWEI_CCE_VPC_ID"
     return 1
 }
+
+HUAWEI_TE_NFS_REPLACE_CONFIRM_TIMEOUT=30
+HUAWEI_TE_NFS_REFERENCES=""
+
+huawei_te_nfs_list_references() {
+    HUAWEI_TE_NFS_REFERENCES=$(kubectl get pv -o jsonpath='{range .items[?(@.spec.storageClassName=="te-nfs")]}{.metadata.name}{"|"}{.spec.claimRef.namespace}{"/"}{.spec.claimRef.name}{"|"}{.status.phase}{"\n"}{end}' 2>/dev/null)
+    [[ -n "$HUAWEI_TE_NFS_REFERENCES" ]]
+}
+
+read_huawei_te_nfs_replacement_confirmation() {
+    local answer=""
+    if [[ ! -t 0 ]]; then
+        log_warning "当前为非交互式运行，无法确认替换 te-nfs，保留旧StorageClass"
+        return 1
+    fi
+    printf '\n%s\n' "================ 华为CCE te-nfs 安全替换确认 ================"
+    printf '%s\n' "检测到现有 te-nfs 不符合 CCE 文件存储规范，但已有业务PV/PVC引用。"
+    printf '%s\n' "将执行：仅删除 StorageClass/te-nfs，再创建同名标准 CCE te-nfs。"
+    printf '%s\n' "绝不执行：删除、修改或重建任何 PV、PVC、Pod。"
+    printf '%s\n' "如未确认，请直接回车或输入任意非 yes 内容，30 秒后也会安全取消。"
+    printf '%s' "请输入完整 yes 以继续替换: "
+    if ! read -r -t "$HUAWEI_TE_NFS_REPLACE_CONFIRM_TIMEOUT" answer; then
+        log_warning "等待 te-nfs 替换确认超时，保留旧StorageClass"
+        return 1
+    fi
+    [[ "$answer" == yes ]] || {
+        log_info "未收到完整 yes，保留旧StorageClass"
+        return 1
+    }
+    return 0
+}
+
+huawei_te_nfs_replace_after_confirmation() {
+    local backup provisioner configured_vpc
+    if ! read_huawei_te_nfs_replacement_confirmation; then
+        return 1
+    fi
+
+    _ensure_artifact_dir
+    backup="${ARTIFACT_DIR}/huawei_te_nfs_before_replacement.yaml"
+    if ! kubectl get sc te-nfs -o yaml >"$backup"; then
+        log_error "无法备份旧 te-nfs，取消替换"
+        return 1
+    fi
+    if ! kubectl delete sc te-nfs; then
+        log_error "删除旧 te-nfs 失败；未修改PV/PVC/Pod，旧SC备份保留在 ${backup}"
+        return 1
+    fi
+    if ! cat <<EOF_HUAWEI_NFS | kubectl apply -f -
+allowVolumeExpansion: true
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: te-nfs
+parameters:
+  csi.storage.k8s.io/csi-driver-name: nas.csi.everest.io
+  csi.storage.k8s.io/fstype: nfs
+  everest.io/sfs-version: sfs3.0
+  everest.io/share-access-level: rw
+  everest.io/share-access-to: ${HUAWEI_CCE_VPC_ID_RESOLVED}
+  everest.io/share-is-public: "false"
+provisioner: everest-csi-provisioner
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+EOF_HUAWEI_NFS
+    then
+        capture_huawei_csi_nas_diagnostics error
+        log_error "创建标准 te-nfs 失败；未修改PV/PVC/Pod。请使用 ${backup} 手动恢复旧StorageClass"
+        return 1
+    fi
+    provisioner=$(kubectl get sc te-nfs -o jsonpath='{.provisioner}' 2>/dev/null)
+    configured_vpc=$(kubectl get sc te-nfs -o jsonpath='{.parameters.everest\.io/share-access-to}' 2>/dev/null)
+    if [[ "$provisioner" != everest-csi-provisioner || "$configured_vpc" != "$HUAWEI_CCE_VPC_ID_RESOLVED" ]]; then
+        capture_huawei_csi_nas_diagnostics error
+        log_error "重建后的 te-nfs 校验失败(provisioner=${provisioner:-空}, VPC=${configured_vpc:-空})；未修改PV/PVC/Pod。请使用 ${backup} 手动恢复旧StorageClass"
+        return 1
+    fi
+    log_success "已按确认替换为标准 CCE te-nfs；本次仅删除并创建StorageClass，未触碰PV/PVC/Pod"
+    return 0
+}
+
 get_gce_primary_network() {
     local metadata_url='http://metadata.google.internal/computeMetadata/v1'
     local network_resource network_name
@@ -2941,17 +3075,38 @@ ensure_nfs_storageclass() {
 
     if kubectl get sc te-nfs &>/dev/null; then
         if [[ "$cloud_platform" == *huawei* ]]; then
-            local configured_vpc
+            local configured_vpc configured_provisioner mismatch_reason
             configured_vpc=$(kubectl get sc te-nfs -o jsonpath='{.parameters.everest\.io/share-access-to}' 2>/dev/null)
+            configured_provisioner=$(kubectl get sc te-nfs -o jsonpath='{.provisioner}' 2>/dev/null)
+            mismatch_reason=""
+            [[ "$configured_provisioner" == everest-csi-provisioner ]] || mismatch_reason="provisioner=${configured_provisioner:-空}，预期everest-csi-provisioner"
             if [[ "$configured_vpc" != "$HUAWEI_CCE_VPC_ID_RESOLVED" ]]; then
-                log_error "te-nfs share-access-to与内置csi-nas VPC ID不一致(配置=${configured_vpc:-空})，跳过RWX挂载测试"
-                record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "te-nfs VPC授权与解析出的VPC ID不匹配，跳过RWX测试"
+                mismatch_reason="${mismatch_reason:+${mismatch_reason}; }share-access-to=${configured_vpc:-空}，预期${HUAWEI_CCE_VPC_ID_RESOLVED}"
+            fi
+            if [[ -n "$mismatch_reason" ]]; then
+                huawei_te_nfs_list_references || true
+                log_error "te-nfs 不符合华为CCE文件存储规范(${mismatch_reason})"
+                if [[ -n "$HUAWEI_TE_NFS_REFERENCES" ]]; then
+                    log_warning "te-nfs 当前PV引用(PV|PVC|状态): ${HUAWEI_TE_NFS_REFERENCES}"
+                fi
+                log_warning "管理员确认后可仅删除旧StorageClass/te-nfs并创建同名标准SC；不会删除、修改或重建PV/PVC/Pod"
+                if huawei_te_nfs_replace_after_confirmation; then
+                    return 0
+                fi
+                record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "te-nfs 不符合CCE文件存储规范；未获完整yes确认或替换失败，已保留PV/PVC/Pod"
                 return 1
             fi
             log_success "te-nfs VPC授权校验通过(csi-nas)"
         fi
         log_success "已存在网络存储StorageClass: te-nfs，无需创建"
         return 0
+    fi
+
+    if [[ "$cloud_platform" == *aws* ]]; then
+        _aws_mark_storage_repair_needed "缺少te-nfs StorageClass"
+        log_error "未发现te-nfs；AWS标准检查阶段不自动创建EFS，将在结果总览后提供storage_ready_for_existing_eks.sh入口"
+        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现te-nfs；总览后可选择执行AWS存储准备脚本"
+        return 1
     fi
 
     case $cloud_platform in
@@ -3045,26 +3200,6 @@ provisioner: everest-csi-provisioner
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
 EOF_HUAWEI_NFS
-        ;;
-    *aws*)
-        # AWS EFS: 依赖控制台返回的 fileSystemId, 无法自动获取, 打印模版供手动填充创建。
-        log_error "未发现 te-nfs：AWS EKS 的 te-nfs(EFS)依赖控制台返回的文件系统ID(fileSystemId)，无法自动创建。请在EFS控制台创建文件系统并获取 fileSystemId(形如 fs-00ca782a22033a2xx)后，填充下方模版并手动 kubectl apply:"
-        cat <<'EOF' | tee -a "$LOG_FILE"
----------------- AWS EKS te-nfs.yaml (请替换 fileSystemId 后手动创建) ----------------
-kind: StorageClass
-apiVersion: storage.k8s.io/v1
-metadata:
-  name: te-nfs
-provisioner: efs.csi.aws.com
-parameters:
-  provisioningMode: efs-ap
-  fileSystemId: fs-00ca782a22033a2xx   # ← 替换为EFS控制台返回的实际文件系统ID
-  directoryPerms: "700"
-reclaimPolicy: Retain
------------------------------------------------------------------------------------
-EOF
-        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现 te-nfs，AWS EFS 依赖控制台 fileSystemId，请填充模版后手动创建并重试"
-        return 1
         ;;
     *google*)
         local gce_network
@@ -3701,31 +3836,188 @@ check_tencent_cloud_features() {
     fi
 }
 
-check_aws_cloud_features() {
-    log_info "当前云平台：AWS(EKS) 开始执行特性检查"
+_aws_mark_storage_repair_needed() {
+    local reason="$1"
+    AWS_STORAGE_REPAIR_NEEDED=true
+    case ";${AWS_STORAGE_REPAIR_REASONS};" in
+    *";${reason};"*) ;;
+    *) AWS_STORAGE_REPAIR_REASONS="${AWS_STORAGE_REPAIR_REASONS:+${AWS_STORAGE_REPAIR_REASONS};}${reason}" ;;
+    esac
+}
 
-    local script_path="/tmp/thinkingai/auto_build_nodepool.sh"
-    local script_url="https://download-thinkingdata.oss-cn-shanghai.aliyuncs.com/ta/tools/auto_build_nodepool.sh"
+_aws_interactive_tty_available() {
+    [[ -t 0 && -r /dev/tty ]]
+}
 
-    mkdir -p /tmp/thinkingai
-    if ! wget -O "${script_path}" "${script_url}"; then
-        log_error "auto_build_nodepool.sh 下载失败，请检查网络或手动下载: ${script_url}"
+_aws_confirm_short_yes() {
+    local prompt="$1" confirmation=""
+    _aws_interactive_tty_available || return 1
+    printf "%b" "${YELLOW}${BOLD}${prompt}${NC}" >/dev/tty
+    read -r -t "$AWS_SPECIAL_ACTION_TIMEOUT" confirmation </dev/tty || confirmation=""
+    [[ "$confirmation" == "Y" || "$confirmation" == "y" ]]
+}
+
+_aws_confirm_full_yes() {
+    local prompt="$1" confirmation=""
+    _aws_interactive_tty_available || return 1
+    printf "%b" "${YELLOW}${BOLD}${prompt}${NC}" >/dev/tty
+    read -r confirmation </dev/tty || confirmation=""
+    [[ "$confirmation" == "yes" ]]
+}
+
+_download_and_run_aws_tool() {
+    local script_name="$1" script_path script_url rc
+    case "$script_name" in
+    auto_build_nodepool.sh | storage_ready_for_existing_eks.sh) ;;
+    *)
+        log_error "拒绝执行未授权的AWS工具: ${script_name}"
+        return 1
+        ;;
+    esac
+
+    script_path="/tmp/thinkingai/${script_name}"
+    script_url="${AWS_TOOL_BASE_URL}/${script_name}"
+    mkdir -p /tmp/thinkingai || {
+        log_error "无法创建AWS工具临时目录: /tmp/thinkingai"
+        return 1
+    }
+    if ! wget -q -O "$script_path" "$script_url"; then
+        log_error "${script_name} 下载失败；可手动下载并执行: wget -O ${script_path} ${script_url} && bash ${script_path}"
         return 1
     fi
-    if [[ ! -s "${script_path}" ]]; then
-        log_error "auto_build_nodepool.sh 下载内容为空，请检查下载地址: ${script_url}"
+    if [[ ! -s "$script_path" ]]; then
+        log_error "${script_name} 下载内容为空，拒绝执行: ${script_url}"
         return 1
     fi
-    log_info "auto_build_nodepool.sh 下载成功，开始执行"
-
-    sh "${script_path}"
-    local rc=$?
+    if ! bash -n "$script_path"; then
+        log_error "${script_name} Bash语法检查失败，拒绝执行: ${script_path}"
+        return 1
+    fi
+    log_info "${script_name} 已下载并通过Bash语法检查，开始执行"
+    bash "$script_path"
+    rc=$?
     if [[ $rc -ne 0 ]]; then
-        log_error "auto_build_nodepool.sh 执行失败 (退出码: ${rc})，请查看上述输出排查"
+        log_error "${script_name} 执行失败(退出码:${rc})；请检查上述输出，或手动执行: bash ${script_path}"
+        return "$rc"
+    fi
+    log_success "${script_name} 执行完成"
+    return 0
+}
+
+check_aws_nodepool_gate() {
+    local crd_output nodepools_output
+
+    if ! crd_output=$(kubectl get crd nodepools.karpenter.sh -o name 2>&1); then
+        if [[ "$crd_output" == *"NotFound"* || "$crd_output" == *"not found"* ]]; then
+            log_error "未发现Karpenter NodePool CRD(nodepools.karpenter.sh)，当前EKS尚不具备标准节点组能力；请先确认Karpenter安装状态"
+            record_result "AWS EKS NodePool前置检查" "FAIL" "缺少nodepools.karpenter.sh CRD，不进入节点组创建脚本"
+        else
+            log_error "无法查询Karpenter NodePool CRD，不能将权限或连接错误误判为无节点组: ${crd_output}"
+            record_result "AWS EKS NodePool前置检查" "FAIL" "CRD查询失败，请检查kubeconfig及RBAC get crd权限"
+        fi
         return 1
     fi
-    log_success "auto_build_nodepool.sh 执行完成"
-    return 0
+
+    if ! nodepools_output=$(kubectl get nodepools.karpenter.sh -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>&1); then
+        log_error "NodePool资源查询失败，不能误判为零对象: ${nodepools_output}"
+        record_result "AWS EKS NodePool前置检查" "FAIL" "NodePool查询失败，请检查RBAC get nodepools权限"
+        return 1
+    fi
+    if [[ -n "$nodepools_output" ]]; then
+        log_success "检测到Karpenter NodePool资源: $(echo "$nodepools_output" | tr '\n' ' ')"
+        record_result "AWS EKS NodePool前置检查" "PASS" "已存在NodePool，继续标准可用性检查"
+        return 0
+    fi
+
+    log_error "未检测到标准的EKS节点组(NodePool资源对象为空)"
+    if ! _aws_interactive_tty_available; then
+        log_warning "当前为非交互式运行，未获得高权限节点组创建授权"
+    fi
+    if ! _aws_confirm_short_yes "是否下载执行 auto_build_nodepool.sh 创建节点组？输入 Y/y 确认（${AWS_SPECIAL_ACTION_TIMEOUT}秒后取消）: "; then
+        record_result "AWS EKS NodePool前置检查" "FAIL" "NodePool为空且未授权执行auto_build_nodepool.sh；本轮停止"
+        log_info "人工执行入口: wget -O /tmp/thinkingai/auto_build_nodepool.sh ${AWS_TOOL_BASE_URL}/auto_build_nodepool.sh && bash /tmp/thinkingai/auto_build_nodepool.sh"
+        return 1
+    fi
+    if _download_and_run_aws_tool "auto_build_nodepool.sh"; then
+        record_result "AWS EKS NodePool创建入口" "PASS" "auto_build_nodepool.sh执行完成；需重新运行可用性检查"
+        return 10
+    fi
+    record_result "AWS EKS NodePool创建入口" "FAIL" "auto_build_nodepool.sh执行失败；本轮停止"
+    return 1
+}
+
+check_aws_consolidation_policy() {
+    local lines name policy display
+    AWS_CONSOLIDATION_CANDIDATES=""
+    if ! lines=$(kubectl get nodepools.karpenter.sh -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.disruption.consolidationPolicy}{"\n"}{end}' 2>&1); then
+        log_error "无法审计NodePool consolidationPolicy: ${lines}"
+        record_result "AWS NodePool驱逐策略检查" "FAIL" "NodePool策略查询失败"
+        return 1
+    fi
+    while IFS=$'\t' read -r name policy; do
+        [[ -n "$name" ]] || continue
+        display="${policy:-<unset>}"
+        log_info "NodePool ${name} consolidationPolicy=${display}"
+        if [[ "$policy" == "WhenEmptyOrUnderutilized" ]]; then
+            AWS_CONSOLIDATION_CANDIDATES="${AWS_CONSOLIDATION_CANDIDATES:+${AWS_CONSOLIDATION_CANDIDATES} }${name}"
+        fi
+    done <<<"$lines"
+    if [[ -n "$AWS_CONSOLIDATION_CANDIDATES" ]]; then
+        log_warning "发现可能驱逐在用Pod的NodePool策略，候选: ${AWS_CONSOLIDATION_CANDIDATES}"
+        record_result "AWS NodePool驱逐策略检查" "WARN" "WhenEmptyOrUnderutilized候选:${AWS_CONSOLIDATION_CANDIDATES}"
+    else
+        record_result "AWS NodePool驱逐策略检查" "PASS" "未发现WhenEmptyOrUnderutilized策略"
+    fi
+}
+
+check_aws_cloud_features() {
+    log_info "当前云平台：AWS(EKS)，执行只读特性检查"
+    kubectl get csidriver ebs.csi.aws.com >/dev/null 2>&1 || _aws_mark_storage_repair_needed "缺少EBS CSI Driver"
+    kubectl get csidriver efs.csi.aws.com >/dev/null 2>&1 || _aws_mark_storage_repair_needed "缺少EFS CSI Driver"
+    check_aws_consolidation_policy || true
+}
+
+run_aws_postcheck_actions() {
+    local name current actual failed=0
+    if $AWS_STORAGE_REPAIR_NEEDED; then
+        log_warning "AWS存储未就绪: ${AWS_STORAGE_REPAIR_REASONS}"
+        if _aws_confirm_short_yes "是否下载执行 storage_ready_for_existing_eks.sh？输入 Y/y 确认（${AWS_SPECIAL_ACTION_TIMEOUT}秒后跳过）: "; then
+            _download_and_run_aws_tool "storage_ready_for_existing_eks.sh" || true
+            log_info "AWS存储处理后请重新运行本检查脚本，以端到端PVC/Pod验证为准"
+        else
+            log_info "已跳过AWS存储修复。人工入口: wget -O /tmp/thinkingai/storage_ready_for_existing_eks.sh ${AWS_TOOL_BASE_URL}/storage_ready_for_existing_eks.sh && bash /tmp/thinkingai/storage_ready_for_existing_eks.sh"
+        fi
+    fi
+
+    [[ -n "$AWS_CONSOLIDATION_CANDIDATES" ]] || return 0
+    if ! _aws_confirm_full_yes "是否将以上NodePool的consolidationPolicy改为WhenEmpty？完整输入 yes 确认: "; then
+        log_info "未输入完整yes，NodePool驱逐策略保持不变"
+        return 0
+    fi
+    for name in $AWS_CONSOLIDATION_CANDIDATES; do
+        current=$(kubectl get nodepools.karpenter.sh "$name" -o jsonpath='{.spec.disruption.consolidationPolicy}' 2>/dev/null) || {
+            log_error "NodePool ${name} 修复前重读失败，已跳过"
+            ((failed += 1))
+            continue
+        }
+        if [[ "$current" != "WhenEmptyOrUnderutilized" ]]; then
+            log_warning "NodePool ${name} 当前策略已变为${current:-<unset>}，不再是候选，已跳过"
+            continue
+        fi
+        if ! kubectl patch nodepools.karpenter.sh "$name" --type=merge -p '{"spec":{"disruption":{"consolidationPolicy":"WhenEmpty"}}}'; then
+            log_error "NodePool ${name} consolidationPolicy patch失败"
+            ((failed += 1))
+            continue
+        fi
+        actual=$(kubectl get nodepools.karpenter.sh "$name" -o jsonpath='{.spec.disruption.consolidationPolicy}' 2>/dev/null) || actual=""
+        if [[ "$actual" == "WhenEmpty" ]]; then
+            log_success "NodePool ${name}: WhenEmptyOrUnderutilized -> WhenEmpty"
+        else
+            log_error "NodePool ${name} 修改后读回值异常: ${actual:-<unset>}"
+            ((failed += 1))
+        fi
+    done
+    [[ $failed -eq 0 ]]
 }
 # ==================== 主执行流程 ====================
 main() {
@@ -3776,6 +4068,22 @@ main() {
 
     cloud_platform=$(detect_cloud_platform)
     record_result "K8S所属环境检查" "PASS" "识别到环境: ${cloud_platform}"
+
+    if [[ "$cloud_platform" == *aws* ]]; then
+        check_aws_nodepool_gate
+        local aws_gate_rc=$?
+        if [[ $aws_gate_rc -ne 0 ]]; then
+            print_summary
+            if [[ $aws_gate_rc -eq 10 ]]; then
+                log_info "EKS节点组创建流程已完成，请重新运行本脚本执行完整标准可用性检查"
+            else
+                log_error "AWS EKS NodePool前置检查未通过，本轮停止，避免继续执行无效探测"
+            fi
+            SCRIPT_COMPLETED=true
+            return 0
+        fi
+    fi
+
     select_nodepool_business_plan "$cloud_platform"
 
     # 内置K8S(自建, 节点名含 te-k8s): 自动为节点补打 billing-mode=reserved, 统一各平台语义。
@@ -3790,9 +4098,9 @@ main() {
         record_result "块存储StorageClass就绪检查" "PASS" "默认StorageClass(te-disk)就绪"
     elif [[ $storageclass_rc -eq 2 ]]; then
         if [[ "$cloud_platform" == *huawei* && (-n "$HUAWEI_TE_DISK_PVCS" || -n "$HUAWEI_TE_DISK_PVS") ]]; then
-            record_result "块存储StorageClass就绪检查" "WARN" "发现被PVC/PV依赖的历史te-disk，保留现有盘型以兼容存量应用"
+            record_result "块存储StorageClass就绪检查" "PASS" "旧SC仍被业务PVC/PV使用，因此不会更新为GPSSD2；已绑定卷和现有Pod不受影响"
         else
-            record_result "块存储StorageClass就绪检查" "WARN" "为保护现有华为 te-disk，未自动修改StorageClass"
+            record_result "块存储StorageClass就绪检查" "PASS" "旧SC仍被业务PVC/PV使用，因此不会更新为GPSSD2；已绑定卷和现有Pod不受影响"
         fi
     else
         record_result "块存储StorageClass就绪检查" "FAIL" "默认StorageClass未就绪，请确认CSI插件与手动配置指引"
@@ -3809,17 +4117,10 @@ main() {
         # FAIL 已由 ensure_nfs_storageclass 内部按平台登记, 此处不重复登记
     fi
 
-    # 平台专属附加项(CSI 之外): 腾讯 imc-operator、AWS auto_build_nodepool。其余平台无附加项。
+    # 平台专属附加项: 腾讯 imc-operator；AWS仅执行只读CSI与NodePool策略审计。
     case $cloud_platform in
     *tencent*) check_tencent_cloud_features ;;
-    *aws*)
-        check_aws_cloud_features
-        log_info "AWS EKS环境经由特殊流程(auto_build_nodepool.sh)处理，不再进行其他检测"
-        record_result "AWS EKS特殊流程(auto_build_nodepool)" "PASS" "已执行auto_build_nodepool.sh"
-        finalize_availability_check
-        SCRIPT_COMPLETED=true
-        return 0
-        ;;
+    *aws*) check_aws_cloud_features ;;
     esac
 
     # Pod部署启动检查: 按平台节点池映射并发探测各池可调度性(弹性池触发 autoscaler 0->1)。
@@ -3846,6 +4147,7 @@ main() {
         record_result "端到端存储验证(块存储 te-disk, RWO)" "FAIL" "镜像拉取失败，存储端到端未完成验证；请先检查节点到镜像仓库的网络、DNS、认证或镜像缓存"
     else
         record_result "端到端存储验证(块存储 te-disk, RWO)" "FAIL" "te-disk 缺失或RWO PVC未Bound、挂载或读写失败，请排查块存储CSI"
+        [[ "$cloud_platform" == *aws* ]] && _aws_mark_storage_repair_needed "te-disk端到端验证失败"
     fi
 
     # 文件存储 te-nfs: RWX 基础读写 + 条件性的跨节点共享读写验证。
@@ -3874,6 +4176,7 @@ main() {
             else
                 record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "FAIL" "RWX PVC未Bound、挂载或单Pod读写失败，请排查文件存储CSI${nfs_hint:+(${nfs_hint})}"
                 record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "SKIP" "RWX基础验证未通过，跳过跨节点共享验证"
+                [[ "$cloud_platform" == *aws* ]] && _aws_mark_storage_repair_needed "te-nfs端到端验证失败"
             fi
         fi
     else
@@ -3882,6 +4185,7 @@ main() {
     fi
 
     finalize_availability_check
+    [[ "$cloud_platform" == *aws* ]] && run_aws_postcheck_actions
 
     log_info "K8S可用性检查结束  $(date '+%Y-%m-%d %H:%M:%S')"
     log_info "如有异常信息提示请跟进确认处理！完整日志已保存至: $LOG_FILE"

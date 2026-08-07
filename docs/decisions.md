@@ -1,7 +1,79 @@
 # 决策记录
 
+## 2026-08-07：Serverless模式采用虚拟节点强指纹与逐调度域验证
+
+- 模式：腾讯虚拟节点以`instance-type=eklet`或`eks.tke.cloud.tencent.com/`前缀识别；阿里虚拟节点必须同时满足`type=virtual-kubelet`和阿里专属label/annotation。虚拟节点与标准节点计数决定纯Serverless、混合或标准模式；证据冲突、无Node或标准节点云归属未达到双重证据时FAIL停止。
+- 调度域：腾讯使用Node名、subnet和AZ；阿里使用Node名和AZ。InternalIP、虚拟CPU/内存/Pod容量和Virtual Kubelet Lease不进入容量或健康结论。
+- 验证：每个调度域以hostname selector固定CPU Probe和存储Pod；腾讯只容忍EKlet污点，阿里仅在现场存在对应Virtual Kubelet污点时容忍。每域独立验证RWO/RWX；两个健康域才验证RWX Writer/Reader共享。
+- 不选：不把无虚拟节点的集群默认为某个云平台Serverless，也不让Serverless脚本运行标准节点池、NodePort、宿主机网络或autoscaler检查。
+
+## 2026-08-07：Serverless临时资源使用短哈希RFC1123标识
+
+- 现场证据：腾讯EKlet节点名与`2026-08-07_170649`格式时间戳被直接用于Deployment、Service、PVC、Pod和label时，分别触发长度上限和下划线非法；生成存储YAML的未转义`$(cat /data/ready)`还在脚本宿主机执行，导致容器命令失真。
+- 决策：以`sl-<探测类型>-<范围哈希>-<运行后缀>`生成对象名和label值，不嵌入节点全名；运行后缀只含数字与连字符。生成YAML时保留字面量`$(cat /data/ready)`，交由容器shell执行。腾讯AZ展示优先取业务可读的`eks.tke.cloud.tencent.com/zone-name`，缺失时再退回通用topology zone。
+- 不选：不只把下划线替换为连字符或简单截断节点名；前者仍会超过63字符，后者既可能碰撞又无法保证随后附加`-pod`、`-writer`、`-reader`仍合法。
+
+## 2026-08-07：Serverless单调度域也必须验证RWX多Pod共享
+
+- 现场证据：单EKlet Serverless集群已验证单Pod可供给、挂载并读写`te-nfs`，但跨调度域检查只能SKIP；这不能证明两个独立Pod对同一RWX PVC的数据可见性。
+- 决策：每个健康Serverless调度域均执行同域Writer/Reader双Pod共享测试，Writer写入标记后Reader读取；它验证RWX多Pod共享，但不将其称为跨节点/跨子网验证。仅在至少两个健康调度域存在时执行跨域RWX测试。
+- 网络结论：NodePort不属于Serverless检查范围；ClusterIP仍是应验证的数据面。失败时必须保存HTTP客户端输出和Kubernetes对象证据；如果镜像没有wget/curl，记录WARN而不是将探针工具缺失误判为网络FAIL。
+
+## 2026-08-07：华为 CCE 存量 StorageClass 采用受保护通过与显式确认替换
+
+- `te-disk`：当旧SC仍被业务PVC/PV引用时，GPSSD2升级不是失败，也不是需要用户处理的“关注项”。脚本不执行apply、patch或delete，并在总览记为通过：旧SC被业务存储使用，因此不会更新GPSSD2；已绑定卷和现有Pod不受本次检查影响。
+- `te-nfs`：当provisioner不是`everest-csi-provisioner`或`everest.io/share-access-to`不同于可信CCE VPC ID时，脚本打印PV/PVC引用。仅交互式完整输入`yes`才删除并创建`StorageClass/te-nfs`；拒绝、超时、空输入及非TTY均保留旧SC并报FAIL。
+- 资源边界：替换流程仅允许读取PV/PVC/Pod，绝不delete、patch、apply或重建它们。删除SC后创建/回读失败时，保留替换前YAML，保存csi-nas诊断，并输出手动恢复指引。
+- 不选：不自动创建`te-nfs-cce`作为默认方案。该名称会让后续业务模板继续引用旧`te-nfs`，无法修复同名契约；用户已确认在明确人工确认后复用标准同名SC。
+
+### 2026-08-07 现场回灌验证
+
+- 现场日志`k8sAvailCheckResult_2026-08-07_114749.log`确认：检测到旧`te-nfs`的`provisioner=nfs-provisioner`且`share-access-to`为空后，管理员确认替换成功；脚本明确记录本次仅删除/创建StorageClass，未触碰PV/PVC/Pod。
+- 验证边界：临时RWX PVC被`everest-csi-provisioner`成功Provision并进入`Bound`，证明新SC、CSI动态供给及脚本回读路径有效。后续Pod已Scheduled但持续`FailedMount`，kubelet执行到SFS域名的`mount -t nfs`后被终止；这不是PVC未供给或脚本把旧SC误判为就绪。
+- 根因归属：现场已确认CCE缺少VPCEP。CCE到SFS的网络访问前置条件未满足时，SFS NFS挂载无法完成；修复VPCEP后应重跑RWX基础及跨节点共享验证，不应回滚新的标准`te-nfs`。
+
+## 2026-08-06：hosts别名逐条RFC1123隔离，节点组交互等待300秒
+
+- 决定：节点组业务规划菜单和选择5后的自定义输入统一等待300秒；超时仍WARN并回退云厂商默认规划。
+- 规范化：DNS名称大小写不敏感且Kubernetes hostAliases只接受小写，因此合法大写名称先完整转小写，再参与去重和跨IP冲突判断。
+- 非法处理：下划线、连续点、非法首尾字符、单段超过63或总长超过253等不能可靠转换的名称，整条别名WARN并丢弃；不通过删除非法字符来猜测管理员原意。同一hosts行的其他合法别名继续保留。
+- 安全目标：进入Deployment YAML的每个名称都必须先通过RFC1123 subdomain校验，任何单条非法`/etc/hosts`记录不得导致探测Deployment整体apply失败。
+
+## 2026-08-06：MySQL探测采用标准配置优先、历史配置兜底
+
+- 决定：优先解析`/data/home/ta/base_server_ta/application.yml`；仅当文件不可读或没有任何有效MySQL目标时，回退`/data/home/ta/data_etl_ta/application.yml`。不合并两个文件的目标，避免把历史废弃地址带入当前检查。
+- 容错：同一配置内有效和损坏JDBC URL并存时，继续使用全部有效`host:port`并去重，损坏项以文件路径和行号WARN；标准配置已有有效目标时绝不回退历史配置。
+- 失败：两个文件均无有效目标时记录FAIL，同时打印两个路径并提示管理员自行测试MySQL地址。
+- 安全：解析和日志只处理主机、端口及损坏行号，不读取或输出MySQL用户名、密码，也不把可能包含敏感查询参数的完整JDBC行写入警告。
+
+## 2026-08-05：物理机 K8S 与客户主机防火墙采用职责分离的规则维护方式
+
+- 现场证据：garena-新内置 K8S 的 `FORWARD` 链依次为 `KUBE-PROXY-FIREWALL`、`KUBE-FORWARD`、客户无条件 `DROP`、`FLANNEL-FWD`；后者计数为 0。客户的周期性规则刷新会重新引入或改变该顺序，因此即便 kube-proxy/Flannel 曾正确写入规则，也会被后续刷新破坏。
+- 决定：客户策略任务不得 `iptables-restore` 整套过滤表、清空链或把终止 `DROP` 插入 Kubernetes/Flannel 链之前。客户规则应放入独立链（例如 `CUSTOM-FIREWALL`），由 INPUT/OUTPUT/FORWARD 的稳定跳转点调用；对 FORWARD，Kubernetes 与 CNI 所需的放行链必须先执行，客户的默认拒绝只能位于其后。规则刷新和 K8S/CNI 更新后均以规则顺序、计数和 Pod->Service 连通性读回验收。
+- 诊断边界：ingress-nginx 调用 `https://10.96.0.1:443` 的 `connect: connection refused` 表明 Service VIP 到 API Server 后端路径仍需要独立验证（IPVS 虚拟服务、后端、EndpointSlice、API Server 监听）。不将其直接等同于 FORWARD DROP；该 DROP 已足以解释跨节点 Pod 转发异常和 Flannel 链零命中。
+- 不选：不建议用一次性 `iptables -I` 或仅重启 kube-proxy 作为最终方案。客户周期任务会再次覆盖顺序，且 kube-proxy 只能定期修复其自身规则，无法约束客户脚本持续插入的终止规则。
+
+### 2026-08-05 现场确认补充
+
+- API Server 已由现场确认正常，因此 ingress 对 `10.96.0.1:443` 的失败不再作为控制面异常处理；根因收敛为客户直连 `FORWARD` 的无条件 DROP 截断 Kubernetes/Flannel 的 Pod 转发。
+- 当前恢复（管理员不允许改动 DROP）：核对目标 DROP 的行号后，使用 `iptables -I FORWARD <DROP行号> -j FLANNEL-FWD` 在其前插入一条 Flannel 跳转；不删除、不替换、不移动管理员 DROP，也不删除其后的旧 Flannel 跳转。该重复 jump 安全且使 Pod 流量先进入 `FLANNEL-FWD`。
+- 长期：每次策略刷新或 Flannel 生命周期事件后，检查 `FLANNEL-FWD` 是否仍在第一个客户直连 DROP 前；若没有则重插。客户若使用整表 `iptables-restore`，本侧插入会被重置，必须由客户维护任务改为仅维护其专用链或在其刷新末尾调用本校正动作。Kubernetes 的 kube-proxy 与 Flannel 都可能在生命周期事件中维护或追加规则，因此“首次部署时 DROP 在最后”不是永久保证。
+- Kruise 暂停边界：暂停 `kruise-daemon` 不会删除其 `ValidatingWebhookConfiguration`。若 webhook `vpod.kb.io` 的 Service 已无 endpoints 且 failurePolicy 为 Fail，Pod 删除同样会被 API Server Admission 拒绝。优先临时将该单个 webhook 改为 `Ignore`，完成修复后恢复原 failurePolicy；不采用 `kubectl delete pod --force`，因为它不是对 Admission 配置问题的可靠修复。
+- Agent Sandbox CrashLoop 诊断边界：当 `kubectl describe pod` 显示 `Liveness probe failed: ... :8080/health: connect: connection refused` 且随后有 `Container ... failed liveness probe, will be restarted`，应用日志中的 npm `SIGTERM` 是 kubelet 重启动作的结果，不是 Node 进程主动崩溃的根因。ACK 现场进一步确认 `node dist/main` 监听 `*:80`，且 `te-agent-sandbox` ConfigMap 为 `app.port: 80`；因此根因是生成 Pod 的探针端口 8080 与应用端口 80 不一致，修复目标是 Sandbox 控制器/模板的 liveness/readiness port=80，而非修改 Node 进程或放宽探针。即使 Pod 有 Kruise SidecarSet 注入注解，也要以 `Controlled By` 与 Events 判定触发方；本例 Owner 为 `Sandbox` CR，promtail sidecar 正常。
+- Kubete Controller Manager CrashLoop 取证边界：Exit Code 1 且容器已成功监听健康端口、Event 没有 kubelet `Killing`/OOM/驱逐信号时，不能把 CrashLoop 归因为 probe。先用 `kubectl logs --previous --timestamps` 获取进程退出前的完整错误。本例已确认 `metricscollection-controller` 连接 MySQL `192.168.0.16:3306` 超时，导致 controller context 构建失败、进程退出；修复目标是该 Pod 到 MySQL 的 TCP 网络路径，不是健康检查。需从同一节点比较宿主机与 Pod 连接，并用 tcpdump 区分 MySQL/网络 ACL、SNAT 与 FORWARD 规则截断。
+
+## 2026-08-04：AWS EKS回归标准检查，特殊动作只按真实问题暴露
+
+- 版本边界：通用检查继续要求kubectl 1.34，作为当前多云共同支持基线。EKS新建物料面向Kubernetes 1.36不等于抬高通用检查版本；待所有目标云平台均发布并支持1.36后再统一调整。
+- 决定：AWS识别后先用精确资源名检查`nodepools.karpenter.sh` CRD和NodePool对象。已有对象继续完整通用检查；零对象时立即询问是否执行`auto_build_nodepool.sh`，成功后结束本轮并要求重跑；CRD缺失或查询Forbidden不进入创建脚本。
+- 权限边界：通用检查脚本不创建EKS。kubeconfig缺失或连接失败时只提示确认`build_eks_v1.36.sh`建集群、AWS授权及`aws eks update-kubeconfig`，不自动获取Admin Full Access。
+- 存储边界：AWS缺少StorageClass、CSI或端到端验证失败时先记录真实FAIL，总览后才询问是否执行`storage_ready_for_existing_eks.sh`；拒绝、超时或非TTY不执行高权限动作。
+- consolidation：撤销“独立脚本长期维护”的旧决定，将只读审计和经完整`yes`确认的窄patch/读回逻辑合并到通用检查；删除`01eks_build/set_nodepool_consolidation_policy.sh`，避免两个入口漂移。
+- 安全：仅白名单允许`auto_build_nodepool.sh`和`storage_ready_for_existing_eks.sh`，下载后必须非空且通过`bash -n`，始终用Bash执行并保留真实退出码。
+
 ## 2026-08-03：Karpenter consolidation policy 使用独立、字段级治理脚本
 
+- 状态：已被2026-08-04决策取代；字段级安全机制保留，但维护入口迁入通用检查脚本。
 - 决定：新增独立脚本 `aws eks k8s/v1.35 eks v1.11 karpenter/set_nodepool_consolidation_policy.sh`，不并入 `auto_build_nodepool.sh`。它仅对实时 `spec.disruption.consolidationPolicy` 精确等于 `WhenEmptyOrUnderutilized` 的 NodePool，在操作者输入完整 `yes` 后执行 merge patch 为 `WhenEmpty`，并逐对象回读确认。
 - 原因：该项是线上存量配置风险治理，不属于创建节点池流程；整份 YAML 导出后 `apply` 会覆盖并发更新的 budgets、`consolidateAfter` 等字段，而窄 JSON patch 保留其余配置。
 - 不选：不采用 `rollout restart`、删除 NodePool 或 NodeClaim 等间接手段，因为目标仅是降低后续 consolidation 激进度，不能引入节点驱逐或业务中断。
