@@ -33,6 +33,8 @@ ARTIFACT_DIR="$(pwd)/k8sAvailCheckArtifacts_${RUN_TS}"
 NAMESPACE="debug"
 # 脚本完成标志：用于EXIT trap判断是否异常退出，异常退出时清理残留测试资源
 SCRIPT_COMPLETED=false
+MAIN_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVERLESS_MODE="Standard"
 AWS_TOOL_BASE_URL="https://download-thinkingdata.oss-cn-shanghai.aliyuncs.com/ta/tools"
 AWS_SPECIAL_ACTION_TIMEOUT=30
 AWS_STORAGE_REPAIR_NEEDED=false
@@ -2505,7 +2507,7 @@ detect_cloud_platform() {
         cloud_provider="volcengine"
     elif echo "$labels" | grep -Eq 'alibabacloud|aliyun'; then
         cloud_provider="alibaba"
-    elif echo "$labels" | grep -Eq 'cloud\.tencent\.com|qcloud'; then
+    elif echo "$labels" | grep -Eq 'cloud\.tencent\.com|qcloud|eks\.tke\.cloud\.tencent\.com'; then
         cloud_provider="tencent"
     elif echo "$labels" | grep -Eq 'cce\.cloud\.com|huaweicloud'; then
         cloud_provider="huawei"
@@ -2563,6 +2565,67 @@ detect_cloud_platform() {
 
     log_info "检测到k8s所属环境: ${BOLD}${cloud_provider}${NC}"
     echo "$cloud_provider"
+}
+
+# 阿里/腾讯仅凭虚拟节点强指纹分流；其他云以及无虚拟节点场景保持既有标准检查逻辑。
+detect_serverless_mode() {
+    local platform="$1" node meta virtual_nodes=0 standard_nodes=0
+    SERVERLESS_MODE="Standard"
+    case "$platform" in
+    alibaba | tencent) ;;
+    *) return 0 ;;
+    esac
+
+    local nodes
+    nodes=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null) || nodes=""
+    [[ -n "$nodes" ]] || {
+        log_error "未发现Node，无法判断Serverless/Standard/Hybrid服务模式"
+        return 1
+    }
+    for node in $nodes; do
+        meta=$(kubectl get node "$node" -o yaml 2>/dev/null) || {
+            log_error "无法读取Node ${node} 元数据，拒绝猜测服务模式"
+            return 1
+        }
+        case "$platform" in
+        tencent)
+            if grep -qE 'node.kubernetes.io/instance-type: eklet|eks.tke.cloud.tencent.com/' <<<"$meta"; then
+                ((virtual_nodes++))
+            else
+                ((standard_nodes++))
+            fi
+            ;;
+        alibaba)
+            if grep -q 'type: virtual-kubelet' <<<"$meta" && grep -qE 'alibabacloud.com/|service.alibabacloud.com/|vk.alpha.alibabacloud.com/' <<<"$meta"; then
+                ((virtual_nodes++))
+            else
+                ((standard_nodes++))
+            fi
+            ;;
+        esac
+    done
+    if (( virtual_nodes == 0 )); then
+        SERVERLESS_MODE="Standard"
+    elif (( standard_nodes == 0 )); then
+        SERVERLESS_MODE="Serverless"
+    else
+        SERVERLESS_MODE="Hybrid"
+    fi
+    log_info "K8S服务模式识别: ${SERVERLESS_MODE}; Serverless调度域:${virtual_nodes}; 标准节点:${standard_nodes}"
+}
+
+run_serverless_availability_checks() {
+    local serverless_script="${MAIN_SCRIPT_DIR}/k8sServerlessAvailCheck.sh"
+    [[ -x "$serverless_script" || -f "$serverless_script" ]] || {
+        log_error "未找到Serverless专项检查脚本: ${serverless_script}"
+        return 1
+    }
+    log_info "进入${SERVERLESS_MODE} Serverless专项检查：跳过NodePort、宿主机网络和标准节点池契约，使用固定虚拟节点调度域验证"
+    NAMESPACE="$NAMESPACE" \
+        APP_CONFIG_FILE="$APP_CONFIG_FILE" \
+        SERVERLESS_NETWORK_TARGET="${SERVERLESS_NETWORK_TARGET:-}" \
+        SERVERLESS_PROBE_IMAGE="${SERVERLESS_PROBE_IMAGE:-}" \
+        bash "$serverless_script"
 }
 
 # ==================== 内置K8S节点标签统一 ====================
@@ -4068,6 +4131,31 @@ main() {
 
     cloud_platform=$(detect_cloud_platform)
     record_result "K8S所属环境检查" "PASS" "识别到环境: ${cloud_platform}"
+
+    if ! detect_serverless_mode "$cloud_platform"; then
+        record_result "K8S服务模式识别" "FAIL" "无法安全识别Serverless/Standard/Hybrid，停止后续检查"
+        print_summary
+        SCRIPT_COMPLETED=true
+        return 1
+    fi
+    record_result "K8S服务模式识别" "PASS" "${SERVERLESS_MODE}"
+    if [[ "$SERVERLESS_MODE" == "Serverless" ]]; then
+        if ! run_serverless_availability_checks; then
+            record_result "Serverless专项检查" "FAIL" "专项检查脚本执行失败"
+            print_summary
+            SCRIPT_COMPLETED=true
+            return 1
+        fi
+        SCRIPT_COMPLETED=true
+        return 0
+    fi
+    if [[ "$SERVERLESS_MODE" == "Hybrid" ]]; then
+        if ! run_serverless_availability_checks; then
+            record_result "Serverless专项检查" "FAIL" "专项检查脚本执行失败；继续执行标准节点路径"
+        else
+            record_result "Serverless专项检查" "PASS" "专项检查已执行，详见前序Serverless汇总"
+        fi
+    fi
 
     if [[ "$cloud_platform" == *aws* ]]; then
         check_aws_nodepool_gate

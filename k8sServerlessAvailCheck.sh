@@ -99,8 +99,8 @@ detect_cluster_mode() {
         elif (( tencent_signals >= 2 && alibaba_signals == 0 )); then CLOUD_PLATFORM=tencent
         else record_result "K8S模式识别" "FAIL" "标准节点集群缺少一致的阿里/腾讯双重证据，拒绝猜测"; return 1; fi
     fi
-    if (( ${#SERVERLESS_DOMAINS[@]} == 0 )); then CLUSTER_MODE="Standard-only"
-    elif (( STANDARD_NODE_COUNT == 0 )); then CLUSTER_MODE="Serverless-only"
+    if (( ${#SERVERLESS_DOMAINS[@]} == 0 )); then CLUSTER_MODE="Standard"
+    elif (( STANDARD_NODE_COUNT == 0 )); then CLUSTER_MODE="Serverless"
     else CLUSTER_MODE="Hybrid"; fi
     record_result "K8S模式识别" "PASS" "${CLOUD_PLATFORM}/${CLUSTER_MODE}; Serverless调度域:${#SERVERLESS_DOMAINS[@]}; 标准节点:${STANDARD_NODE_COUNT}"
 }
@@ -531,7 +531,7 @@ main() {
         print_summary
         return 1
     fi
-    if [[ "$CLUSTER_MODE" == "Standard-only" ]]; then
+    if [[ "$CLUSTER_MODE" == "Standard" ]]; then
         record_result "Serverless检查分流" "SKIP" "当前为标准节点模式，请使用 k8sAvailCheck.sh 执行节点池检查"
         print_summary
         SCRIPT_COMPLETED=true

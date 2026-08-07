@@ -12,6 +12,10 @@ fail() {
 
 [[ -f "$script" ]] || fail "serverless script must exist"
 grep -qF 'detect_cluster_mode()' "$script" || fail "must detect cluster mode"
+grep -qF 'CLUSTER_MODE="Standard"' "$script" || fail "standard mode must use the unified mode name"
+grep -qF 'CLUSTER_MODE="Serverless"' "$script" || fail "serverless mode must use the unified mode name"
+! grep -qF 'Standard-only' "$script" || fail "legacy Standard-only mode name must not remain"
+! grep -qF 'Serverless-only' "$script" || fail "legacy Serverless-only mode name must not remain"
 grep -qF 'discover_serverless_domains()' "$script" || fail "must discover Serverless scheduling domains"
 grep -qF 'check_serverless_domain_health()' "$script" || fail "must gate each Serverless domain"
 grep -qF 'check_platform_features()' "$script" || fail "must retain platform feature checks"

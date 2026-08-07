@@ -47,6 +47,13 @@ require_text 'bash -n "$script_path"'
 require_text 'bash "$script_path"'
 require_text 'storage_ready_for_existing_eks.sh'
 require_text 'check_aws_consolidation_policy()'
+require_text 'detect_serverless_mode()'
+require_text 'run_serverless_availability_checks()'
+require_text 'eks\.tke\.cloud\.tencent\.com'
+require_text 'Serverless'
+require_text 'Hybrid'
+require_text 'SERVERLESS_MODE="Standard"'
+require_text 'if [[ "$SERVERLESS_MODE" == "Serverless" ]]'
 forbid_text 'sh "${script_path}"'
 forbid_text 'AWS EKS环境经由特殊流程(auto_build_nodepool.sh)处理，不再进行其他检测'
 
@@ -60,6 +67,49 @@ sed -n '/^main()/,/^# ==================== 资源清理/p' "$SCRIPT" >"$main_sou
 ! grep -q 'cleanup_historical_test_pvs || true' "$main_source" || fail 'test PV cleanup must not run before the end of the main flow'
 [[ "$(grep -c 'finalize_availability_check' "$main_source")" -eq 1 ]] || fail 'only the completed standard flow may enter historical test PV cleanup'
 grep -q 'check_aws_nodepool_gate' "$main_source" || fail 'AWS NodePool gate must run before nodepool plan and storage checks'
+
+# 阿里/腾讯仅以虚拟节点强指纹分流；普通节点及其他云不能被误导进入Serverless路径。
+serverless_mode_source="$test_tmp/k8sAvailCheck.serverless-mode.functions.sh"
+sed -n '/^detect_serverless_mode()/,/^}/p' "$SCRIPT" >"$serverless_mode_source"
+log_info() { :; }
+log_error() { :; }
+# shellcheck disable=SC1090
+source "$serverless_mode_source"
+kubectl() {
+    case "$*" in
+    "get nodes -o jsonpath="*) printf '%b' "$MODE_NODES" ;;
+    "get node "*)
+        local node="${3}"
+        case "$node" in
+        eklet-a) printf '%s\n' "$MODE_EKLET_A" ;;
+        eklet-b) printf '%s\n' "$MODE_EKLET_B" ;;
+        worker-a) printf '%s\n' "$MODE_WORKER_A" ;;
+        virtual-kubelet-a) printf '%s\n' "$MODE_VIRTUAL_KUBELET_A" ;;
+        *) return 1 ;;
+        esac
+        ;;
+    *) return 1 ;;
+    esac
+}
+MODE_NODES=$'eklet-a\neklet-b\n'
+MODE_EKLET_A='node.kubernetes.io/instance-type: eklet'
+MODE_EKLET_B='eks.tke.cloud.tencent.com/subnet-id: subnet-b'
+detect_serverless_mode tencent || fail 'Tencent EKlet-only mode detection must succeed'
+[[ "$SERVERLESS_MODE" == Serverless ]] || fail 'Tencent EKlet-only cluster must be Serverless'
+
+MODE_NODES=$'eklet-a\nworker-a\n'
+MODE_WORKER_A='node.kubernetes.io/instance-type: S5.MEDIUM4'
+detect_serverless_mode tencent || fail 'Tencent hybrid mode detection must succeed'
+[[ "$SERVERLESS_MODE" == Hybrid ]] || fail 'Tencent virtual plus standard nodes must be Hybrid'
+
+MODE_NODES=$'worker-a\n'
+detect_serverless_mode tencent || fail 'Tencent standard mode detection must succeed'
+[[ "$SERVERLESS_MODE" == Standard ]] || fail 'Tencent standard nodes must remain Standard'
+
+MODE_NODES=$'virtual-kubelet-a\n'
+MODE_VIRTUAL_KUBELET_A=$'type: virtual-kubelet\nservice.alibabacloud.com/eni-id: eni-1'
+detect_serverless_mode alibaba || fail 'Alibaba virtual-kubelet mode detection must succeed'
+[[ "$SERVERLESS_MODE" == Serverless ]] || fail 'Alibaba virtual-kubelet cluster must be Serverless'
 
 # 第二层业务节点组规划：预制方案必须经云厂商规则展开，并允许管理员完整替代默认规划。
 nodepool_plan_source="$test_tmp/k8sAvailCheck.nodepool-plan.functions.sh"

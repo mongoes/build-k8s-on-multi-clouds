@@ -2,7 +2,7 @@
 
 ## 当前阶段
 
-2026-08-07 Serverless专项检查已实施、待双云现场回灌：`k8sServerlessAvailCheck.sh` 从Node强指纹识别腾讯EKlet与阿里Virtual Kubelet，区分`Serverless-only`、`Hybrid`、`Standard-only`；云厂商证据冲突或标准节点云归属不足时FAIL停止，不猜测。腾讯首次实测发现探测对象名超63字符、时间戳下划线违反RFC1123、以及生成YAML时误执行存储容器命令替换，现已改为短哈希RFC1123资源ID并修正转义；AZ优先展示`eks.tke.cloud.tencent.com/zone-name`。ClusterIP失败现保留命令输出、Service、EndpointSlice、Endpoints和Pod物料；探测镜像缺少HTTP客户端时仅WARN。`te-nfs` 现先在每个健康调度域以两个Pod共享同一PVC验证RWX，再在至少两个健康调度域时做跨域Writer/Reader验证；虚拟CPU、内存、Pod容量、InternalIP和Lease不参与结论。下一步：用同一腾讯单EKlet集群确认同域双Pod RWX与ClusterIP诊断，再用多EKlet集群验证跨域RWX，随后回灌阿里多Virtual Kubelet、混合模式及未知/冲突模式。
+2026-08-07 Serverless专项检查已合并到`k8sAvailCheck.sh`入口：阿里/腾讯从虚拟节点强指纹识别`Serverless`、`Standard`、`Hybrid`三种模式；`Serverless`委派固定虚拟节点调度域专项验证并跳过NodePort、宿主机网络及标准节点池契约，`Standard`保持原完整主流程，`Hybrid`先做专项验证再继续标准节点路径。独立`k8sServerlessAvailCheck.sh`仍保留为单独回灌入口。腾讯单EKlet已实测通过ClusterIP、`te-disk` RWO、`te-nfs` RWX单Pod及同域双Pod共享；跨域RWX因单调度域正确SKIP。下一步：回灌阿里多Virtual Kubelet、腾讯多EKlet和Hybrid，验证跨调度域RWX与两条路径汇总。
 
 2026-08-07 华为CCE存储回灌已真实验证：历史`te-disk`被业务PVC/PV引用时，检查按通过呈现且未改变SC。旧`te-nfs`（`nfs-provisioner`、无VPC授权）在人工确认后已仅替换同名StorageClass，未触碰PV/PVC/Pod；后续临时RWX PVC由`everest-csi-provisioner`成功供给并Bound，证明脚本改造与SC参数生效。Pod失败于节点对SFS地址的NFS挂载（`FailedMount`），现场已确认CCE缺少VPCEP，属于云侧文件存储访问通路前置条件，不是脚本逻辑误判。
 

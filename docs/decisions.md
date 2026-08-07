@@ -19,6 +19,12 @@
 - 决策：每个健康Serverless调度域均执行同域Writer/Reader双Pod共享测试，Writer写入标记后Reader读取；它验证RWX多Pod共享，但不将其称为跨节点/跨子网验证。仅在至少两个健康调度域存在时执行跨域RWX测试。
 - 网络结论：NodePort不属于Serverless检查范围；ClusterIP仍是应验证的数据面。失败时必须保存HTTP客户端输出和Kubernetes对象证据；如果镜像没有wget/curl，记录WARN而不是将探针工具缺失误判为网络FAIL。
 
+## 2026-08-07：主检查器仅对阿里/腾讯进行三态服务模式分流
+
+- 模式命名统一为`Serverless`、`Standard`、`Hybrid`，不再使用`*-only`。腾讯以EKlet强指纹、阿里以Virtual Kubelet与阿里专属信号组合识别虚拟节点；无虚拟节点即`Standard`，虚拟节点与标准节点共存即`Hybrid`。
+- 决策：`k8sAvailCheck.sh`在云厂商识别后进行分流。`Serverless`运行Serverless专项检查并结束，不执行节点池规划、NodePort、宿主机网络或标准节点契约；`Hybrid`先运行专项检查，再保留原标准路径。AWS、华为、GCP、火山和自建集群不进入该分流，继续原逻辑。
+- 不选：不把虚拟节点逻辑复制进标准节点检查函数，也不让Serverless模式强行执行标准节点池检查；两者会把无物理节点的产品边界误报为集群故障。
+
 ## 2026-08-07：华为 CCE 存量 StorageClass 采用受保护通过与显式确认替换
 
 - `te-disk`：当旧SC仍被业务PVC/PV引用时，GPSSD2升级不是失败，也不是需要用户处理的“关注项”。脚本不执行apply、patch或delete，并在总览记为通过：旧SC被业务存储使用，因此不会更新GPSSD2；已绑定卷和现有Pod不受本次检查影响。
