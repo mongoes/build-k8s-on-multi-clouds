@@ -35,6 +35,22 @@ NAMESPACE="debug"
 SCRIPT_COMPLETED=false
 MAIN_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVERLESS_MODE="Standard"
+K8S_CHECK_SCOPE="${K8S_CHECK_SCOPE:-auto}"
+PROBE_ID_SUFFIX="$(date +'%H%M%S')-$$"
+PROBE_LABEL="serverless-avail-probe"
+PROBE_RUN_LABEL="sl-$(date +'%Y%m%d-%H%M%S')-$$"
+PROBE_NAME="serverless-avail-probe-${RUN_TS}"
+DISK_PVC="serverless-avail-disk-${RUN_TS}"
+NFS_PVC="serverless-avail-nfs-${RUN_TS}"
+NGINX_IMAGE="docker-ta.thinkingdata.cn/te/nginx:1.20"
+SERVERLESS_PROBE_IMAGE="${SERVERLESS_PROBE_IMAGE:-$NGINX_IMAGE}"
+PROBE_TIMEOUT="${PROBE_TIMEOUT:-180}"
+SERVERLESS_DOMAINS=()
+READY_SERVERLESS_DOMAINS=()
+SERVERLESS_READY_POD=""
+SERVERLESS_WAIT_REASON=""
+STANDARD_NODES=()
+STANDARD_NODE_COUNT=0
 AWS_TOOL_BASE_URL="https://download-thinkingdata.oss-cn-shanghai.aliyuncs.com/ta/tools"
 AWS_SPECIAL_ACTION_TIMEOUT=30
 AWS_STORAGE_REPAIR_NEEDED=false
@@ -47,7 +63,6 @@ K8S_MAJOR_VERSION="1"
 K8S_MINOR_VERSION="34"
 # 可用性检查统一从数数镜像仓库拉取, 与实际服务部署来源保持一致(不再走 docker hub / GCR 备用)。
 # 若从此仓库拉取失败, 大概率是容器集群网络策略未放行, 视为不符合部署需求并强提示。
-NGINX_IMAGE="docker-ta.thinkingdata.cn/te/nginx:1.20"
 # 拉取失败时的统一强提示文案(容器集群网络策略未放行 docker-ta.thinkingdata.cn)
 IMAGE_PULL_FAIL_HINT="从 docker-ta.thinkingdata.cn 仓库拉取镜像失败，不符合部署需求，请确认容器集群访问配置妥当&&放行后重试检查。"
 
@@ -333,6 +348,8 @@ LEGACY_APP_CONFIG_FILE="/data/home/ta/data_etl_ta/application.yml"
 HOST_LATENCY_THRESHOLD_MS=50
 # 延迟采样次数(取均值, 削峰抖动)。TCP 握手计时近似 RTT(略高于 ICMP 但同量级)。
 HOST_LATENCY_SAMPLES=5
+# kubectl exec 是独立于容器内 curl 的流式连接，必须另设硬超时，避免Serverless exec通道异常时无限等待。
+MYSQL_KUBECTL_EXEC_TIMEOUT="${MYSQL_KUBECTL_EXEC_TIMEOUT:-15}"
 # Endpoint 出现后，kube-proxy/CNI 将 Service 规则同步至数据面的最长等待时间。
 # Endpoint 就绪不代表 ClusterIP/NodePort 在每个节点上已立即可用。
 SERVICE_DATA_PLANE_RETRY_TIMEOUT=30
@@ -343,6 +360,9 @@ SERVICE_DATA_PLANE_RETRY_TIMEOUT=30
 # 非 CSI 故障。取 20Gi 可一次性越过全部云下限(阿里 PL1 的 20 是最高门槛); 盘随测试几分钟
 # 即删, 瞬时计费可忽略。AWS gp3 下限仅 1Gi, 取 20 同样合规。
 E2E_PVC_SIZE="20Gi"
+# 临时PV先删PVC后由CSI异步回收；腾讯CBS等云盘回收可能超过60秒。
+# 仅影响本轮临时PVC的等待，不改变业务StorageClass的Retain策略。
+STORAGE_PV_RECLAIM_TIMEOUT="${STORAGE_PV_RECLAIM_TIMEOUT:-180}"
 
 # 华为CCE文件存储的人工VPC ID兜底。正常情况下脚本从内置 csi-nas 的
 # everest.io/share-access-to 自动读取；仅自动读取失败时使用本变量。
@@ -475,6 +495,29 @@ record_result() {
     return 0
 }
 
+# 脚本通常从 ta1 管理节点执行；若存在 license，company_name 即为大数据集群名。
+# 该信息仅作为总览上下文，无法读取或解析时不影响检查结论。
+get_cluster_name() {
+    local license_file company_name license_glob="${TA_LICENSE_GLOB:-/data/app/.admin_manager_ta/*license}"
+    license_file=$(compgen -G "$license_glob" 2>/dev/null | LC_ALL=C sort | head -1)
+    [[ -n "$license_file" && -f "$license_file" && -r "$license_file" ]] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+
+    company_name=$(jq -r 'if (.company_name | type) == "string" then .company_name else empty end' "$license_file" 2>/dev/null) || return 1
+    [[ "$company_name" != null && "$company_name" =~ [^[:space:]] ]] || return 1
+    # 总览字段必须保持单行，避免异常license内容破坏后续结果展示。
+    [[ "$company_name" != *$'\n'* && "$company_name" != *$'\r'* ]] || return 1
+    printf '%s\n' "$company_name"
+}
+
+print_cluster_name_summary() {
+    local maxw="${1:-0}" cluster_name padded
+    if cluster_name=$(get_cluster_name); then
+        padded=$(_pad_disp "集群名称" "$maxw")
+        log_info "  [ 信息 ] ${padded} —— ${cluster_name}"
+    fi
+}
+
 # 打印最终汇总总览(彩色), 并统计 PASS/WARN/FAIL/IMPORTANT/SKIP 数量
 print_summary() {
     log_step "检查结果总览"
@@ -482,11 +525,15 @@ print_summary() {
     local i
 
     # 先求所有检查项名的最大显示宽度, 供右补空格对齐 '——' 详情列
-    local maxw=0 w
+    local maxw w
+    maxw=$(_disp_width "集群名称")
     for i in "${!RESULT_NAMES[@]}"; do
         w=$(_disp_width "${RESULT_NAMES[$i]}")
         ((w > maxw)) && maxw=$w
     done
+
+    # 集群名称是总览上下文，不属于检查项，也不参与结果统计。
+    print_cluster_name_summary "$maxw"
 
     for i in "${!RESULT_NAMES[@]}"; do
         local name="${RESULT_NAMES[$i]}"
@@ -760,15 +807,14 @@ discover_and_check_nodes() {
     log_step "节点池与节点配置检查"
     local platform="$1"
 
-    local all_nodes=$(kubectl get nodes --no-headers 2>/dev/null)
-    if [[ -z "$all_nodes" ]]; then
+    local all_node_names
+    all_node_names=$(get_standard_node_names)
+    if [[ -z "$all_node_names" ]]; then
         log_error "未获取到任何节点，请确认集群是否已添加节点"
         return 1
     fi
 
-    local total_nodes=$(echo "$all_nodes" | wc -l | tr -d ' ')
-
-    local all_node_names=$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+    local total_nodes=$(printf '%s\n' "$all_node_names" | grep -c .)
 
     # 按nodepool-name标签归类
     declare -A pool_nodes_map
@@ -1046,7 +1092,8 @@ check_nodepool_contract() {
     fi
 
     # 按 nodepool-name 标签归类(同 discover_and_check_nodes)
-    local all_node_names=$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+    local all_node_names
+    all_node_names=$(get_standard_node_names)
     declare -A pool_nodes_map
     local node
     for node in $all_node_names; do
@@ -2227,29 +2274,70 @@ parse_mysql_targets() {
 }
 
 # ==================== 混合部署: Pod -> 集群内 MySQL TCP 连通性 ====================
-# 复用就绪 nginx Pod，以 curl telnet:// 验证三次握手。
+# 复用就绪 nginx Pod，以 curl 的 remote_ip/remote_port 确认三次握手。
 # 只验"网络+端口可达"(安全组/路由是否放行), 不登录、不依赖 mysql 客户端。
 MYSQL_PROBE_FAILURE_REASON=""
-_mysql_curl_connect() {
-    local host="$1" port="$2"
-    kubectl exec "$POD_NAME" -n "$NAMESPACE" -- curl --noproxy '*' --connect-timeout 5 --max-time 5 --silent --show-error --output /dev/null --write-out '%{time_connect}' "telnet://${host}:${port}"
+_run_kubectl_exec_with_timeout() {
+    local timeout_seconds="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --signal=TERM "${timeout_seconds}s" kubectl exec "$@"
+    else
+        kubectl --request-timeout="${timeout_seconds}s" exec "$@"
+    fi
 }
 
-_mysql_valid_time_connect() {
-    [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v seconds="$1" 'BEGIN { exit !(seconds > 0) }'
+_mysql_curl_connect() {
+    local host="$1" port="$2"
+    _run_kubectl_exec_with_timeout "$MYSQL_KUBECTL_EXEC_TIMEOUT" \
+        "$POD_NAME" -n "$NAMESPACE" -- \
+        curl --noproxy '*' --connect-timeout 5 --max-time 5 --silent --show-error --output /dev/null \
+        --write-out 'remote_ip=%{remote_ip};remote_port=%{remote_port};time_connect=%{time_connect}' \
+        "http://${host}:${port}/"
+}
+
+_mysql_tcp_connected() {
+    local result="$1" expected_port="$2" remote_ip remote_port
+    [[ "$result" =~ remote_ip=([^;[:space:]]*) ]] || return 1
+    remote_ip="${BASH_REMATCH[1]}"
+    [[ "$result" =~ remote_port=([0-9]+) ]] || return 1
+    remote_port="${BASH_REMATCH[1]}"
+    [[ -n "$remote_ip" && "$remote_port" == "$expected_port" ]]
+}
+
+_mysql_time_connect() {
+    local result="$1"
+    if [[ "$result" =~ time_connect=([0-9]+(\.[0-9]+)?) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
 }
 
 capture_mysql_probe_diagnostics() {
-    local pool="$1" mysql_target="$2" host="${2%:*}" port="${2##*:}"
-    local artifact stdout_file stderr_file curl_command rc_curl rc_resolv rc_hosts rc_getent rc_tcp tcp_time probe_file
+    local pool="$1" mysql_target="$2" initial_rc="${3:-}" host="${2%:*}" port="${2##*:}"
+    local artifact stdout_file stderr_file curl_command rc_curl rc_resolv rc_hosts rc_getent rc_tcp tcp_result tcp_time probe_file
     local getent_available=0
     _ensure_artifact_dir
     artifact="${ARTIFACT_DIR}/mysql_probe_${pool//[^A-Za-z0-9_.-]/_}_${host//[^A-Za-z0-9_.-]/_}_${port}_${RUN_TS}_${RANDOM}.txt"
     stdout_file="${artifact}.stdout"
     stderr_file="${artifact}.stderr"
-    curl_command="curl --noproxy '*' --connect-timeout 5 --max-time 5 --silent --show-error --output /dev/null --write-out '%{time_connect}' telnet://${host}:${port}"
+    curl_command="curl --noproxy '*' --connect-timeout 5 --max-time 5 --silent --show-error --output /dev/null --write-out 'remote_ip=%{remote_ip};remote_port=%{remote_port};time_connect=%{time_connect}' http://${host}:${port}/"
     { printf 'pool=%s\npod=%s\nnamespace=%s\ntarget=%s\nraw_curl_command=%s\n' "$pool" "$POD_NAME" "$NAMESPACE" "$mysql_target" "$curl_command"; } >"$artifact"
-    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v curl' >"$stdout_file" 2>"$stderr_file"; then rc_curl=0; else rc_curl=$?; fi
+    if [[ "$initial_rc" == 124 || "$initial_rc" == 137 ]]; then
+        {
+            printf '\n[initial kubectl exec]\nexit_code=%s\n' "$initial_rc"
+            printf 'kubectl exec stream exceeded %ss; skipped repeated exec diagnostics\n' "$MYSQL_KUBECTL_EXEC_TIMEOUT"
+            printf '\n[pod]\n'
+            kubectl --request-timeout=10s get pod "$POD_NAME" -n "$NAMESPACE" -o yaml 2>&1 || true
+            printf '\n[pod describe]\n'
+            kubectl --request-timeout=10s describe pod "$POD_NAME" -n "$NAMESPACE" 2>&1 || true
+        } >>"$artifact"
+        MYSQL_PROBE_FAILURE_REASON="kubectl exec 超过${MYSQL_KUBECTL_EXEC_TIMEOUT}秒未完成，已强制终止（请检查API Server到探测Pod的exec通道）"
+        MYSQL_PROBE_DIAGNOSTIC_ARTIFACT="$artifact"
+        return 0
+    fi
+    if _run_kubectl_exec_with_timeout "$MYSQL_KUBECTL_EXEC_TIMEOUT" "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v curl' >"$stdout_file" 2>"$stderr_file"; then rc_curl=0; else rc_curl=$?; fi
     {
         printf '\n[command -v curl]\nexit_code=%s\nstdout:\n' "$rc_curl"
         cat "$stdout_file"
@@ -2257,7 +2345,7 @@ capture_mysql_probe_diagnostics() {
         cat "$stderr_file"
     } >>"$artifact"
     for probe_file in '/etc/resolv.conf' '/etc/hosts'; do
-        if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c "cat $probe_file" >"$stdout_file" 2>"$stderr_file"; then rc_resolv=0; else rc_resolv=$?; fi
+        if _run_kubectl_exec_with_timeout "$MYSQL_KUBECTL_EXEC_TIMEOUT" "$POD_NAME" -n "$NAMESPACE" -- sh -c "cat $probe_file" >"$stdout_file" 2>"$stderr_file"; then rc_resolv=0; else rc_resolv=$?; fi
         {
             printf '\n[%s]\nexit_code=%s\nstdout:\n' "$probe_file" "$rc_resolv"
             cat "$stdout_file"
@@ -2265,10 +2353,13 @@ capture_mysql_probe_diagnostics() {
             cat "$stderr_file"
         } >>"$artifact"
     done
-    if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v getent' >"$stdout_file" 2>"$stderr_file"; then getent_available=1; fi
-    if [[ $getent_available -eq 1 ]]; then kubectl exec "$POD_NAME" -n "$NAMESPACE" -- getent hosts "$host" >>"$artifact" 2>&1 || true; fi
+    if _run_kubectl_exec_with_timeout "$MYSQL_KUBECTL_EXEC_TIMEOUT" "$POD_NAME" -n "$NAMESPACE" -- sh -c 'command -v getent' >"$stdout_file" 2>"$stderr_file"; then getent_available=1; fi
+    if [[ $getent_available -eq 1 ]]; then
+        _run_kubectl_exec_with_timeout "$MYSQL_KUBECTL_EXEC_TIMEOUT" "$POD_NAME" -n "$NAMESPACE" -- getent hosts "$host" >>"$artifact" 2>&1 || true
+    fi
     if _mysql_curl_connect "$host" "$port" >"$stdout_file" 2>"$stderr_file"; then rc_tcp=0; else rc_tcp=$?; fi
-    tcp_time=$(<"$stdout_file")
+    tcp_result=$(<"$stdout_file")
+    tcp_time=$(_mysql_time_connect "$tcp_result" 2>/dev/null || true)
     {
         printf '\n[curl TCP result]\nexit_code=%s\ntime_connect=%s\nstdout:\n' "$rc_tcp" "$tcp_time"
         cat "$stdout_file"
@@ -2276,13 +2367,19 @@ capture_mysql_probe_diagnostics() {
         cat "$stderr_file"
     } >>"$artifact"
     rm -f "$stdout_file" "$stderr_file"
+    if _mysql_tcp_connected "$tcp_result" "$port"; then
+        MYSQL_PROBE_FAILURE_REASON='curl 诊断复测已确认TCP连接成功'
+        MYSQL_PROBE_DIAGNOSTIC_ARTIFACT="$artifact"
+        return 0
+    fi
     case "$rc_tcp" in
+    124 | 137) MYSQL_PROBE_FAILURE_REASON="kubectl exec 超过${MYSQL_KUBECTL_EXEC_TIMEOUT}秒未完成，已强制终止（请检查API Server到探测Pod的exec通道）" ;;
     127) MYSQL_PROBE_FAILURE_REASON='Pod 内缺少 curl，无法执行 TCP 探测' ;;
     6) MYSQL_PROBE_FAILURE_REASON='Pod DNS 无法解析 MySQL 主机名' ;;
     2) MYSQL_PROBE_FAILURE_REASON='curl 工具或协议参数异常' ;;
     7) MYSQL_PROBE_FAILURE_REASON='TCP 探测失败（请结合诊断物料确认路由、安全组、监听端口）' ;;
-    28) if _mysql_valid_time_connect "$tcp_time"; then MYSQL_PROBE_FAILURE_REASON='curl 诊断复测成功'; else MYSQL_PROBE_FAILURE_REASON='TCP 探测超时或未建立连接'; fi ;;
-    0) MYSQL_PROBE_FAILURE_REASON='curl 执行未建立有效连接' ;;
+    28) MYSQL_PROBE_FAILURE_REASON='TCP 探测超时或未建立连接' ;;
+    0) MYSQL_PROBE_FAILURE_REASON='curl 未返回已连接的远端地址' ;;
     *) MYSQL_PROBE_FAILURE_REASON="curl 执行异常（exit=${rc_tcp}，详见诊断物料）" ;;
     esac
     MYSQL_PROBE_DIAGNOSTIC_ARTIFACT="$artifact"
@@ -2290,13 +2387,15 @@ capture_mysql_probe_diagnostics() {
 
 test_pod_to_mysql_connectivity() {
     local mysql_target="$1" pool="${2:-unknown}" host="${1%:*}" port="${1##*:}" out rc
+    log_info "从探测Pod ${POD_NAME} 发起MySQL TCP检查: ${mysql_target}（单次最长${MYSQL_KUBECTL_EXEC_TIMEOUT}秒）"
     if out=$(_mysql_curl_connect "$host" "$port" 2>/dev/null); then rc=0; else rc=$?; fi
-    if _mysql_valid_time_connect "$out"; then
-        [[ $rc -eq 28 ]] && log_info "MySQL TCP握手已建立，服务保持连接，按连接成功计"
+    if _mysql_tcp_connected "$out" "$port"; then
+        [[ $rc -ne 0 ]] && log_info "MySQL TCP握手已建立；curl因MySQL非HTTP协议退出(exit=${rc})，按连接成功计"
         log_success "测试Pod访问集群内MySQL正常(TCP ${mysql_target} 可达)"
         return 0
     fi
-    capture_mysql_probe_diagnostics "$pool" "$mysql_target"
+    log_warning "MySQL首次TCP探测未通过(exit=${rc})，开始采集有超时保护的诊断物料"
+    capture_mysql_probe_diagnostics "$pool" "$mysql_target" "$rc"
     log_error "错误：Pod无法连通集群内MySQL(${mysql_target})：${MYSQL_PROBE_FAILURE_REASON}"
     log_error "诊断物料已保存至: ${MYSQL_PROBE_DIAGNOSTIC_ARTIFACT}"
     return 1
@@ -2308,8 +2407,10 @@ test_pod_to_host_latency() {
     log_step "Pod访问集群内云主机网络延迟检查"
     for ((i = 0; i < HOST_LATENCY_SAMPLES; i++)); do
         out=$(_mysql_curl_connect "$host" "$port" 2>/dev/null) || :
-        if _mysql_valid_time_connect "$out"; then
-            sample_ms=$(awk -v seconds="$out" 'BEGIN { printf "%d", seconds * 1000 }')
+        if _mysql_tcp_connected "$out" "$port"; then
+            sample_ms=$(_mysql_time_connect "$out" 2>/dev/null || true)
+            [[ "$sample_ms" =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
+            sample_ms=$(awk -v seconds="$sample_ms" 'BEGIN { printf "%d", seconds * 1000 }')
             total=$((total + sample_ms))
             ok=$((ok + 1))
         fi
@@ -2569,8 +2670,11 @@ detect_cloud_platform() {
 
 # 阿里/腾讯仅凭虚拟节点强指纹分流；其他云以及无虚拟节点场景保持既有标准检查逻辑。
 detect_serverless_mode() {
-    local platform="$1" node meta virtual_nodes=0 standard_nodes=0
+    local platform="$1" node meta tencent_zone virtual_nodes=0 standard_nodes=0
     SERVERLESS_MODE="Standard"
+    SERVERLESS_DOMAINS=()
+    STANDARD_NODES=()
+    STANDARD_NODE_COUNT=0
     case "$platform" in
     alibaba | tencent) ;;
     *) return 0 ;;
@@ -2591,41 +2695,657 @@ detect_serverless_mode() {
         tencent)
             if grep -qE 'node.kubernetes.io/instance-type: eklet|eks.tke.cloud.tencent.com/' <<<"$meta"; then
                 ((virtual_nodes++))
+                tencent_zone=$(kubectl get node "$node" -o jsonpath='{.metadata.labels.eks\.tke\.cloud\.tencent\.com/zone-name}' 2>/dev/null)
+                [[ -n "$tencent_zone" ]] || tencent_zone=$(kubectl get node "$node" -o jsonpath='{.metadata.labels.topology\.kubernetes\.io/zone}' 2>/dev/null)
+                SERVERLESS_DOMAINS+=("${node}|tencent|${tencent_zone}|$(kubectl get node "$node" -o jsonpath='{.metadata.labels.eks\.tke\.cloud\.tencent\.com/subnet-id}' 2>/dev/null)|eks.tke.cloud.tencent.com/eklet")
             else
                 ((standard_nodes++))
+                STANDARD_NODES+=("$node")
             fi
             ;;
         alibaba)
             if grep -q 'type: virtual-kubelet' <<<"$meta" && grep -qE 'alibabacloud.com/|service.alibabacloud.com/|vk.alpha.alibabacloud.com/' <<<"$meta"; then
                 ((virtual_nodes++))
+                SERVERLESS_DOMAINS+=("${node}|alibaba|$(kubectl get node "$node" -o jsonpath='{.metadata.labels.topology\.kubernetes\.io/zone}' 2>/dev/null)||virtual-kubelet.io/provider")
             else
                 ((standard_nodes++))
+                STANDARD_NODES+=("$node")
             fi
             ;;
         esac
     done
-    if (( virtual_nodes == 0 )); then
+    if ((virtual_nodes == 0)); then
         SERVERLESS_MODE="Standard"
-    elif (( standard_nodes == 0 )); then
+    elif ((standard_nodes == 0)); then
         SERVERLESS_MODE="Serverless"
     else
         SERVERLESS_MODE="Hybrid"
     fi
-    log_info "K8S服务模式识别: ${SERVERLESS_MODE}; Serverless调度域:${virtual_nodes}; 标准节点:${standard_nodes}"
+    STANDARD_NODE_COUNT=$standard_nodes
+    log_info "K8S服务模式识别: ${SERVERLESS_MODE}; Serverless虚拟节点:${virtual_nodes}; 标准节点:${standard_nodes}"
 }
 
-run_serverless_availability_checks() {
-    local serverless_script="${MAIN_SCRIPT_DIR}/k8sServerlessAvailCheck.sh"
-    [[ -x "$serverless_script" || -f "$serverless_script" ]] || {
-        log_error "未找到Serverless专项检查脚本: ${serverless_script}"
+get_standard_node_names() {
+    if [[ "$SERVERLESS_MODE" == "Hybrid" ]]; then
+        printf '%s\n' "${STANDARD_NODES[@]}"
+    else
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+    fi
+}
+
+count_ready_standard_nodes() {
+    local node ready unsched count=0
+    for node in $(get_standard_node_names); do
+        ready=$(kubectl get node "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+        unsched=$(kubectl get node "$node" -o jsonpath='{.spec.unschedulable}' 2>/dev/null)
+        [[ "$ready" == True && "$unsched" != true ]] && ((count++))
+    done
+    printf '%s\n' "$count"
+}
+
+serverless_make_probe_id() {
+    local kind="$1" scope="$2" kind_safe scope_hash suffix
+    kind_safe="$(printf '%s' "$kind" | tr -c 'a-z0-9-' '-')"
+    scope_hash="$(printf '%s' "$scope" | cksum | awk '{print $1}')"
+    suffix="${PROBE_ID_SUFFIX:-$(date +'%H%M%S')-$$}"
+    printf 'sl-%s-%s-%s\n' "$kind_safe" "$scope_hash" "$suffix"
+}
+
+serverless_build_tolerations() {
+    local domain_record="$1" indent="${2:-2}" node vendor zone subnet taint key="" pad
+    IFS='|' read -r node vendor zone subnet taint <<<"$domain_record"
+    case "$vendor" in
+    tencent) key="eks.tke.cloud.tencent.com/eklet" ;;
+    alibaba)
+        if kubectl get node "$node" -o jsonpath='{.spec.taints[?(@.key=="virtual-kubelet.io/provider")].effect}' 2>/dev/null | grep -qx NoSchedule; then
+            key="virtual-kubelet.io/provider"
+        fi
+        ;;
+    esac
+    [[ -n "$key" ]] || return 0
+    printf -v pad '%*s' "$indent" ''
+    printf '%stolerations:\n%s- key: %s\n%s  operator: Exists\n%s  effect: NoSchedule\n' "$pad" "$pad" "$key" "$pad" "$pad"
+}
+
+serverless_record_result() {
+    local name="$1" status="$2" detail="${3:-}"
+    case "$status" in
+    PASS) log_success "$detail" ;;
+    WARN) log_warning "$detail" ;;
+    FAIL) log_error "$detail" ;;
+    SKIP) log_info "跳过：${detail}" ;;
+    *) log_info "${status}: ${detail}" ;;
+    esac
+    record_result "$name" "$status" "$detail"
+}
+
+serverless_log_wait_progress() {
+    local resource="$1" state="$2" elapsed="$3" timeout="$4"
+    log_info "等待${resource}就绪：当前状态=${state:-未创建}，已等待${elapsed}/${timeout}秒"
+}
+
+serverless_check_domain_health() {
+    local record="$1" node vendor zone subnet taint state ready network unsched ips
+    IFS='|' read -r node vendor zone subnet taint <<<"$record"
+    state=$(kubectl get node "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="NetworkUnavailable")].status}|{.spec.unschedulable}' 2>/dev/null)
+    IFS='|' read -r ready network unsched <<<"$state"
+    [[ "$ready" == True && "$network" == False && "$unsched" != true ]] || {
+        serverless_record_result "Serverless/虚拟节点健康(${node})" "FAIL" "Ready/网络/Cordon门槛未通过"
         return 1
     }
-    log_info "进入${SERVERLESS_MODE} Serverless专项检查：跳过NodePort、宿主机网络和标准节点池契约，使用固定虚拟节点调度域验证"
-    NAMESPACE="$NAMESPACE" \
-        APP_CONFIG_FILE="$APP_CONFIG_FILE" \
-        SERVERLESS_NETWORK_TARGET="${SERVERLESS_NETWORK_TARGET:-}" \
-        SERVERLESS_PROBE_IMAGE="${SERVERLESS_PROBE_IMAGE:-}" \
-        bash "$serverless_script"
+    if [[ "$vendor" == tencent ]]; then
+        ips=$(kubectl get node "$node" -o jsonpath='{.metadata.labels.eks\.tke\.cloud\.tencent\.com/available-ip-count}' 2>/dev/null)
+        [[ "$ips" =~ ^[1-9][0-9]*$ ]] || {
+            serverless_record_result "Serverless/虚拟节点健康(${node})" "FAIL" "腾讯EKlet子网可用IP不足或缺失: ${ips:-空}"
+            return 1
+        }
+    fi
+    serverless_record_result "Serverless/虚拟节点健康(${node})" "PASS" "zone=${zone:-未知}; subnet=${subnet:-不适用}; 调度前置通过"
+}
+
+TENCENT_IMC_STATUS="missing"
+TENCENT_IMC_DETAIL=""
+inspect_tencent_imc_operator() {
+    local imc_deploy
+    TENCENT_IMC_STATUS="missing"
+    TENCENT_IMC_DETAIL="未检测到imc-operator插件"
+    imc_deploy=$(kubectl get deployment -n kube-system --no-headers 2>/dev/null | awk 'tolower($1) ~ /imc/ {print $1; exit}')
+    [[ -n "$imc_deploy" ]] || return 1
+    if [[ "$(kubectl get deployment -n kube-system "$imc_deploy" -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null)" == "True" ]]; then
+        TENCENT_IMC_STATUS="available"
+        TENCENT_IMC_DETAIL="imc-operator插件运行正常 (deployment: ${imc_deploy})"
+        return 0
+    fi
+    TENCENT_IMC_STATUS="unavailable"
+    TENCENT_IMC_DETAIL="imc-operator插件状态异常 (deployment: ${imc_deploy})"
+    return 1
+}
+
+serverless_check_platform_features() {
+    case "$cloud_platform" in
+    tencent)
+        if inspect_tencent_imc_operator; then
+            serverless_record_result "Serverless/腾讯云平台特性检查" "PASS" "$TENCENT_IMC_DETAIL"
+        else
+            serverless_record_result "Serverless/腾讯云平台特性检查" "WARN" "${TENCENT_IMC_DETAIL}；腾讯云生产环境建议安装并确保Available=True"
+        fi
+        ;;
+    aws)
+        serverless_record_result "Serverless/AWS平台特性检查" "SKIP" "Serverless 模式不执行节点组创建或检查流程"
+        ;;
+    *) serverless_record_result "Serverless/平台特性检查" "SKIP" "${cloud_platform} 无额外 Serverless 平台检查项" ;;
+    esac
+}
+
+serverless_wait_for_pod_ready() {
+    local selector="$1" pod phase pvc_phase pvc_name waiting_reason pod_desc started=$SECONDS elapsed=0 last_report=-30 deadline=$((SECONDS + PROBE_TIMEOUT))
+    SERVERLESS_READY_POD=""
+    SERVERLESS_WAIT_REASON=""
+    while ((SECONDS < deadline)); do
+        pod="$(kubectl get pod -n "$NAMESPACE" -l "$selector" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+        phase="$(kubectl get pod -n "$NAMESPACE" -l "$selector" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)"
+        if [[ "$selector" == storage-probe=* ]]; then
+            pvc_name="${selector#storage-probe=}"
+            pvc_phase="$(kubectl get pvc -n "$NAMESPACE" "$pvc_name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+            phase="Pod:${phase:-未创建}; PVC:${pvc_phase:-未创建}"
+        fi
+        if [[ -n "$pod" ]] && kubectl get pod -n "$NAMESPACE" "$pod" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null | grep -qx true; then
+            SERVERLESS_READY_POD="$pod"
+            return 0
+        fi
+        if [[ -n "$pod" ]]; then
+            waiting_reason="$(kubectl get pod -n "$NAMESPACE" "$pod" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)"
+            case "$waiting_reason" in
+            ErrImagePull | ImagePullBackOff)
+                SERVERLESS_WAIT_REASON="image-pull-failed"
+                log_error "$IMAGE_PULL_FAIL_HINT"
+                break
+                ;;
+            CrashLoopBackOff | CreateContainerConfigError | CreateContainerError | RunContainerError)
+                SERVERLESS_WAIT_REASON="container-start-failed"
+                break
+                ;;
+            esac
+        fi
+        elapsed=$((SECONDS - started))
+        if ((elapsed == 0 || elapsed - last_report >= 30)); then
+            serverless_log_wait_progress "探测Pod(${selector})" "${phase:-未创建}" "$elapsed" "$PROBE_TIMEOUT"
+            last_report=$elapsed
+        fi
+        sleep 3
+    done
+    _ensure_artifact_dir
+    kubectl get pod -n "$NAMESPACE" -l "$selector" -o yaml >"$ARTIFACT_DIR/${selector//[=,]/_}-pods.yaml" 2>/dev/null || true
+    if [[ -n "${pod:-}" ]]; then
+        pod_desc="$(kubectl describe pod -n "$NAMESPACE" "$pod" 2>&1 || true)"
+        printf '%s\n' "$pod_desc" >"$ARTIFACT_DIR/${pod}.describe.txt"
+        if [[ -z "$SERVERLESS_WAIT_REASON" ]]; then
+            if grep -qiE 'FailedMount|FailedAttachVolume' <<<"$pod_desc"; then
+                SERVERLESS_WAIT_REASON="mount-failed"
+            else
+                SERVERLESS_WAIT_REASON="$(_classify_probe_failure "$waiting_reason" "$pod_desc")"
+            fi
+        fi
+    fi
+    [[ -n "$SERVERLESS_WAIT_REASON" ]] || SERVERLESS_WAIT_REASON="timeout-unknown"
+    log_info "等待探测 Pod 就绪失败（最后状态: ${phase:-未创建}；原因=${SERVERLESS_WAIT_REASON}）"
+    return 1
+}
+
+serverless_probe_clusterip_service() {
+    local pod="$1" service_host="$2"
+    kubectl exec -n "$NAMESPACE" "$pod" -- sh -c '
+if command -v wget >/dev/null 2>&1; then
+    exec wget -S -T 10 -O /dev/null "$1"
+elif command -v curl >/dev/null 2>&1; then
+    exec curl -fsS --connect-timeout 10 -o /dev/null "$1"
+fi
+printf "PROBE_CLIENT_MISSING: neither wget nor curl exists in probe image\\n" >&2
+exit 127
+' sh "http://${service_host}"
+}
+
+serverless_capture_clusterip_diagnostics() {
+    local pod="$1" service_host="$2" probe_output="$3" diagnostic_file
+    _ensure_artifact_dir
+    diagnostic_file="$ARTIFACT_DIR/clusterip-${PROBE_NAME}.diagnostics.txt"
+    {
+        printf '=== ClusterIP probe target ===\n%s\n\n' "$service_host"
+        printf '=== Probe command output ===\n%s\n\n' "$probe_output"
+        printf '=== Service ===\n'
+        kubectl get service -n "$NAMESPACE" "$PROBE_NAME" -o yaml 2>&1
+        printf '\n=== EndpointSlice ===\n'
+        kubectl get endpointslice -n "$NAMESPACE" -l "kubernetes.io/service-name=${PROBE_NAME}" -o yaml 2>&1
+        printf '\n=== Endpoints (compatibility API) ===\n'
+        kubectl get endpoints -n "$NAMESPACE" "$PROBE_NAME" -o yaml 2>&1
+        printf '\n=== Probe Pod ===\n'
+        kubectl get pod -n "$NAMESPACE" "$pod" -o yaml 2>&1
+    } >"$diagnostic_file"
+    printf '%s' "$diagnostic_file"
+}
+
+serverless_apply_network_probe() {
+    local domain_record="$1" node vendor zone subnet taint toleration_yaml manifest host_aliases
+    IFS='|' read -r node vendor zone subnet taint <<<"$domain_record"
+    PROBE_NAME="$(serverless_make_probe_id net "$node")"
+    manifest="$ARTIFACT_DIR/${PROBE_NAME}.yaml"
+    toleration_yaml="$(serverless_build_tolerations "$domain_record" 6)"
+    host_aliases=$(build_probe_host_aliases)
+    _ensure_artifact_dir
+    cat >"$manifest" <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${PROBE_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: serverless-avail-probe
+    probe-run: ${PROBE_RUN_LABEL}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: serverless-avail-probe
+      probe: ${PROBE_NAME}
+  template:
+    metadata:
+      labels:
+        app: serverless-avail-probe
+        probe: ${PROBE_NAME}
+        probe-run: ${PROBE_RUN_LABEL}
+    spec:
+${host_aliases}
+      nodeSelector:
+        kubernetes.io/hostname: ${node}
+${toleration_yaml}
+      containers:
+      - name: nginx-probe
+        image: ${SERVERLESS_PROBE_IMAGE}
+        ports:
+        - containerPort: 80
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 3
+          periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${PROBE_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: serverless-avail-probe
+    probe-run: ${PROBE_RUN_LABEL}
+spec:
+  type: ClusterIP
+  selector:
+    app: serverless-avail-probe
+    probe: ${PROBE_NAME}
+  ports:
+  - port: 80
+    targetPort: 80
+EOF
+    kubectl apply -f "$manifest" >/dev/null
+}
+
+serverless_check_network_readiness() {
+    local domain_record="$1" node vendor zone subnet taint pod service_host mysql_target service_probe_output diagnostic_file
+    local mysql_total=0 mysql_fail=0 old_pod_name="${POD_NAME:-}"
+    IFS='|' read -r node vendor zone subnet taint <<<"$domain_record"
+    log_info "创建指定Serverless虚拟节点探测Deployment与ClusterIP Service，目标节点=${node}"
+    if ! serverless_apply_network_probe "$domain_record" || ! serverless_wait_for_pod_ready "probe=${PROBE_NAME}"; then
+        serverless_record_result "Serverless/指定虚拟节点Pod部署启动(${node})" "FAIL" "指定Serverless虚拟节点的探测 Pod 未就绪"
+        return 1
+    fi
+    pod="$SERVERLESS_READY_POD"
+    serverless_record_result "Serverless/指定虚拟节点Pod部署启动(${node})" "PASS" "指定Serverless虚拟节点探测Pod已就绪"
+    log_step "Serverless Pod访问ClusterIP Service检查(${node})"
+    service_host="${PROBE_NAME}.${NAMESPACE}.svc"
+    if service_probe_output="$(serverless_probe_clusterip_service "$pod" "$service_host" 2>&1)"; then
+        serverless_record_result "Serverless/Pod访问集群Service网络(${node})" "PASS" "Pod 可访问 ClusterIP Service"
+    else
+        diagnostic_file="$(serverless_capture_clusterip_diagnostics "$pod" "$service_host" "$service_probe_output")"
+        if grep -qF 'PROBE_CLIENT_MISSING' <<<"$service_probe_output"; then
+            serverless_record_result "Serverless/Pod访问集群Service网络(${node})" "WARN" "探测镜像缺少 wget/curl，未对 ClusterIP 数据面作失败结论；诊断: ${diagnostic_file}"
+        else
+            serverless_record_result "Serverless/Pod访问集群Service网络(${node})" "FAIL" "Pod 无法访问 ClusterIP Service；诊断: ${diagnostic_file}"
+        fi
+    fi
+    log_step "Serverless Pod访问MySQL网络检查(${node})"
+    if parse_mysql_targets; then
+        POD_NAME="$pod"
+        for mysql_target in "${MYSQL_PROBE_TARGETS[@]}"; do
+            ((mysql_total += 1))
+            test_pod_to_mysql_connectivity "$mysql_target" "serverless-${node}" || ((mysql_fail += 1))
+        done
+        POD_NAME="$old_pod_name"
+        if [[ $mysql_fail -eq 0 ]]; then
+            serverless_record_result "Serverless/Pod访问MySQL网络(${node})" "PASS" "${mysql_total}个MySQL目标均可TCP连通: ${MYSQL_PROBE_TARGETS[*]}；配置来源=${MYSQL_CONFIG_SELECTED}"
+        else
+            serverless_record_result "Serverless/Pod访问MySQL网络(${node})" "FAIL" "${mysql_fail}/${mysql_total}个MySQL目标无法TCP连通；配置来源=${MYSQL_CONFIG_SELECTED}"
+        fi
+    else
+        POD_NAME="$old_pod_name"
+        serverless_record_result "Serverless/Pod访问MySQL网络(${node})" "FAIL" "MySQL JDBC探测目标解析失败: ${MYSQL_PARSE_ERROR}"
+    fi
+}
+
+serverless_ensure_storageclass() {
+    local storage_class="$1" ensure_rc
+    case "$storage_class" in
+    te-disk)
+        if ensure_storageclass "$cloud_platform"; then
+            serverless_record_result "Serverless/StorageClass就绪检查(te-disk)" "PASS" "te-disk已按${cloud_platform}平台策略就绪"
+            return 0
+        else
+            ensure_rc=$?
+        fi
+        if [[ $ensure_rc -eq 2 ]]; then
+            serverless_record_result "Serverless/StorageClass就绪检查(te-disk)" "SKIP" "管理员未授权初始化te-disk；已保持原StorageClass不变"
+            return 2
+        fi
+        serverless_record_result "Serverless/StorageClass就绪检查(te-disk)" "FAIL" "te-disk未按${cloud_platform}平台策略就绪"
+        return 1
+        ;;
+    te-nfs)
+        if ensure_nfs_storageclass "$cloud_platform" "Serverless/"; then
+            serverless_record_result "Serverless/StorageClass就绪检查(te-nfs)" "PASS" "te-nfs已按${cloud_platform}平台策略就绪"
+            return 0
+        fi
+        return 1
+        ;;
+    esac
+    serverless_record_result "Serverless/StorageClass就绪检查(${storage_class})" "FAIL" "不支持的StorageClass检查目标"
+    return 1
+}
+
+serverless_wait_reason_detail() {
+    case "$SERVERLESS_WAIT_REASON" in
+    image-pull-failed) printf '%s' "探测镜像拉取失败，存储端到端未完成验证" ;;
+    container-start-failed) printf '%s' "探测容器启动失败，存储端到端未完成验证" ;;
+    scheduling-failed | no-nodepool) printf '%s' "探测Pod无法调度到目标Serverless虚拟节点" ;;
+    mount-failed) printf '%s' "PVC已供给但卷挂载失败" ;;
+    *) printf '%s' "PVC供给、挂载或Pod就绪超时" ;;
+    esac
+}
+
+serverless_verify_storage_e2e() {
+    local storage_class="$1" access_mode="$2" domain_record="$3" node vendor zone subnet taint toleration_yaml pvc_name pod_name manifest marker
+    IFS='|' read -r node vendor zone subnet taint <<<"$domain_record"
+    case "$storage_class" in
+    te-disk) pvc_name="$DISK_PVC" ;;
+    te-nfs) pvc_name="$NFS_PVC" ;;
+    *) return 1 ;;
+    esac
+    pod_name="${pvc_name}-pod"
+    manifest="$ARTIFACT_DIR/${pvc_name}.yaml"
+    marker="serverless-ready-${RUN_TS}"
+    toleration_yaml="$(serverless_build_tolerations "$domain_record" 2)"
+    _ensure_artifact_dir
+    cat >"$manifest" <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${pvc_name}
+  namespace: ${NAMESPACE}
+  labels:
+    app: serverless-avail-probe
+    probe-run: ${PROBE_RUN_LABEL}
+spec:
+  accessModes:
+  - ${access_mode}
+  storageClassName: ${storage_class}
+  resources:
+    requests:
+      storage: ${E2E_PVC_SIZE}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod_name}
+  namespace: ${NAMESPACE}
+  labels:
+    app: serverless-avail-probe
+    storage-probe: ${pvc_name}
+    probe-run: ${PROBE_RUN_LABEL}
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: ${node}
+${toleration_yaml}
+  containers:
+  - name: storage-probe
+    image: ${SERVERLESS_PROBE_IMAGE}
+    command: ["sh", "-c", "echo ${marker} > /data/ready && test \"\$(cat /data/ready)\" = \"${marker}\" && sleep 3600"]
+    volumeMounts:
+    - name: storage
+      mountPath: /data
+  volumes:
+  - name: storage
+    persistentVolumeClaim:
+      claimName: ${pvc_name}
+EOF
+    if ! kubectl apply -f "$manifest" >/dev/null || ! serverless_wait_for_pod_ready "storage-probe=${pvc_name}"; then
+        _storage_e2e_capture_diagnostics "$pvc_name" "serverless-${storage_class}-${node}" "$pod_name"
+        serverless_record_result "Serverless/端到端存储验证(${storage_class}, ${access_mode}, ${node})" "FAIL" "$(serverless_wait_reason_detail)；详见物料目录"
+        return 1
+    fi
+    if kubectl exec -n "$NAMESPACE" "$pod_name" -- cat /data/ready 2>/dev/null | grep -qx "$marker"; then
+        serverless_record_result "Serverless/端到端存储验证(${storage_class}, ${access_mode}, ${node})" "PASS" "PVC 动态供给、挂载和读写成功"
+        return 0
+    fi
+    serverless_record_result "Serverless/端到端存储验证(${storage_class}, ${access_mode}, ${node})" "FAIL" "挂载目录读写校验失败"
+    return 1
+}
+
+serverless_verify_rwx_same_domain() {
+    local domain_record="$1" node vendor zone subnet taint toleration_yaml pvc_name writer_name reader_name manifest marker
+    IFS='|' read -r node vendor zone subnet taint <<<"$domain_record"
+    pvc_name="$(serverless_make_probe_id nfs-shared "$node")"
+    writer_name="${pvc_name}-writer"
+    reader_name="${pvc_name}-reader"
+    manifest="$ARTIFACT_DIR/${pvc_name}.yaml"
+    marker="serverless-same-domain-${RUN_TS}"
+    toleration_yaml="$(serverless_build_tolerations "$domain_record" 2)"
+    _ensure_artifact_dir
+    cat >"$manifest" <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${pvc_name}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${PROBE_LABEL}
+    probe-run: ${PROBE_RUN_LABEL}
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: te-nfs
+  resources:
+    requests:
+      storage: ${E2E_PVC_SIZE}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${writer_name}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${PROBE_LABEL}
+    rwx-probe: ${pvc_name}
+    role: writer
+    probe-run: ${PROBE_RUN_LABEL}
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: ${node}
+${toleration_yaml}
+  containers:
+  - name: writer
+    image: ${SERVERLESS_PROBE_IMAGE}
+    command: ["sh", "-c", "echo ${marker} > /data/marker && sleep 3600"]
+    volumeMounts: [{name: storage, mountPath: /data}]
+  volumes: [{name: storage, persistentVolumeClaim: {claimName: ${pvc_name}}}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${reader_name}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${PROBE_LABEL}
+    rwx-probe: ${pvc_name}
+    role: reader
+    probe-run: ${PROBE_RUN_LABEL}
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: ${node}
+${toleration_yaml}
+  containers:
+  - name: reader
+    image: ${SERVERLESS_PROBE_IMAGE}
+    command: ["sh", "-c", "sleep 3600"]
+    volumeMounts: [{name: storage, mountPath: /data}]
+  volumes: [{name: storage, persistentVolumeClaim: {claimName: ${pvc_name}}}]
+EOF
+    if kubectl apply -f "$manifest" >/dev/null && serverless_wait_for_pod_ready "rwx-probe=${pvc_name},role=writer" && serverless_wait_for_pod_ready "rwx-probe=${pvc_name},role=reader" && kubectl exec -n "$NAMESPACE" "$reader_name" -- cat /data/marker 2>/dev/null | grep -qx "$marker"; then
+        serverless_record_result "Serverless/同一虚拟节点RWX共享(${node})" "PASS" "两个 Pod 已通过同一 te-nfs PVC 共享读写"
+        return 0
+    fi
+    serverless_record_result "Serverless/同一虚拟节点RWX共享(${node})" "FAIL" "两个 Pod 未能通过同一 te-nfs PVC 共享读写"
+    return 1
+}
+
+serverless_verify_rwx_cross_domain() {
+    local writer_record="$1" reader_record="$2" writer writer_vendor _ reader reader_vendor cross_pvc manifest marker writer_tolerations reader_tolerations
+    IFS='|' read -r writer writer_vendor _ <<<"$writer_record"
+    IFS='|' read -r reader reader_vendor _ <<<"$reader_record"
+    cross_pvc="$(serverless_make_probe_id nfs-cross "${writer}-${reader}")"
+    manifest="$ARTIFACT_DIR/${cross_pvc}.yaml"
+    marker="serverless-cross-${RUN_TS}"
+    writer_tolerations="$(serverless_build_tolerations "$writer_record" 2)"
+    reader_tolerations="$(serverless_build_tolerations "$reader_record" 2)"
+    _ensure_artifact_dir
+    cat >"$manifest" <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${cross_pvc}
+  namespace: ${NAMESPACE}
+  labels: {app: ${PROBE_LABEL}, probe-run: ${PROBE_RUN_LABEL}}
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: te-nfs
+  resources: {requests: {storage: ${E2E_PVC_SIZE}}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: ${cross_pvc}-writer, namespace: ${NAMESPACE}, labels: {app: ${PROBE_LABEL}, probe-run: ${PROBE_RUN_LABEL}, cross-probe: writer}}
+spec:
+  restartPolicy: Never
+  nodeSelector: {kubernetes.io/hostname: ${writer}}
+${writer_tolerations}
+  containers:
+  - name: writer
+    image: ${SERVERLESS_PROBE_IMAGE}
+    command: ["sh", "-c", "echo ${marker} > /data/marker && sleep 3600"]
+    volumeMounts: [{name: storage, mountPath: /data}]
+  volumes: [{name: storage, persistentVolumeClaim: {claimName: ${cross_pvc}}}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: ${cross_pvc}-reader, namespace: ${NAMESPACE}, labels: {app: ${PROBE_LABEL}, probe-run: ${PROBE_RUN_LABEL}, cross-probe: reader}}
+spec:
+  restartPolicy: Never
+  nodeSelector: {kubernetes.io/hostname: ${reader}}
+${reader_tolerations}
+  containers:
+  - name: reader
+    image: ${SERVERLESS_PROBE_IMAGE}
+    command: ["sh", "-c", "sleep 3600"]
+    volumeMounts: [{name: storage, mountPath: /data}]
+  volumes: [{name: storage, persistentVolumeClaim: {claimName: ${cross_pvc}}}]
+EOF
+    if kubectl apply -f "$manifest" >/dev/null && serverless_wait_for_pod_ready "cross-probe=writer" && serverless_wait_for_pod_ready "cross-probe=reader" && kubectl exec -n "$NAMESPACE" "${cross_pvc}-reader" -- cat /data/marker 2>/dev/null | grep -qx "$marker"; then
+        serverless_record_result "Serverless/跨虚拟节点RWX共享" "PASS" "${writer} -> ${reader} 共享读写成功"
+        return 0
+    fi
+    serverless_record_result "Serverless/跨虚拟节点RWX共享" "FAIL" "${writer} -> ${reader} RWX共享读写失败"
+    return 1
+}
+
+cleanup_serverless_resources() {
+    local record_outcome="${1:-true}" failed=0 pvc selector="app=${PROBE_LABEL},probe-run=${PROBE_RUN_LABEL}"
+    local pvc_names
+    pvc_names=$(kubectl get pvc -n "$NAMESPACE" -l "$selector" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+    kubectl delete deployment -n "$NAMESPACE" -l "$selector" --ignore-not-found --wait=false >/dev/null 2>&1 || failed=1
+    kubectl delete service -n "$NAMESPACE" -l "$selector" --ignore-not-found --wait=false >/dev/null 2>&1 || failed=1
+    kubectl delete pod -n "$NAMESPACE" -l "$selector" --force --grace-period=0 --ignore-not-found >/dev/null 2>&1 || failed=1
+    for pvc in $pvc_names; do
+        _storage_e2e_cleanup "$pvc" || failed=1
+    done
+    [[ "$record_outcome" == true ]] || return "$failed"
+    if [[ $failed -eq 0 ]]; then
+        serverless_record_result "Serverless/临时资源回收" "PASS" "本轮Deployment、Service、Pod、PVC及绑定PV已回收"
+    else
+        serverless_record_result "Serverless/临时资源回收" "FAIL" "部分临时资源或绑定PV回收失败，请按probe-run=${PROBE_RUN_LABEL}复核"
+    fi
+}
+
+run_serverless_checks_inline() {
+    local domain_record domain_node nfs_base_ok disk_ready=0 nfs_ready=0
+    READY_SERVERLESS_DOMAINS=()
+    log_step "Serverless云平台特性检查"
+    serverless_check_platform_features
+    log_step "Serverless块存储StorageClass就绪检查(te-disk)"
+    serverless_ensure_storageclass te-disk && disk_ready=1
+    log_step "Serverless网络存储StorageClass就绪检查(te-nfs)"
+    serverless_ensure_storageclass te-nfs && nfs_ready=1
+    for domain_record in "${SERVERLESS_DOMAINS[@]}"; do
+        IFS='|' read -r domain_node _ <<<"$domain_record"
+        log_step "Serverless虚拟节点健康检查(${domain_node})"
+        serverless_check_domain_health "$domain_record" || continue
+        READY_SERVERLESS_DOMAINS+=("$domain_record")
+        log_step "Serverless指定虚拟节点Pod与网络检查(${domain_node})"
+        serverless_check_network_readiness "$domain_record" || true
+        DISK_PVC="$(serverless_make_probe_id disk "$domain_node")"
+        NFS_PVC="$(serverless_make_probe_id nfs "$domain_node")"
+        if [[ $disk_ready -eq 1 ]]; then
+            log_step "Serverless端到端存储验证(te-disk, ${domain_node})"
+            serverless_verify_storage_e2e "te-disk" "ReadWriteOnce" "$domain_record" || true
+        else
+            serverless_record_result "Serverless/端到端存储验证(te-disk, ReadWriteOnce, ${domain_node})" "SKIP" "te-disk StorageClass未就绪"
+        fi
+        if [[ $nfs_ready -eq 1 ]]; then
+            nfs_base_ok=0
+            log_step "Serverless端到端存储验证(te-nfs, ${domain_node})"
+            serverless_verify_storage_e2e "te-nfs" "ReadWriteMany" "$domain_record" && nfs_base_ok=1
+            if [[ $nfs_base_ok -eq 1 ]]; then
+                log_step "Serverless同一虚拟节点双Pod RWX共享(${domain_node})"
+                serverless_verify_rwx_same_domain "$domain_record" || true
+            else
+                serverless_record_result "Serverless/同一虚拟节点RWX共享(${domain_node})" "SKIP" "te-nfs RWX基础验证未通过"
+            fi
+        else
+            serverless_record_result "Serverless/端到端存储验证(te-nfs, ReadWriteMany, ${domain_node})" "SKIP" "te-nfs StorageClass未就绪"
+            serverless_record_result "Serverless/同一虚拟节点RWX共享(${domain_node})" "SKIP" "te-nfs StorageClass未就绪"
+        fi
+    done
+    if ((${#READY_SERVERLESS_DOMAINS[@]} >= 2)); then
+        log_step "Serverless跨虚拟节点RWX共享检查"
+        if [[ $nfs_ready -eq 1 ]]; then
+            serverless_verify_rwx_cross_domain "${READY_SERVERLESS_DOMAINS[0]}" "${READY_SERVERLESS_DOMAINS[1]}" || true
+        else
+            serverless_record_result "Serverless/跨虚拟节点RWX共享" "SKIP" "te-nfs StorageClass未就绪"
+        fi
+    else
+        log_step "Serverless跨虚拟节点RWX共享检查"
+        serverless_record_result "Serverless/跨虚拟节点RWX共享" "SKIP" "少于两个通过健康门槛的Serverless虚拟节点"
+    fi
+    log_step "Serverless临时资源回收"
+    cleanup_serverless_resources
 }
 
 # ==================== 内置K8S节点标签统一 ====================
@@ -2764,6 +3484,27 @@ reconcile_huawei_te_disk() {
 }
 
 # ==================== StorageClass 确保函数 ====================
+TE_DISK_REINIT_CONFIRM_TIMEOUT="${TE_DISK_REINIT_CONFIRM_TIMEOUT:-300}"
+
+_confirm_te_disk_reinitialize() {
+    local confirm="" input_path="${TE_DISK_CONFIRM_INPUT_PATH:-/dev/tty}" output_path="${TE_DISK_CONFIRM_OUTPUT_PATH:-/dev/tty}"
+    if [[ ! -r "$input_path" ]]; then
+        log_warning "当前为非交互式运行，已保持原StorageClass不变，不会重新初始化te-disk"
+        return 2
+    fi
+
+    printf "%b" "\e[33m\e[1m是否重新初始化默认SC为 te-disk? 输入 y 确认（${TE_DISK_REINIT_CONFIRM_TIMEOUT}秒超时，其他输入保持原SC）: \e[0m" >"$output_path" 2>/dev/null || true
+    if ! read -r -t "$TE_DISK_REINIT_CONFIRM_TIMEOUT" confirm <"$input_path"; then
+        log_warning "${TE_DISK_REINIT_CONFIRM_TIMEOUT}秒内未收到确认，已保持原StorageClass不变，不会重新初始化te-disk"
+        return 2
+    fi
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        log_warning "未输入Y确认，已保持原StorageClass不变，不会重新初始化te-disk"
+        return 2
+    fi
+    return 0
+}
+
 ensure_storageclass() {
     local cloud_platform="$1"
     log_step "块存储StorageClass就绪检查（te-disk）"
@@ -2808,19 +3549,13 @@ ensure_storageclass() {
         if [[ -n "$te_prefixed_sc" ]]; then
             local te_list=$(echo "$te_prefixed_sc" | tr '\n' ' ')
             log_warning "检测到已有 te- 开头(非 te-disk)的默认StorageClass: ${te_list}—— 该SC可能正被存量业务PVC使用，重新初始化将摘除其default注解并改为 te-disk"
-            local confirm=""
-            if [[ -r /dev/tty ]]; then
-                printf "%b" "\e[33m\e[1m是否重新初始化默认SC为 te-disk? 输入 y 确认, 其它任意键保留现有默认SC: \e[0m" >/dev/tty
-                read -r confirm </dev/tty
+            if _confirm_te_disk_reinitialize; then
+                log_info "用户确认重新初始化默认SC为 te-disk"
             else
-                log_warning "当前为非交互式运行(无 /dev/tty)，无法确认，按安全默认【保留现有默认SC】，不重新初始化"
-            fi
-            if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-                log_info "用户选择保留现有默认StorageClass(${te_list})，跳过 te-disk 初始化"
+                local confirm_rc=$?
                 record_result "块存储StorageClass就绪检查(保留现有默认SC)" "WARN" "保留现有默认SC(${te_list})，未统一为 te-disk，请确认其与业务匹配"
-                return 0
+                return "$confirm_rc"
             fi
-            log_info "用户确认重新初始化默认SC为 te-disk"
         fi
         # 摘除现有所有默认SC的default注解, 统一让位 te-disk
         for sc_name in $existing_default_sc; do
@@ -3069,7 +3804,7 @@ huawei_te_nfs_replace_after_confirmation() {
         log_error "删除旧 te-nfs 失败；未修改PV/PVC/Pod，旧SC备份保留在 ${backup}"
         return 1
     fi
-    if ! cat <<EOF_HUAWEI_NFS | kubectl apply -f -
+    if ! cat <<EOF_HUAWEI_NFS | kubectl apply -f -; then
 allowVolumeExpansion: true
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -3086,7 +3821,6 @@ provisioner: everest-csi-provisioner
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
 EOF_HUAWEI_NFS
-    then
         capture_huawei_csi_nas_diagnostics error
         log_error "创建标准 te-nfs 失败；未修改PV/PVC/Pod。请使用 ${backup} 手动恢复旧StorageClass"
         return 1
@@ -3118,8 +3852,17 @@ get_gce_primary_network() {
     printf '%s\n' "$network_name"
 }
 
+record_storageclass_result() {
+    local prefix="$1" name="$2" status="$3" detail="$4"
+    if [[ "$prefix" == "Serverless/" ]]; then
+        serverless_record_result "${prefix}${name}" "$status" "$detail"
+    else
+        record_result "${prefix}${name}" "$status" "$detail"
+    fi
+}
+
 ensure_nfs_storageclass() {
-    local cloud_platform="$1"
+    local cloud_platform="$1" result_prefix="${2:-}"
     log_step "网络存储StorageClass就绪检查(te-nfs)"
 
     if [[ "$cloud_platform" == *huawei* ]]; then
@@ -3127,7 +3870,7 @@ ensure_nfs_storageclass() {
             capture_huawei_csi_nas_diagnostics
             log_error "华为CCE文件存储前置检查失败: ${HUAWEI_CCE_VPC_ID_ERROR}"
             log_error "请修复csi-nas后重试；若云管理员已确认集群VPC ID，可使用: HUAWEI_CCE_VPC_ID='<vpc-uuid>' bash k8sAvailCheck.sh"
-            record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "无法取得可信VPC ID，未创建或使用te-nfs；详见csi-nas诊断物料"
+            record_storageclass_result "$result_prefix" "网络存储SC就绪检查(te-nfs)" "FAIL" "无法取得可信VPC ID，未创建或使用te-nfs；详见csi-nas诊断物料"
             return 1
         fi
         if [[ "$HUAWEI_CCE_VPC_ID_SOURCE" == "manual" ]]; then
@@ -3156,7 +3899,7 @@ ensure_nfs_storageclass() {
                 if huawei_te_nfs_replace_after_confirmation; then
                     return 0
                 fi
-                record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "te-nfs 不符合CCE文件存储规范；未获完整yes确认或替换失败，已保留PV/PVC/Pod"
+                record_storageclass_result "$result_prefix" "网络存储SC就绪检查(te-nfs)" "FAIL" "te-nfs 不符合CCE文件存储规范；未获完整yes确认或替换失败，已保留PV/PVC/Pod"
                 return 1
             fi
             log_success "te-nfs VPC授权校验通过(csi-nas)"
@@ -3168,7 +3911,7 @@ ensure_nfs_storageclass() {
     if [[ "$cloud_platform" == *aws* ]]; then
         _aws_mark_storage_repair_needed "缺少te-nfs StorageClass"
         log_error "未发现te-nfs；AWS标准检查阶段不自动创建EFS，将在结果总览后提供storage_ready_for_existing_eks.sh入口"
-        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现te-nfs；总览后可选择执行AWS存储准备脚本"
+        record_storageclass_result "$result_prefix" "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现te-nfs；总览后可选择执行AWS存储准备脚本"
         return 1
     fi
 
@@ -3192,7 +3935,7 @@ reclaimPolicy: Retain
 volumeBindingMode: Immediate
 --------------------------------------------------------------------------------------------------
 EOF
-        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现 te-nfs，阿里ACK 需控制台创建 NAS 后重试，已打印模版"
+        record_storageclass_result "$result_prefix" "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现 te-nfs，阿里ACK 需控制台创建 NAS 后重试，已打印模版"
         return 1
         ;;
     *tencent*)
@@ -3216,7 +3959,7 @@ reclaimPolicy: Retain
 volumeBindingMode: Immediate
 ------------------------------------------------------------------------------------------------------
 EOF
-        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现 te-nfs，腾讯TKE 需控制台创建 CFS 后重试，已打印模版"
+        record_storageclass_result "$result_prefix" "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现 te-nfs，腾讯TKE 需控制台创建 CFS 后重试，已打印模版"
         return 1
         ;;
     *volc*)
@@ -3242,7 +3985,7 @@ reclaimPolicy: Retain
 volumeBindingMode: Immediate
 ------------------------------------------------------------------------------------------------
 EOF
-        record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现 te-nfs，火山VKE 需控制台安装CSI+创建NAS 后重试，已打印模版"
+        record_storageclass_result "$result_prefix" "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现 te-nfs，火山VKE 需控制台安装CSI+创建NAS 后重试，已打印模版"
         return 1
         ;;
     *huawei*)
@@ -3291,7 +4034,7 @@ mountOptions:
 - retrans=3
 --------------------------------------------------------------------------------------------------------
 EOF_GCP_NFS_MANUAL
-            record_result "网络存储SC就绪检查(te-nfs)" "FAIL" "无法从GCE Metadata取得可信network；已打印Google Cloud控制台确认后的手工创建模版"
+            record_storageclass_result "$result_prefix" "网络存储SC就绪检查(te-nfs)" "FAIL" "无法从GCE Metadata取得可信network；已打印Google Cloud控制台确认后的手工创建模版"
             return 1
         fi
 
@@ -3367,7 +4110,8 @@ HISTORICAL_TEST_PV_CONFIRM_TIMEOUT=30
 HISTORICAL_TEST_PV_DELETE_TIMEOUT=60
 HISTORICAL_TEST_PVS=()
 
-# 只识别历史版本留下的固定测试 PVC；不使用宽泛的 Released/te-nfs 条件，避免触及业务卷。
+# 只识别固定Standard测试PVC，或由serverless_make_probe_id生成的精确Serverless测试PVC；
+# 不使用宽泛的 Released/te-nfs 条件，避免触及业务卷。
 historical_test_pv_is_candidate() {
     local pv="$1" data phase claim_ns claim_name storage_class csi_driver provisioner volume_handle sc_provisioner
     data=$(kubectl get pv "$pv" -o jsonpath='{.status.phase}|{.spec.claimRef.namespace}|{.spec.claimRef.name}|{.spec.storageClassName}|{.spec.csi.driver}|{.metadata.annotations.pv\.kubernetes\.io/provisioned-by}|{.spec.csi.volumeHandle}' 2>/dev/null) || return 1
@@ -3376,7 +4120,9 @@ historical_test_pv_is_candidate() {
     [[ "$phase" == Released && "$claim_ns" == debug ]] || return 1
     case "$claim_name" in
     te-csi-check-disk-pvc | te-csi-check-nfs-pvc | te-csi-check-nfs-rwx-pvc) ;;
-    *) return 1 ;;
+    *)
+        [[ "$claim_name" =~ ^sl-(disk|nfs|nfs-shared|nfs-cross)-[0-9]+-[0-9]{6}-[0-9]+$ ]] || return 1
+        ;;
     esac
     [[ "$storage_class" == te-disk || "$storage_class" == te-nfs ]] || return 1
     [[ -n "$csi_driver" && -n "$provisioner" && -n "$volume_handle" ]] || return 1
@@ -3408,7 +4154,7 @@ cleanup_historical_test_pvs() {
         return 0
     fi
 
-    log_warning "发现 ${#HISTORICAL_TEST_PVS[@]} 个历史测试残留PV，候选仅包含 Released/debug/te-csi-check 白名单/CSI 动态卷且PVC已不存在的资源："
+    log_warning "发现 ${#HISTORICAL_TEST_PVS[@]} 个历史测试残留PV，候选仅包含 Released/debug/Standard或Serverless测试命名白名单/CSI动态卷且PVC已不存在的资源："
     for pv in "${HISTORICAL_TEST_PVS[@]}"; do
         historical_test_pv_is_candidate "$pv" || continue
         log_warning "  - ${pv} claim=${HISTORICAL_TEST_PV_CLAIM} sc=${HISTORICAL_TEST_PV_STORAGE_CLASS} driver=${HISTORICAL_TEST_PV_CSI_DRIVER} volumeHandle=${HISTORICAL_TEST_PV_VOLUME_HANDLE}"
@@ -3475,14 +4221,17 @@ cleanup_historical_test_pvs() {
 # 所有正常结束路径都从这里收尾：先处理经严格门槛识别的历史测试 PV，再输出最终总览。
 # 异常退出不调用该函数，避免在脚本中断时扩大删除范围。
 finalize_availability_check() {
-    cleanup_historical_test_pvs || true
+    local scope="${1:-Standard}"
+    case "$scope" in
+    Standard | Serverless | Hybrid) cleanup_historical_test_pvs || true ;;
+    esac
     print_summary
 }
 
 _storage_e2e_cleanup() {
     local pvc="$1"
     shift
-    local pod pv_name elapsed=0 reclaim_timeout=60
+    local pod pv_name elapsed=0 reclaim_timeout="${STORAGE_PV_RECLAIM_TIMEOUT:-180}"
     pv_name=$(kubectl get pvc "$pvc" -n "$NAMESPACE" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
     for pod in "$@"; do
         kubectl delete pod "$pod" -n "$NAMESPACE" --force --grace-period=0 --ignore-not-found &>/dev/null
@@ -3528,10 +4277,24 @@ _storage_e2e_capture_diagnostics() {
 _apply_csi_check_pod() {
     # 参数: pod pvc image role test_label; role=reader 时强制与 writer 分布到不同节点。
     local pod="$1" pvc="$2" image="$3" role="${4:-single}" test_label="${5:-storage-e2e}"
-    local anti_affinity=""
-    if [[ "$role" == "reader" ]]; then
-        anti_affinity="
+    local affinity=""
+    if [[ "$SERVERLESS_MODE" == "Hybrid" ]]; then
+        affinity="
   affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node.k8s.te/nodepool-name
+            operator: Exists"
+    fi
+    if [[ "$role" == "reader" ]]; then
+        if [[ -z "$affinity" ]]; then
+            affinity="
+  affinity:
+"
+        fi
+        affinity="${affinity}
     podAntiAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
       - labelSelector:
@@ -3553,7 +4316,7 @@ metadata:
     app: te-csi-check
     e2e-test: ${test_label}
     e2e-role: ${role}
-spec:${anti_affinity}
+spec:${affinity}
   containers:
   - name: csi-check
     image: ${image}
@@ -3598,6 +4361,14 @@ _wait_for_storage_pod() {
         sleep "$interval"
         ((elapsed += interval))
     done
+    local pod_desc waiting_reason
+    pod_desc=$(kubectl describe pod "$pod" -n "$NAMESPACE" 2>&1 || true)
+    waiting_reason=$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null)
+    if grep -qiE 'FailedMount|FailedAttachVolume' <<<"$pod_desc"; then
+        STORAGE_WAIT_REASON="mount-failed"
+    else
+        STORAGE_WAIT_REASON="$(_classify_probe_failure "$waiting_reason" "$pod_desc")"
+    fi
     return 1
 }
 
@@ -3816,13 +4587,15 @@ _kyverno_image_version() {
     return 1
 }
 
+TA_ADMIN_BIN="${TA_ADMIN_BIN:-/data/app/.admin_manager_ta/ta-admin}"
+
 run_kyverno_reinstall() {
-    /data/app/.admin_manager_ta/ta-admin/ta-admin te_k8s install -name kyverno
+    "$TA_ADMIN_BIN" te_k8s install -name kyverno
 }
 
 check_kyverno_compatibility() {
     local required_k8s="1.34.0" required_kyverno="1.18.0"
-    local reinstall_command='/data/app/.admin_manager_ta/ta-admin/ta-admin te_k8s install -name kyverno'
+    local reinstall_command="${TA_ADMIN_BIN} te_k8s install -name kyverno"
     local server_version image_ref image version versions_display="" needs_reinstall=false unparseable=false
 
     log_step "Kyverno K8S兼容性检查"
@@ -3885,16 +4658,10 @@ check_tencent_cloud_features() {
     echo "当前云平台：腾讯云(TKE)，开始执行特性检查"
 
     log_info "检查imc-operator镜像缓存插件..."
-    local imc_deploy=$(kubectl get deployment -n kube-system --no-headers 2>/dev/null | grep "imc" | awk '{print $1}')
-    if [[ -n "$imc_deploy" ]]; then
-        local imc_status=$(kubectl get deployment -n kube-system "$imc_deploy" -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null)
-        if [[ "$imc_status" == "True" ]]; then
-            log_success "imc-operator插件运行正常 (deployment: ${imc_deploy})"
-        else
-            log_warning "imc-operator插件状态异常 (deployment: ${imc_deploy})"
-        fi
+    if inspect_tencent_imc_operator; then
+        log_success "$TENCENT_IMC_DETAIL"
     else
-        log_warning "未检测到imc-operator插件，腾讯云生产环境建议安装"
+        log_warning "$TENCENT_IMC_DETAIL"
         log_info "参考文档: https://cloud.tencent.com/document/product/457/78134"
     fi
 }
@@ -4082,6 +4849,69 @@ run_aws_postcheck_actions() {
     done
     [[ $failed -eq 0 ]]
 }
+
+print_common_preflight_plan() {
+    echo -e "\n${BOLD}$(_banner_line "公共前置检查计划")${NC}"
+    log_info "- kubectl检查"
+    log_info "- K8S集群连通性检查"
+    log_info "- Kyverno K8S兼容性检查"
+    log_info "- K8S所属环境与服务模式检查"
+    log_info "  (完成环境识别后，将按 Standard / Serverless / Hybrid 发布本次后续检查计划)"
+}
+
+print_standard_check_plan() {
+    echo -e "\n${BOLD}$(_banner_line "Standard后续检查计划")${NC}"
+    log_info "- 节点组业务规划选择"
+    log_info "- 块存储StorageClass就绪检查(te-disk)"
+    log_info "- 网络存储StorageClass就绪检查(te-nfs)"
+    log_info "- Pod部署启动检查(并发探测所有节点池)"
+    log_info "- 节点池与节点配置检查"
+    log_info "- 节点组契约校验(规格/付费类型/污点 vs 池名声明)"
+    log_info "- 本地服务器访问Pod网络连通性检查(兼容性验证)"
+    log_info "- 本地服务器访问Kubernetes Service连通性检查(NodePort)"
+    log_info "- Pod访问本地服务器网络连通性检查"
+    log_info "- Pod访问集群内MySQL连通性检查"
+    log_info "- Pod访问集群内云主机延迟检查(<${HOST_LATENCY_THRESHOLD_MS}ms)"
+    log_info "- 端到端存储验证(te-disk RWO)"
+    log_info "- 端到端存储验证(te-nfs RWX基础)"
+    log_info "- 端到端存储验证(te-nfs RWX跨节点共享)"
+    log_info "- 测试PV清理与检查结果总览"
+}
+
+print_serverless_check_plan() {
+    echo -e "\n${BOLD}$(_banner_line "Serverless后续检查计划")${NC}"
+    log_info "- 云平台Serverless特性检查"
+    log_info "- 每个Serverless虚拟节点健康检查"
+    log_info "- 指定Serverless虚拟节点Pod部署启动检查"
+    log_info "- Pod访问ClusterIP Service检查"
+    log_info "- Pod访问MySQL网络检查"
+    log_info "- te-disk StorageClass与RWO端到端验证"
+    log_info "- te-nfs StorageClass与RWX基础验证"
+    log_info "- 同一Serverless虚拟节点双Pod RWX共享验证"
+    log_info "- 跨Serverless虚拟节点RWX共享验证(至少两个健康虚拟节点)"
+    log_info "- Serverless临时资源回收"
+    log_info "- 检查结果总览"
+    log_info "    (Serverless不检查NodePort、宿主机网络、物理节点容量或标准节点池契约)"
+}
+
+print_serverless_skip_plan() {
+    echo -e "\n${BOLD}$(_banner_line "Serverless兼容入口分流计划")${NC}"
+    log_info "- 当前集群无Serverless虚拟节点，登记SKIP"
+    log_info "- 输出统一检查结果总览并正常结束"
+    log_info "    (兼容入口仅执行Serverless分支，不执行Standard检查；完整检查请运行k8sAvailCheck.sh)"
+}
+
+print_mode_specific_plan() {
+    case "$SERVERLESS_MODE" in
+    Serverless) print_serverless_check_plan ;;
+    Standard) print_standard_check_plan ;;
+    Hybrid)
+        print_serverless_check_plan
+        print_standard_check_plan
+        ;;
+    esac
+}
+
 # ==================== 主执行流程 ====================
 main() {
     echo -e "${BOLD}$(_banner_rule)"
@@ -4092,34 +4922,15 @@ main() {
     echo -e "$(_banner_rule)${NC}"
 
     echo -e "\n${BOLD}$(_banner_line "检查项说明")${NC}"
-    log_info "本脚本将依次确认以下部署前置能力："
-    log_info "- 集群、节点池与调度能力：kubectl/集群连通性、云环境识别、节点池规格/标签/污点及弹性扩容起服"
-    log_info "- 存储动态供给、挂载与读写：te-disk(RWO)和te-nfs(RWX)的StorageClass、PVC、Pod及跨节点共享验证"
-    log_info "- Pod、Service/NodePort 与云主机网络连通性：本地服务器、Pod、MySQL及云主机间的双向可达性和延迟"
+    log_info "本脚本先完成公共前置检查，再根据云平台和服务模式发布对应检查计划。"
+    log_info "- Standard集群：节点池与调度能力、NodePort Service、宿主机网络及标准存储验证"
+    log_info "- Serverless：虚拟节点、ClusterIP Service 及Serverless存储验证"
+    log_info "- Hybrid：分别执行Serverless与Standard检查，统一汇总且互不遮蔽失败"
+    log_info "- 存储动态供给、挂载与读写：按模式验证te-disk(RWO)和te-nfs(RWX)"
+    log_info "- Pod、Service/NodePort 与云主机网络连通性：NodePort和宿主机项仅适用于Standard分支"
     log_info "执行期间会在 namespace=debug 创建临时探测资源（Deployment、Service、PVC、Pod），结束后自动清理；测试yaml与诊断信息保留在物料目录。"
 
-    echo -e "\n${BOLD}$(_banner_line "检查计划")${NC}"
-
-    log_info "1. kubectl检查"
-    log_info "2. K8S集群连通性检查"
-    log_info "3. Kyverno K8S兼容性检查"
-    log_info "4. K8S所属环境检查"
-    log_info "5. 节点组业务规划选择"
-    log_info "6. 块存储StorageClass就绪检查(te-disk)"
-    log_info "7. 网络存储StorageClass就绪检查(te-nfs)"
-    log_info "8. Pod部署启动检查(并发探测所有节点池)"
-    log_info "9. 节点池与节点配置检查"
-    log_info "10. 节点组契约校验(规格/付费类型/污点 vs 池名声明)"
-    log_info "11. 本地服务器访问Pod网络连通性检查(兼容性验证)"
-    log_info "12. 本地服务器访问Kubernetes Service连通性检查(NodePort)"
-    log_info "13. Pod访问本地服务器网络连通性检查"
-    log_info "14. Pod访问集群内MySQL连通性检查(混合部署网络错配探测)"
-    log_info "15. Pod访问集群内云主机延迟检查(<${HOST_LATENCY_THRESHOLD_MS}ms, TCP握手近似RTT)"
-    log_info "16. 端到端存储验证(块存储 te-disk, RWO: PVC->单Pod挂载->读写)"
-    log_info "17. 端到端存储验证(文件存储 te-nfs, RWX: PVC->Pod挂载->读写)"
-    log_info "18. 端到端存储验证(文件存储 te-nfs, RWX跨节点共享读写)"
-    log_info "19. 测试PV清理(精确识别，可确认后回收)"
-    log_info "    (端到端 SC->PVC->Pod 起服为 CSI 就绪的唯一金标准)"
+    print_common_preflight_plan
     echo ""
 
     checkUser
@@ -4127,34 +4938,57 @@ main() {
     record_result "kubectl检查" "PASS" "kubectl已就绪(版本匹配目标${K8S_VERSION})"
     test_k8s_connection
     record_result "K8S集群连通性检查" "PASS" "集群连接正常"
+    ensure_namespace
     check_kyverno_compatibility
 
     cloud_platform=$(detect_cloud_platform)
-    record_result "K8S所属环境检查" "PASS" "识别到环境: ${cloud_platform}"
 
     if ! detect_serverless_mode "$cloud_platform"; then
-        record_result "K8S服务模式识别" "FAIL" "无法安全识别Serverless/Standard/Hybrid，停止后续检查"
+        record_result "K8S所属环境检查" "FAIL" "云平台=${cloud_platform}；无法安全识别Serverless/Standard/Hybrid"
         print_summary
         SCRIPT_COMPLETED=true
         return 1
     fi
-    record_result "K8S服务模式识别" "PASS" "${SERVERLESS_MODE}"
-    if [[ "$SERVERLESS_MODE" == "Serverless" ]]; then
-        if ! run_serverless_availability_checks; then
-            record_result "Serverless专项检查" "FAIL" "专项检查脚本执行失败"
-            print_summary
-            SCRIPT_COMPLETED=true
-            return 1
+    record_result "K8S所属环境检查" "PASS" "云平台=${cloud_platform}；服务模式=${SERVERLESS_MODE}"
+
+    case "$K8S_CHECK_SCOPE" in
+    auto | serverless) ;;
+    *)
+        record_result "检查范围参数" "FAIL" "K8S_CHECK_SCOPE仅支持auto或serverless，当前=${K8S_CHECK_SCOPE}"
+        print_summary
+        SCRIPT_COMPLETED=true
+        return 1
+        ;;
+    esac
+
+    if [[ "$K8S_CHECK_SCOPE" == "serverless" && "$SERVERLESS_MODE" == "Standard" ]]; then
+        print_serverless_skip_plan
+    elif [[ "$K8S_CHECK_SCOPE" == "serverless" ]]; then
+        print_serverless_check_plan
+    else
+        print_mode_specific_plan
+    fi
+
+    if [[ "$K8S_CHECK_SCOPE" == "serverless" ]]; then
+        if [[ "$SERVERLESS_MODE" == "Standard" ]]; then
+            record_result "Serverless/检查分流" "SKIP" "当前为Standard模式，无Serverless虚拟节点可检查"
+        else
+            run_serverless_checks_inline
         fi
+        finalize_availability_check "Serverless"
+        log_info "K8S Serverless可用性检查结束  $(date '+%Y-%m-%d %H:%M:%S')"
         SCRIPT_COMPLETED=true
         return 0
     fi
-    if [[ "$SERVERLESS_MODE" == "Hybrid" ]]; then
-        if ! run_serverless_availability_checks; then
-            record_result "Serverless专项检查" "FAIL" "专项检查脚本执行失败；继续执行标准节点路径"
-        else
-            record_result "Serverless专项检查" "PASS" "专项检查已执行，详见前序Serverless汇总"
-        fi
+
+    if [[ "$SERVERLESS_MODE" == "Serverless" ]]; then
+        run_serverless_checks_inline
+        finalize_availability_check "Serverless"
+        log_info "K8S Serverless可用性检查结束  $(date '+%Y-%m-%d %H:%M:%S')"
+        SCRIPT_COMPLETED=true
+        return 0
+    elif [[ "$SERVERLESS_MODE" == "Hybrid" ]]; then
+        run_serverless_checks_inline
     fi
 
     if [[ "$cloud_platform" == *aws* ]]; then
@@ -4180,15 +5014,18 @@ main() {
 
     # CSI 不再做组件级预检查(SC.provisioner 与 CSIDriver 对象解耦, grep 期望组件只增误报);
     # CSI 就绪由末尾 verify_storage_e2e 端到端真实建 PVC + 起挂载 Pod 作唯一金标准。
+    local disk_ready=0
     ensure_storageclass "$cloud_platform"
     storageclass_rc=$?
     if [[ $storageclass_rc -eq 0 ]]; then
+        disk_ready=1
         record_result "块存储StorageClass就绪检查" "PASS" "默认StorageClass(te-disk)就绪"
     elif [[ $storageclass_rc -eq 2 ]]; then
         if [[ "$cloud_platform" == *huawei* && (-n "$HUAWEI_TE_DISK_PVCS" || -n "$HUAWEI_TE_DISK_PVS") ]]; then
+            disk_ready=1
             record_result "块存储StorageClass就绪检查" "PASS" "旧SC仍被业务PVC/PV使用，因此不会更新为GPSSD2；已绑定卷和现有Pod不受影响"
         else
-            record_result "块存储StorageClass就绪检查" "PASS" "旧SC仍被业务PVC/PV使用，因此不会更新为GPSSD2；已绑定卷和现有Pod不受影响"
+            record_result "块存储StorageClass就绪检查" "SKIP" "管理员未授权初始化te-disk；已保持原StorageClass不变"
         fi
     else
         record_result "块存储StorageClass就绪检查" "FAIL" "默认StorageClass未就绪，请确认CSI插件与手动配置指引"
@@ -4229,7 +5066,9 @@ main() {
     run_network_checks_per_pool
 
     # 块存储验证固定针对 te-disk，不依赖其他默认 StorageClass。
-    if verify_storage_e2e "te-disk" "块存储 te-disk RWO" "te-csi-check-disk" "ReadWriteOnce"; then
+    if [[ $disk_ready -ne 1 ]]; then
+        record_result "端到端存储验证(块存储 te-disk, RWO)" "SKIP" "te-disk StorageClass未就绪，未创建必然失败的测试PVC"
+    elif verify_storage_e2e "te-disk" "块存储 te-disk RWO" "te-csi-check-disk" "ReadWriteOnce"; then
         record_result "端到端存储验证(块存储 te-disk, RWO)" "PASS" "RWO PVC动态供给、挂载与单Pod读写成功"
     elif [[ "$STORAGE_WAIT_REASON" == "image-pull-failed" ]]; then
         record_result "端到端存储验证(块存储 te-disk, RWO)" "FAIL" "镜像拉取失败，存储端到端未完成验证；请先检查节点到镜像仓库的网络、DNS、认证或镜像缓存"
@@ -4247,7 +5086,7 @@ main() {
         if verify_storage_e2e "te-nfs" "文件存储 te-nfs RWX基础" "te-csi-check-nfs" "ReadWriteMany" "$nfs_hint"; then
             record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "PASS" "RWX PVC动态供给、挂载与单Pod读写成功"
             local schedulable_nodes
-            schedulable_nodes=$(kubectl get nodes --no-headers 2>/dev/null | awk '$2 ~ /^Ready/ && $2 !~ /SchedulingDisabled/ {n++} END {print n+0}')
+            schedulable_nodes=$(count_ready_standard_nodes)
             if [[ "$schedulable_nodes" -lt 2 ]]; then
                 record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "SKIP" "仅${schedulable_nodes}个可调度节点，无法验证跨节点共享；RWX基础读写已通过"
             elif verify_nfs_rwx_cross_node "te-nfs" "te-csi-check-nfs-rwx" "$nfs_hint"; then
@@ -4272,7 +5111,7 @@ main() {
         record_result "端到端存储验证(文件存储 te-nfs, RWX跨节点共享)" "SKIP" "te-nfs 未就绪，跳过跨节点共享验证"
     fi
 
-    finalize_availability_check
+    finalize_availability_check "$SERVERLESS_MODE"
     [[ "$cloud_platform" == *aws* ]] && run_aws_postcheck_actions
 
     log_info "K8S可用性检查结束  $(date '+%Y-%m-%d %H:%M:%S')"
@@ -4287,6 +5126,8 @@ main() {
 # EXIT trap: 脚本未正常完成时清理可能残留的测试资源，避免nginx-test/np-probe-*遗留计费节点
 cleanup_on_exit() {
     if ! $SCRIPT_COMPLETED; then
+        # Serverless异常退出同样按本轮run-id执行安全PV/PVC回收，避免误删并发检查或遗留计费卷。
+        cleanup_serverless_resources false || log_error "异常退出时部分Serverless临时资源未完成回收，请按probe-run=${PROBE_RUN_LABEL}复核"
         # 兼容旧测试资源(nginx-test)与新探测资源(np-probe-*),按label批量清理
         if kubectl get deployment -n "$NAMESPACE" -l app=nginx-test 2>/dev/null | grep -q . ||
             kubectl get deployment -n "$NAMESPACE" -l app="${PROBE_PREFIX}" 2>/dev/null | grep -q . ||

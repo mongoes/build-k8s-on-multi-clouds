@@ -19,7 +19,7 @@
 | 无法查询任一目标命名空间 | `WARN`，说明权限或 API 查询异常，不能误报未安装。 |
 | 集群版本低于 1.34 | `PASS`，披露发现的版本，不重装。 |
 | 集群版本大于等于 1.34，全部版本可解析且均不低于 1.18.0 | `PASS`，不重装。 |
-| 集群版本大于等于 1.34，任一版本低于阈值或无法解析 | 执行一次 `/data/app/.admin_manager_ta/ta-admin/ta-admin te_k8s install -name kyverno`。成功记录 `PASS`；失败记录 `FAIL` 并打印该命令供人工执行。 |
+| 集群版本大于等于 1.34，任一版本低于阈值或无法解析 | 执行一次 `/data/app/.admin_manager_ta/ta-admin te_k8s install -name kyverno`。成功记录 `PASS`；失败记录 `FAIL` 并打印该命令供人工执行。 |
 
 ## 位置与边界
 

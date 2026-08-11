@@ -2,7 +2,21 @@
 
 ## 当前阶段
 
-2026-08-07 Serverless专项检查已合并到`k8sAvailCheck.sh`入口：阿里/腾讯从虚拟节点强指纹识别`Serverless`、`Standard`、`Hybrid`三种模式；`Serverless`委派固定虚拟节点调度域专项验证并跳过NodePort、宿主机网络及标准节点池契约，`Standard`保持原完整主流程，`Hybrid`先做专项验证再继续标准节点路径。独立`k8sServerlessAvailCheck.sh`仍保留为单独回灌入口。腾讯单EKlet已实测通过ClusterIP、`te-disk` RWO、`te-nfs` RWX单Pod及同域双Pod共享；跨域RWX因单调度域正确SKIP。下一步：回灌阿里多Virtual Kubelet、腾讯多EKlet和Hybrid，验证跨调度域RWX与两条路径汇总。
+2026-08-10 阿里Serverless te-disk状态传播缺陷已修复、待现场复测：当存在`te-`前缀旧默认SC但没有`te-disk`时，初始化确认等待300秒；超时、非TTY或非Y输入均明确提示保持原SC且不会初始化。该安全拒绝以rc=2向上传播，Serverless SC检查及各虚拟节点RWO验证改为SKIP，不再创建必然Pending的PVC或每节点等待180秒；Standard非华为路径同步遵循该语义，华为被业务卷引用的旧SC特例不变。新增测试覆盖超时、拒绝、同意、返回码传播及“不调用Serverless te-disk E2E”。
+
+2026-08-10 Kyverno ta-admin路径现场缺陷已修复：线上确认真实可执行文件为`/data/app/.admin_manager_ta/ta-admin`，此前双层`ta-admin/ta-admin`同时污染自动执行和失败提示。主脚本现以`TA_ADMIN_BIN`为单一来源，自动重装与人工兜底命令统一为`/data/app/.admin_manager_ta/ta-admin te_k8s install -name kyverno`；活动测试、设计、计划和决策文档已同步。历史发布快照保留原貌，不作为当前执行入口。
+
+2026-08-10 总览集群名称展示已对齐：有效license现在显示为`[ 信息 ] 集群名称 —— XXX`，名称列与检查项共用CJK显示宽度计算，详情分隔符严格对齐；信息行不参与检查统计，无有效license仍完全省略。新增回归测试已证明旧的独立`集群名：XXX`格式会失败、新格式通过。
+
+2026-08-10 腾讯TKE单EKlet第三次回灌闭环：15项PASS、0项FAIL、0项WARN、2项按设计SKIP，总体通过。真实管理节点的license成功解析并在总览首行显示`集群名：库洛通用-上海`，有效license展示路径完成现场验收；无license、无效license时省略该行仍只有本地测试证据。上一轮清理11个历史Serverless测试PV后，本轮仅回收本次创建的3个PV，历史PV扫描显示无候选，证明重复执行不会新增Released测试残留。单EKlet环境不足以验证跨虚拟节点RWX，标准MySQL配置成功路径也未覆盖历史`data_etl_ta/application.yml`回退。
+
+2026-08-10 检查总览集群名已实施并完成有效license现场回灌：脚本在总览开始时从`/data/app/.admin_manager_ta/*license`的首个确定性匹配文件读取字符串`company_name`，成功时打印`集群名：XXX`。非管理节点无license、jq不可用、JSON/字段无效或内容为空时完全省略该行，不打印`unknown`，也不影响任何检查结论；只读取company_name且拒绝多行内容破坏总览。无license省略路径已通过本地测试，尚未在非管理节点现场回灌。
+
+2026-08-10 腾讯TKE单EKlet第二次回灌闭环：服务模式正确识别为纯Serverless，16项PASS、0项FAIL、1项因仅有单EKlet而按设计SKIP。指定EKlet Pod、ClusterIP、标准配置MySQL TCP、te-disk RWO、te-nfs RWX及同EKlet双Pod共享均通过；本轮3个临时存储PV全部回收。历史清理精确识别11个`debug/sl-nfs-*`/`sl-nfs-shared-*` Released CSI PV，30秒无输入后按默认策略逐个回收，最终PV清单仅保留`kube-system`及`te-agent` Bound业务PV，证明超时默认清理和业务PV排除符合预期。“至少一个Serverless真实集群完整回归”已核销；历史PV清理矩阵仅余显式Y确认和N拒绝分支。
+
+2026-08-10 腾讯TKE单EKlet回灌确认：`te-disk`临时PV在脚本60秒窗口后已自行消失，CBS删除链路实际成功，原结论为等待阈值假失败而非CSI失效。公共临时PV回收默认等待已调整为180秒（可由`STORAGE_PV_RECLAIM_TIMEOUT`覆盖）。同时发现早期Serverless `debug/sl-nfs-*`、`sl-nfs-shared-*` Released PV未被旧历史清理白名单接管；现已将这些严格由脚本生成的命名纳入同一安全候选规则，并让Serverless正常收尾执行历史PV扫描、展示、确认、Delete patch和删除。业务PV仍需满足debug、Released、无PVC、te-disk/te-nfs、CSI动态卷、当前SC provisioner一致及精确测试命名才会处理。下一步：在腾讯集群现场确认历史候选展示和确认清理后无Released `sl-*`残留，并验证CBS在180秒内稳定回收。
+
+2026-08-07 Serverless已作为一等检查模式内建到`k8sAvailCheck.sh`，独立`k8sServerlessAvailCheck.sh`已由管理员移入trash space并正式退役。Standard/Serverless公共能力进一步收敛：公共阶段统一确保`debug`命名空间；共用MySQL配置降级、TCP诊断、hostAliases、腾讯imc-operator Available判定、平台StorageClass准备、探测镜像和PVC容量；Pod等待统一复用失败分类；Serverless存储失败保存PVC/Pod describe；临时PVC按本轮run-id精确识别，复用安全PV `Delete`补丁和回收等待。腾讯现场证明Pod访问`ta3:3306`已收到MySQL握手，但原`curl telnet://`等待会话结束，最终被外层15秒timeout以124终止并误判。公共MySQL探测现改为HTTP请求触发快速协议退出，并以curl返回的`remote_ip`、`remote_port`确认TCP建连；curl退出1/28或`time_connect=0.000000`均不再覆盖已建立连接的事实。下一步：腾讯单虚拟节点回灌确认MySQL结果PASS、hosts与PV回收，再执行腾讯多虚拟节点、阿里和Hybrid矩阵。
 
 2026-08-07 华为CCE存储回灌已真实验证：历史`te-disk`被业务PVC/PV引用时，检查按通过呈现且未改变SC。旧`te-nfs`（`nfs-provisioner`、无VPC授权）在人工确认后已仅替换同名StorageClass，未触碰PV/PVC/Pod；后续临时RWX PVC由`everest-csi-provisioner`成功供给并Bound，证明脚本改造与SC参数生效。Pod失败于节点对SFS地址的NFS挂载（`FailedMount`），现场已确认CCE缺少VPCEP，属于云侧文件存储访问通路前置条件，不是脚本逻辑误判。
 
@@ -40,7 +54,7 @@ P0 设计确认：GKE Filestore `te-nfs` 不能隐式依赖 `default` VPC；需�
 
 ## 已识别资产
 
-- Kubernetes 集群可用性检查脚本：`k8sAvailCheck.sh`、`k8sServerlessAvailCheck.sh`。
+- Kubernetes 集群可用性检查唯一入口：`k8sAvailCheck.sh`，按识别结果执行 Standard、Serverless 或 Hybrid 检查；不再维护独立 `k8sServerlessAvailCheck.sh`。
 - 节点池构建脚本：`auto_build_nodepool.sh`。
 - 测试与文档目录：`tests/`、`docs/`。
 
@@ -49,15 +63,14 @@ P0 设计确认：GKE Filestore `te-nfs` 不能隐式依赖 `default` VPC；需�
 - [ ] P0：在腾讯多EKlet环境复跑已修复的Serverless专项脚本，再在阿里多Virtual Kubelet环境回灌：逐域Pod/网络/RWO/RWX、双域RWX共享、纯Serverless/混合/Standard-only/未知冲突拒绝路径；确认Tencent EKlet toleration和Alibaba无污点节点均可起服。
 - [ ] P0：华为CCE已完成SC替换实测；待在控制台补齐SFS所需VPCEP后，重跑RWX基础与跨节点共享验证，并同时复核`od-4c32g`节点池缺失问题。
 - [ ] P1：在含大写及非法`/etc/hosts`别名的环境回灌，确认生成物料只含小写RFC1123名称且Deployment可apply；确认节点组提示显示300秒。
-- [ ] P1：在只有`data_etl_ta/application.yml`的历史环境回灌MySQL目标解析、Pod TCP连通性及延迟检查结果。
+- [ ] P1：在只有`data_etl_ta/application.yml`的腾讯Serverless历史环境回灌MySQL目标解析；预期`ta3:3306`输出实际`remote_ip`并按TCP已连接计为PASS，同时保留连接耗时用于延迟检查。
 - [ ] P0：针对 garena-新物理机内置 K8S，API Server 已确认正常，根因收敛为 `FORWARD` 中客户无条件 DROP 位于 `FLANNEL-FWD` 之前、截断 Pod 转发。管理员不允许改动 DROP：立即恢复仅在该 DROP 前插入一条 `-j FLANNEL-FWD`，原 DROP 与其后的历史 Flannel 跳转均不动。每次策略刷新、Flannel/kube-proxy 重建后回读顺序与 Pod 到 `10.96.0.1:443` 连通性；若客户刷新会整表 restore，则必须由其维护方提供不覆盖 K8S/CNI 链的集成方式，否则本侧插入无法持久。
 - [ ] P0：garena-新暂停 `kruise-daemon` 后，残留的集群级 validating webhook `vpod.kb.io` 仍指向无 Endpoints 的 `kruise-webhook-service.kruise-system:443`，导致包括删除 Pod 在内的 Admission 请求失败。需先对该精确 webhook 临时设 `failurePolicy: Ignore` 或恢复 webhook endpoint，删除/修复工作负载后按原值恢复；不可把 `--force` 当成绕过 Admission 的方案。
 - [ ] P0：ACK `te-agent` 的 Agent Sandbox `sandbox-1-*` CrashLoop 已排除 Kruise、驱逐和 OOM：Pod 由 `Sandbox` CR 控制，Kruise 仅注入 promtail sidecar；kubelet Event 明确为 `Container sandbox failed liveness probe, will be restarted`。现场 `node dist/main` 实际监听 `*:80`，`te-agent-sandbox` ConfigMap 亦为 `app.port: 80`，但 Pod liveness/readiness 固定探测 `:8080/health`，是确定的配置/控制器模板不一致。npm 中 SIGTERM 是 kubelet 终止后的表象。需修正生成 Sandbox Pod 的 liveness/readiness port 为 80（并以新 Pod 验证）；不应先改重启策略或误停 Kruise。
 - [ ] P0：华为 `te-system/kubete-controller-manager:6.0.8` 在 node `192.168.0.170` CrashLoop 的根因已定位：`metricscollection-controller` 初始化 DB client 时连接 `192.168.0.16:3306` 超时，随后构建全部 controller context 失败并 Exit 1。它已成功解析 `te-global-config`、监听 `8443` 且 liveness 曾多次 Healthy；不是探针、OOM、驱逐或 Kruise。下一步以宿主机/POD 双向 TCP 测试和 node tcpdump 验证 MySQL 本身、Pod 出站 SNAT/路由、以及已知 FORWARD DROP 的实际命中；修复网络路径后重启 Deployment 验收。
 - [ ] P0：按AWS EKS验收矩阵回灌：CRD不存在、CRD Forbidden、零NodePool的Y/拒绝/非TTY、已有NodePool完整标准流程、存储缺失入口、consolidation合规/不合规。
-- [ ] P0：在至少一个 Serverless 集群完成独立脚本回归，证明不依赖 Node / NodePool 假设。
 - [ ] P1：在真实存在旧版 Kyverno 且 K8S>=1.34 的环境回灌升级成功路径，并验证重装失败时的人工指令提示。
-- [ ] P1：在含历史 `debug/te-csi-check-*` Released PV 的隔离集群逐项验收 `Y` 清理、`N` 跳过、30 秒超时默认清理和业务 PV 排除。
+- [ ] P1：历史测试PV清理已在线上验证30秒超时默认清理及业务PV排除；补齐显式输入`Y`清理和`N`跳过两个交互分支后完成矩阵闭环。
 - [ ] P1：完成 CCE NAS / Everest 的 VPC ID 自动解析与端到端复测。
 - [ ] P1：补齐 `Unschedulable`、`NotTriggerScaleUp`、冷启动、镜像/DNS/MySQL/RTT 失败矩阵的可执行样例与现场证据。
 - [ ] P2：取得 GCP Filestore/账单和隔离集群权限后，再启动实例/share 成本复用核验及 `te-nfs` 异常分流矩阵。

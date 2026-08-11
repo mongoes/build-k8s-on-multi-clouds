@@ -8,7 +8,8 @@ forbid_text() { ! grep -qF -- "$1" "$SCRIPT" || fail "forbidden text remains: $1
 
 require_text 'get_huawei_cce_vpc_id()'
 require_text '检查项说明'
-require_text '集群、节点池与调度能力'
+require_text 'Standard集群：节点池与调度能力、NodePort Service、宿主机网络及标准存储验证'
+require_text 'Hybrid：分别执行Serverless与Standard检查，统一汇总且互不遮蔽失败'
 require_text '存储动态供给、挂载与读写'
 require_text 'Pod、Service/NodePort 与云主机网络连通性'
 require_text '执行期间会在 namespace=debug 创建临时探测资源'
@@ -48,8 +49,28 @@ require_text 'bash "$script_path"'
 require_text 'storage_ready_for_existing_eks.sh'
 require_text 'check_aws_consolidation_policy()'
 require_text 'detect_serverless_mode()'
-require_text 'run_serverless_availability_checks()'
 require_text 'eks\.tke\.cloud\.tencent\.com'
+require_text 'print_common_preflight_plan()'
+require_text 'print_standard_check_plan()'
+require_text 'print_serverless_check_plan()'
+require_text 'print_serverless_skip_plan()'
+require_text 'run_serverless_checks_inline()'
+require_text 'cleanup_serverless_resources()'
+require_text 'ensure_namespace'
+require_text 'inspect_tencent_imc_operator()'
+require_text 'SERVERLESS_WAIT_REASON'
+require_text 'probe-run: ${PROBE_RUN_LABEL}'
+require_text 'Serverless/'
+forbid_text 'Serverless调度域'
+forbid_text '同调度域'
+forbid_text '跨Serverless调度域'
+require_text 'K8S_CHECK_SCOPE="${K8S_CHECK_SCOPE:-auto}"'
+require_text 'get_standard_node_names()'
+require_text 'node.k8s.te/nodepool-name'
+require_text 'operator: Exists'
+forbid_text 'bash "$serverless_script"'
+forbid_text 'SERVERLESS_NETWORK_TARGET'
+forbid_text 'Serverless/Pod访问指定业务地址网络'
 require_text 'Serverless'
 require_text 'Hybrid'
 require_text 'SERVERLESS_MODE="Standard"'
@@ -60,13 +81,172 @@ forbid_text 'AWS EKS环境经由特殊流程(auto_build_nodepool.sh)处理，不
 test_tmp=$(mktemp -d)
 trap 'rm -rf "$test_tmp"' EXIT
 
+# 总览集群名来自管理节点 license 的 company_name；缺文件或无有效字段时必须完全不打印。
+cluster_name_source="$test_tmp/k8sAvailCheck.cluster-name.functions.sh"
+sed -n '/^_disp_width()/,/^# ==================== 日志函数/p' "$SCRIPT" >"$cluster_name_source"
+sed -n '/^get_cluster_name()/,/^# 打印最终汇总/p' "$SCRIPT" >>"$cluster_name_source"
+LICENSE_TEST_MODE=valid
+license_test_file="$test_tmp/test.license"
+touch "$license_test_file"
+TA_LICENSE_GLOB="$test_tmp/*license"
+jq() {
+    [[ "$LICENSE_TEST_MODE" == valid ]] && printf '%s\n' '测试大数据集群' || printf '%s\n' 'null'
+}
+# shellcheck disable=SC1090
+source "$cluster_name_source"
+[[ "$(get_cluster_name)" == '测试大数据集群' ]] || fail 'license company_name must be used as the cluster name'
+LICENSE_TEST_MODE=missing
+rm -f "$license_test_file"
+missing_cluster_name=''
+if missing_cluster_name=$(get_cluster_name); then
+    fail 'missing license must not produce a printable cluster name'
+fi
+[[ -z "$missing_cluster_name" ]] || fail 'missing license must return no cluster-name text'
+LICENSE_TEST_MODE=invalid
+touch "$license_test_file"
+invalid_cluster_name=''
+if invalid_cluster_name=$(get_cluster_name); then
+    fail 'invalid company_name must not produce a printable cluster name'
+fi
+[[ -z "$invalid_cluster_name" ]] || fail 'invalid company_name must return no cluster-name text'
+
+CLUSTER_SUMMARY_LINES=''
+log_info() { CLUSTER_SUMMARY_LINES="${CLUSTER_SUMMARY_LINES}$*\n"; }
+LICENSE_TEST_MODE=valid
+print_cluster_name_summary 12
+[[ "$CLUSTER_SUMMARY_LINES" == *'  [ 信息 ] 集群名称     —— 测试大数据集群'* ]] || fail 'valid license must print an aligned information row at summary start'
+[[ "$CLUSTER_SUMMARY_LINES" != *'集群名：'* ]] || fail 'cluster name must not use the old standalone summary format'
+CLUSTER_SUMMARY_LINES=''
+LICENSE_TEST_MODE=missing
+rm -f "$license_test_file"
+print_cluster_name_summary
+[[ -z "$CLUSTER_SUMMARY_LINES" ]] || fail 'non-management node must omit the cluster-name summary line entirely'
+require_text 'print_cluster_name_summary'
+
+# te-disk初始化是有风险的SC变更：300秒无输入或非Y输入必须保持原SC，
+# 并把Serverless SC及后续RWO路径标记为SKIP，而不是误报PASS后创建必失败PVC。
+te_disk_confirm_source="$test_tmp/k8sAvailCheck.te-disk-confirm.functions.sh"
+awk '/^_confirm_te_disk_reinitialize\(\)/ { capture=1 } capture && /^ensure_nfs_storageclass\(\)/ { exit } capture { print }' "$SCRIPT" >"$te_disk_confirm_source"
+# shellcheck disable=SC1090
+source "$te_disk_confirm_source"
+TE_DISK_REINIT_CONFIRM_TIMEOUT=300
+TE_DISK_CONFIRM_OUTPUT_PATH=/dev/null
+TE_DISK_CONFIRM_LOG=''
+log_warning() { TE_DISK_CONFIRM_LOG="${TE_DISK_CONFIRM_LOG}$*"; }
+log_info() { TE_DISK_CONFIRM_LOG="${TE_DISK_CONFIRM_LOG}$*"; }
+
+empty_confirm_input="$test_tmp/empty-confirm-input"
+: >"$empty_confirm_input"
+TE_DISK_CONFIRM_INPUT_PATH="$empty_confirm_input"
+te_disk_confirm_rc=0
+_confirm_te_disk_reinitialize || te_disk_confirm_rc=$?
+[[ $te_disk_confirm_rc -eq 2 ]] || fail 'te-disk confirmation timeout/EOF must return the intentional-skip status 2'
+[[ "$TE_DISK_CONFIRM_LOG" == *'300秒内未收到确认，已保持原StorageClass不变，不会重新初始化te-disk'* ]] || fail 'te-disk confirmation timeout must clearly state that the existing SC is unchanged'
+
+printf 'n\n' >"$test_tmp/reject-confirm-input"
+TE_DISK_CONFIRM_INPUT_PATH="$test_tmp/reject-confirm-input"
+TE_DISK_CONFIRM_LOG=''
+te_disk_confirm_rc=0
+_confirm_te_disk_reinitialize || te_disk_confirm_rc=$?
+[[ $te_disk_confirm_rc -eq 2 ]] || fail 'non-y te-disk confirmation must return the intentional-skip status 2'
+[[ "$TE_DISK_CONFIRM_LOG" == *'已保持原StorageClass不变，不会重新初始化te-disk'* ]] || fail 'non-y te-disk confirmation must clearly state that the existing SC is unchanged'
+
+printf 'y\n' >"$test_tmp/accept-confirm-input"
+TE_DISK_CONFIRM_INPUT_PATH="$test_tmp/accept-confirm-input"
+_confirm_te_disk_reinitialize || fail 'y must authorize te-disk reinitialization'
+
+printf 'n\n' >"$test_tmp/ensure-reject-confirm-input"
+TE_DISK_CONFIRM_INPUT_PATH="$test_tmp/ensure-reject-confirm-input"
+log_step() { :; }
+log_success() { :; }
+record_result() { :; }
+kubectl() {
+    case "$*" in
+    'get sc -o jsonpath='*) printf '%s\n' 'te-disk-essd' ;;
+    *) return 0 ;;
+    esac
+}
+ensure_te_disk_rc=0
+ensure_storageclass alibaba || ensure_te_disk_rc=$?
+[[ $ensure_te_disk_rc -eq 2 ]] || fail 'ensure_storageclass must propagate intentional te-disk initialization refusal as status 2'
+
+serverless_sc_source="$test_tmp/k8sAvailCheck.serverless-sc.functions.sh"
+awk '/^serverless_ensure_storageclass\(\)/ { capture=1 } capture && /^serverless_wait_reason_detail\(\)/ { exit } capture { print }' "$SCRIPT" >"$serverless_sc_source"
+# shellcheck disable=SC1090
+source "$serverless_sc_source"
+SERVERLESS_RESULT_STATUS=''
+SERVERLESS_RESULT_DETAIL=''
+cloud_platform=alibaba
+ensure_storageclass() { return 2; }
+serverless_record_result() { SERVERLESS_RESULT_STATUS="$2"; SERVERLESS_RESULT_DETAIL="$3"; }
+serverless_sc_rc=0
+serverless_ensure_storageclass te-disk || serverless_sc_rc=$?
+[[ $serverless_sc_rc -eq 2 ]] || fail 'Serverless te-disk refusal must preserve the intentional-skip status 2'
+[[ "$SERVERLESS_RESULT_STATUS" == SKIP ]] || fail 'Serverless te-disk refusal must record SC readiness as SKIP'
+[[ "$SERVERLESS_RESULT_DETAIL" == *'保持原StorageClass不变'* ]] || fail 'Serverless te-disk SKIP must explain that the existing SC was preserved'
+
+serverless_inline_source="$test_tmp/k8sAvailCheck.serverless-inline.functions.sh"
+awk '/^run_serverless_checks_inline\(\)/ { capture=1 } capture && /^# ==================== 内置K8S节点标签统一/ { exit } capture { print }' "$SCRIPT" >"$serverless_inline_source"
+# shellcheck disable=SC1090
+source "$serverless_inline_source"
+SERVERLESS_DOMAINS=('virtual-kubelet-zone-a|alibaba|zone-a|||')
+SERVERLESS_DISK_E2E_CALLS=0
+SERVERLESS_DISK_SKIP_ROWS=0
+serverless_check_platform_features() { :; }
+serverless_ensure_storageclass() { [[ "$1" == te-disk ]] && return 2; return 1; }
+serverless_check_domain_health() { return 0; }
+serverless_check_network_readiness() { return 0; }
+serverless_make_probe_id() { printf 'probe-%s\n' "$1"; }
+serverless_verify_storage_e2e() { [[ "$1" == te-disk ]] && ((SERVERLESS_DISK_E2E_CALLS += 1)); return 0; }
+serverless_record_result() {
+    [[ "$1" == Serverless/端到端存储验证\(te-disk,* && "$2" == SKIP ]] && ((SERVERLESS_DISK_SKIP_ROWS += 1))
+    return 0
+}
+cleanup_serverless_resources() { :; }
+run_serverless_checks_inline
+[[ $SERVERLESS_DISK_E2E_CALLS -eq 0 ]] || fail 'Serverless must not create a te-disk E2E probe after initialization was refused'
+[[ $SERVERLESS_DISK_SKIP_ROWS -eq 1 ]] || fail 'Serverless must record one te-disk E2E SKIP per healthy virtual node when te-disk is unavailable'
+
 # 历史 PV 清理必须只在完成现场标准检查后执行；AWS NodePool 前置门禁失败时不得
 # 顺带扫描或删除历史 PV，以免一个只读门禁扩大为无关资源变更。
 main_source="$test_tmp/k8sAvailCheck.main.sh"
 sed -n '/^main()/,/^# ==================== 资源清理/p' "$SCRIPT" >"$main_source"
 ! grep -q 'cleanup_historical_test_pvs || true' "$main_source" || fail 'test PV cleanup must not run before the end of the main flow'
-[[ "$(grep -c 'finalize_availability_check' "$main_source")" -eq 1 ]] || fail 'only the completed standard flow may enter historical test PV cleanup'
+[[ "$(grep -c 'finalize_availability_check' "$main_source")" -eq 3 ]] || fail 'Serverless scope, auto Serverless, and completed Standard/Hybrid paths must each finalize exactly once'
 grep -q 'check_aws_nodepool_gate' "$main_source" || fail 'AWS NodePool gate must run before nodepool plan and storage checks'
+grep -q 'print_common_preflight_plan' "$main_source" || fail 'main must publish the common preflight plan before mode detection'
+grep -q 'print_mode_specific_plan' "$main_source" || fail 'main must publish a mode-specific plan after environment detection'
+grep -q 'run_serverless_checks_inline' "$main_source" || fail 'main must execute Serverless checks in-process'
+grep -q 'run_serverless_checks_inline' "$main_source" && grep -q 'select_nodepool_business_plan' "$main_source" || fail 'Hybrid path must retain both Serverless and Standard branches'
+
+# 计划展示必须先公共前置、后模式专属；Serverless计划不得混入标准节点检查项。
+plan_source="$test_tmp/k8sAvailCheck.plan.functions.sh"
+sed -n '/^print_common_preflight_plan()/,/^# ==================== 主执行流程/p' "$SCRIPT" >"$plan_source"
+plan_output=$(
+    BOLD='' NC='' HOST_LATENCY_THRESHOLD_MS=50 SERVERLESS_MODE=Serverless
+    _banner_line() { printf '%s' "$1"; }
+    log_info() { printf '%s\n' "$*"; }
+    # shellcheck disable=SC1090
+    source "$plan_source"
+    print_common_preflight_plan
+    print_mode_specific_plan
+)
+[[ "$plan_output" == *'- kubectl检查'* ]] || fail 'common preflight plan must be published without numbering'
+[[ "$plan_output" == *'Serverless后续检查计划'* ]] || fail 'Serverless plan must be published after mode detection'
+[[ "$plan_output" == *'Pod访问ClusterIP Service检查'* ]] || fail 'Serverless plan must describe ClusterIP validation'
+[[ "$plan_output" != *'节点组业务规划选择'* ]] || fail 'Serverless-only plan must not include standard nodepool checks'
+[[ "$plan_output" != *'本地服务器访问Kubernetes Service连通性检查(NodePort)'* ]] || fail 'Serverless-only plan must not include NodePort checks'
+! grep -qE '(^|[[:space:]])([0-9]+|S[0-9]+)\.' <<<"$plan_output" || fail 'published plans must not contain numeric item prefixes'
+
+skip_plan_output=$(
+    BOLD='' NC=''
+    _banner_line() { printf '%s' "$1"; }
+    log_info() { printf '%s\n' "$*"; }
+    # shellcheck disable=SC1090
+    source "$plan_source"
+    print_serverless_skip_plan
+)
+[[ "$skip_plan_output" == *'不执行Standard检查'* ]] || fail 'Serverless compatibility entry must clearly skip Standard checks on a Standard cluster'
 
 # 阿里/腾讯仅以虚拟节点强指纹分流；普通节点及其他云不能被误导进入Serverless路径。
 serverless_mode_source="$test_tmp/k8sAvailCheck.serverless-mode.functions.sh"
@@ -620,6 +800,8 @@ require_text 'parse_mysql_targets()'
 require_text 'LEGACY_APP_CONFIG_FILE="/data/home/ta/data_etl_ta/application.yml"'
 require_text 'for mysql_target in "${MYSQL_PROBE_TARGETS[@]}"'
 require_text 'test_pod_to_mysql_connectivity "$mysql_target"'
+require_text 'MYSQL_KUBECTL_EXEC_TIMEOUT'
+require_text '_run_kubectl_exec_with_timeout()'
 require_text 'test_pod_to_host_latency "$mysql_target"'
 forbid_text 'MYSQL_PROBE_IP'
 forbid_text 'MYSQL_HOST_RAW'
@@ -697,35 +879,45 @@ grep -qF 'nodeSelector:' "$selector_manifest" || fail 'selector pool manifest mu
 grep -qF 'node.k8s.te/nodepool-name: "spot-32c128g"' "$selector_manifest" || fail 'selector pool manifest must target the requested node pool'
 grep -q '^      nodeSelector:$' "$selector_manifest" || fail 'nodeSelector must be at template.spec indentation'
 grep -q '^      hostAliases:$' "$selector_manifest" || fail 'hostAliases must be at template.spec indentation alongside nodeSelector'
-# MySQL 探测必须使用 curl 的 TCP connect-only 与 time_connect，不能依赖 nginx 镜像中的 bash/timeout/devtcp。
-require_text 'telnet://'
+# MySQL 探测必须以 curl 已连接到远端地址为准，不能等待 MySQL 主动关闭 telnet 会话。
+require_text '%{remote_ip}'
+require_text '%{remote_port}'
 require_text '%{time_connect}'
+forbid_text 'telnet://'
 forbid_text '--connect-only'
 forbid_text '/dev/tcp'
 forbid_text 'command -v bash'
-forbid_text 'command -v timeout'
+! grep -qF -- '-- sh -c command -v timeout' "$SCRIPT" || fail 'MySQL probe must not depend on timeout inside the container'
 
 # curl 成功、缺失、DNS 与 TCP 失败均必须可被 MySQL 探测分类。生产实现需以这些 curl 退出码/输出为准。
 mysql_curl_source="$test_tmp/k8sAvailCheck.mysql-curl.functions.sh"
-sed -n '/^_mysql_curl_connect()/,/^# ==================== 混合部署: Pod -> MySQL 所在云主机延迟/p' "$SCRIPT" >"$mysql_curl_source"
+sed -n '/^_run_kubectl_exec_with_timeout()/,/^# ==================== 混合部署: Pod -> MySQL 所在云主机延迟/p' "$SCRIPT" >"$mysql_curl_source"
 log_step() { :; }
 log_info() { :; }
 log_success() { :; }
 log_warning() { :; }
 log_error() { :; }
 _ensure_artifact_dir() { mkdir -p "$ARTIFACT_DIR"; }
+# 测试替身：生产使用coreutils timeout；单测需在同一shell内继续调用mock kubectl函数。
+timeout() {
+    [[ "$1" == --signal=TERM ]] && shift
+    shift
+    "$@"
+}
 # shellcheck disable=SC1090
 source "$mysql_curl_source"
 POD_NAME=mysql-probe NAMESPACE=debug RUN_TS=test ARTIFACT_DIR="$test_tmp/mysql-curl-artifacts"
+MYSQL_KUBECTL_EXEC_TIMEOUT=15
 MYSQL_CURL_MODE=success
 kubectl() {
     local cmd="$*"
     case "$cmd" in
-    *'telnet://mysql.example.internal:3306'*)
+    *'http://mysql.example.internal:3306/'*)
         case "$MYSQL_CURL_MODE" in
-        success) printf '0.012\n'; return 0 ;;
-        partial) printf '0.012\n'; printf 'curl: (28) Time-out\n' >&2; return 28 ;;
-        zero) printf '0.000000\n'; return 0 ;;
+        success) printf 'remote_ip=10.0.0.12;remote_port=3306;time_connect=0.012\n'; return 0 ;;
+        protocol) printf 'remote_ip=10.0.0.12;remote_port=3306;time_connect=0.012\n'; printf 'curl: (1) Received HTTP/0.9 when not allowed\n' >&2; return 1 ;;
+        partial) printf 'remote_ip=10.0.0.12;remote_port=3306;time_connect=0.012\n'; printf 'curl: (28) Time-out\n' >&2; return 28 ;;
+        zero) printf 'remote_ip=10.0.0.12;remote_port=3306;time_connect=0.000000\n'; return 1 ;;
         missing) printf 'curl: not found\n' >&2; return 127 ;;
         dns) printf 'curl: (6) Could not resolve host\n' >&2; return 6 ;;
         tcp) printf 'curl: (7) Failed to connect\n' >&2; return 7 ;;
@@ -737,12 +929,15 @@ kubectl() {
 MYSQL_CURL_MODE=partial
 log_info() { printf '%s\n' "$*"; }
 log_success() { printf '%s\n' "$*"; }
-connectivity_output=$(test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a 2>&1) || fail 'rc=28 with non-zero time_connect must still pass connectivity'
-[[ "$connectivity_output" == *'MySQL TCP握手已建立，服务保持连接，按连接成功计'* ]] || fail 'partial curl success must explain the established TCP handshake'
+connectivity_output=$(test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a 2>&1) || fail 'rc=28 with remote_ip must still pass connectivity'
 [[ "$connectivity_output" != *'Time-out'* && "$connectivity_output" != *'command terminated'* ]] || fail 'partial curl stderr must not leak to connectivity output'
+MYSQL_CURL_MODE=protocol
+test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a || fail 'MySQL greeting reported as curl HTTP/0.9 error must still pass after TCP connect'
 MYSQL_CURL_MODE=success
-test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a || fail 'curl telnet time_connect success must pass MySQL connectivity'
-for mysql_case in missing dns tcp zero; do
+test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a || fail 'curl remote_ip success must pass MySQL connectivity'
+MYSQL_CURL_MODE=zero
+test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a || fail 'remote_ip with zero-rounded time_connect must pass connectivity'
+for mysql_case in missing dns tcp; do
     MYSQL_CURL_MODE="$mysql_case"
     if test_pod_to_mysql_connectivity 'mysql.example.internal:3306' pool-a; then
         fail "curl ${mysql_case} failure must fail MySQL connectivity"
@@ -751,7 +946,6 @@ for mysql_case in missing dns tcp zero; do
     missing) [[ "$MYSQL_PROBE_FAILURE_REASON" == *'缺少 curl'* ]] || fail 'missing curl must be classified as a probe-tool failure' ;;
     dns) [[ "$MYSQL_PROBE_FAILURE_REASON" == *'DNS'* ]] || fail 'curl DNS failure must be classified as DNS' ;;
     tcp) [[ "$MYSQL_PROBE_FAILURE_REASON" == *'TCP'* ]] || fail 'curl TCP failure must be classified as TCP' ;;
-    zero) [[ "$MYSQL_PROBE_FAILURE_REASON" == *'有效连接'* || "$MYSQL_PROBE_FAILURE_REASON" == *'TCP'* ]] || fail 'zero time_connect must fail connectivity classification' ;;
     esac
 done
 MYSQL_CURL_MODE=tcp
@@ -764,9 +958,10 @@ grep -qF 'exit_code=7' "$tcp_diagnostic_artifact" || fail 'TCP diagnostic artifa
 [[ "$MYSQL_CURL_LOG" == *'诊断物料已保存至:'* && "$MYSQL_CURL_LOG" == *'mysql_probe_'* ]] || fail 'connectivity failure must log its diagnostic artifact path'
 MYSQL_CURL_MODE=partial
 capture_mysql_probe_diagnostics pool-a 'mysql.example.internal:3306'
-[[ "$MYSQL_PROBE_FAILURE_REASON" == 'curl 诊断复测成功' ]] || fail 'rc28 with non-zero time_connect must classify as diagnostic reprobe success'
+[[ "$MYSQL_PROBE_FAILURE_REASON" == 'curl 诊断复测已确认TCP连接成功' ]] || fail 'rc28 with remote_ip must classify as diagnostic reprobe success'
 mysql_partial_artifact="$MYSQL_PROBE_DIAGNOSTIC_ARTIFACT"
 grep -qF 'exit_code=28' "$mysql_partial_artifact" || fail 'diagnostic artifact must retain curl rc28'
+grep -qF 'remote_ip=10.0.0.12' "$mysql_partial_artifact" || fail 'diagnostic artifact must retain connected remote IP'
 grep -qF 'time_connect=0.012' "$mysql_partial_artifact" || fail 'diagnostic artifact must retain curl time_connect'
 
 # time_connect 的秒值必须在脚本端转换为毫秒，不能被 awk 正则错误丢弃。
@@ -778,7 +973,7 @@ HOST_LATENCY_SAMPLES=1
 HOST_LATENCY_THRESHOLD_MS=50
 kubectl() {
     local cmd="$*"
-    [[ "$cmd" == *'telnet://mysql.example.internal:3306'* ]] && { printf '0.012\n'; printf 'curl: (28) Time-out\ncommand terminated with exit code 28\n' >&2; return 28; }
+    [[ "$cmd" == *'http://mysql.example.internal:3306/'* ]] && { printf 'remote_ip=10.0.0.12;remote_port=3306;time_connect=0.012\n'; printf 'curl: (1) Received HTTP/0.9 when not allowed\n' >&2; return 1; }
     return 0
 }
 test_pod_to_host_latency 'mysql.example.internal:3306' || fail 'curl time_connect sample must pass latency probe'
@@ -797,7 +992,7 @@ forbid_text "tcp_command=\"timeout 5 bash -c 'exec 3<>/dev/tcp/\${host}/\${port}
 
 # MySQL TCP 探测失败时必须保留 Pod 内诊断物料，便于区分镜像工具缺失、DNS 与端口不可达。
 mysql_diagnostic_source="$test_tmp/k8sAvailCheck.mysql-diagnostic.functions.sh"
-sed -n '/^_mysql_curl_connect()/,/^# ==================== 混合部署: Pod -> MySQL 所在云主机延迟/p' "$SCRIPT" >"$mysql_diagnostic_source"
+sed -n '/^_run_kubectl_exec_with_timeout()/,/^# ==================== 混合部署: Pod -> MySQL 所在云主机延迟/p' "$SCRIPT" >"$mysql_diagnostic_source"
 log_step() { :; }
 log_info() { :; }
 log_success() { :; }
@@ -819,7 +1014,7 @@ kubectl() {
     *'command -v bash'*) printf '/bin/bash\n' ;;
     *'command -v timeout'*) printf '/usr/bin/timeout\n' ;;
     *'cat /etc/resolv.conf'*) printf 'nameserver 10.96.0.10\n' ;;
-    *'telnet://mysql.example.internal:3306'*)
+    *'http://mysql.example.internal:3306/'*)
         printf 'tcp probe stdout\n'
         printf 'tcp probe stderr\n' >&2
         return 42
@@ -833,7 +1028,7 @@ mysql_diagnostic_artifact=$(find "$ARTIFACT_DIR" -type f -print -quit)
 [[ -n "$mysql_diagnostic_artifact" ]] || fail 'failed MySQL exec must create a diagnostic artifact'
 grep -qF "$MYSQL_DIAGNOSTIC_TARGET" "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include the target'
 grep -qF "$MYSQL_DIAGNOSTIC_POOL" "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include the node pool'
-grep -qF "raw_curl_command=curl --noproxy '*' --connect-timeout 5 --max-time 5 --silent --show-error --output /dev/null --write-out '%{time_connect}' telnet://mysql.example.internal:3306" "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must retain the raw curl command'
+grep -qF "raw_curl_command=curl --noproxy '*' --connect-timeout 5 --max-time 5 --silent --show-error --output /dev/null --write-out 'remote_ip=%{remote_ip};remote_port=%{remote_port};time_connect=%{time_connect}' http://mysql.example.internal:3306/" "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must retain the raw curl command'
 grep -qF 'tcp probe stdout' "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include failed command stdout'
 grep -qF 'tcp probe stderr' "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include failed command stderr'
 grep -qF 'exit_code=42' "$mysql_diagnostic_artifact" || fail 'MySQL diagnostic artifact must include failed command exit code'
@@ -1068,6 +1263,16 @@ awk '/^_kyverno_version_lt\(\)/ { capture=1 } capture && /^check_tencent_cloud_f
 # shellcheck disable=SC1090
 source "$kyverno_source"
 
+# Kyverno重装的自动执行与失败提示必须共用线上真实的单层ta-admin绝对路径。
+fake_ta_admin="$test_tmp/ta-admin"
+fake_ta_admin_calls="$test_tmp/ta-admin.calls"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >"%s"\n' "$fake_ta_admin_calls" >"$fake_ta_admin"
+chmod +x "$fake_ta_admin"
+TA_ADMIN_BIN="$fake_ta_admin"
+run_kyverno_reinstall
+[[ "$(cat "$fake_ta_admin_calls")" == 'te_k8s install -name kyverno' ]] || fail 'Kyverno reinstall must invoke ta-admin with the exact install arguments'
+TA_ADMIN_BIN='/data/app/.admin_manager_ta/ta-admin'
+
 run_kyverno_case() {
     local server_version="$1" te_rows="$2" kube_rows="$3" query_fail_namespace="${4:-}" install_rc="${5:-0}"
     RESULT_NAMES=() RESULT_STATUS=() RESULT_DETAIL=()
@@ -1126,7 +1331,8 @@ run_kyverno_case 'v1.34.0' $'kyverno-admission\tdocker.example/kyvernopre:v1.18.
 
 run_kyverno_case 'v1.34.0' $'kyverno-admission\tdocker.example/kyvernopre:v1.10.3\n' '' '' 9
 [[ "${RESULT_STATUS[0]:-}" == FAIL ]] || fail 'failed Kyverno reinstall must record FAIL'
-[[ "$KYVERNO_LAST_ERROR" == *'/data/app/.admin_manager_ta/ta-admin/ta-admin te_k8s install -name kyverno'* ]] || fail 'failed Kyverno reinstall must print the manual command'
+[[ "$KYVERNO_LAST_ERROR" == *'/data/app/.admin_manager_ta/ta-admin te_k8s install -name kyverno'* ]] || fail 'failed Kyverno reinstall must print the single-level ta-admin absolute path'
+[[ "$KYVERNO_LAST_ERROR" != *'/ta-admin/ta-admin '* ]] || fail 'failed Kyverno reinstall must never print the duplicated ta-admin path'
 
 run_kyverno_case 'v1.34.0' '' '' te-system
 [[ "${RESULT_STATUS[0]:-}" == WARN ]] || fail 'failed Kyverno discovery must warn instead of reporting absence'
@@ -1159,6 +1365,7 @@ awk '/^historical_test_pv_is_candidate\(\)/ { capture=1 } capture && /^_storage_
 HISTORICAL_CLEANUP_CALLS="$test_tmp/historical-pv-cleanup.calls"
 : >"$HISTORICAL_CLEANUP_CALLS"
 HISTORICAL_TEST_PV_EXISTS=1
+HISTORICAL_SERVERLESS_PV_EXISTS=1
 HISTORICAL_TEST_PV_CONFIRM_TIMEOUT=30
 HISTORICAL_TEST_PV_DELETE_TIMEOUT=60
 RESULT_NAMES=() RESULT_STATUS=() RESULT_DETAIL=()
@@ -1178,7 +1385,9 @@ kubectl() {
     printf '%s\n' "$cmd" >>"$HISTORICAL_CLEANUP_CALLS"
     case "$cmd" in
     "get pv -o jsonpath="*)
-        [[ "$HISTORICAL_TEST_PV_EXISTS" == 1 ]] && printf 'test-debug-pv business-released-pv'
+        [[ "$HISTORICAL_TEST_PV_EXISTS" == 1 ]] && printf 'test-debug-pv '
+        [[ "$HISTORICAL_SERVERLESS_PV_EXISTS" == 1 ]] && printf 'serverless-released-pv '
+        printf 'serverless-non-test-pv business-released-pv'
         ;;
     "get pv test-debug-pv -o jsonpath="*)
         [[ "$HISTORICAL_TEST_PV_EXISTS" == 1 ]] || return 1
@@ -1187,11 +1396,22 @@ kubectl() {
     "get pv business-released-pv -o jsonpath="*)
         printf 'Released|te-agent|home-sandbox-1-business|te-nfs|nas.csi.everest.io|everest-csi-provisioner|volume-business'
         ;;
+    "get pv serverless-released-pv -o jsonpath="*)
+        [[ "$HISTORICAL_SERVERLESS_PV_EXISTS" == 1 ]] || return 1
+        printf 'Released|debug|sl-nfs-shared-2327932362-203509-3838|te-nfs|nas.csi.everest.io|everest-csi-provisioner|volume-serverless-test'
+        ;;
+    "get pv serverless-non-test-pv -o jsonpath="*)
+        printf 'Released|debug|sl-nfs-business-data|te-nfs|nas.csi.everest.io|everest-csi-provisioner|volume-serverless-business'
+        ;;
     "get sc te-nfs -o jsonpath="*) printf 'everest-csi-provisioner' ;;
     "get pvc te-csi-check-nfs-pvc -n debug") return 1 ;;
+    "get pvc sl-nfs-shared-2327932362-203509-3838 -n debug") return 1 ;;
     "patch pv test-debug-pv --type=merge -p "*) return 0 ;;
     "delete pv test-debug-pv --ignore-not-found --wait=false") HISTORICAL_TEST_PV_EXISTS=0 ;;
+    "patch pv serverless-released-pv --type=merge -p "*) return 0 ;;
+    "delete pv serverless-released-pv --ignore-not-found --wait=false") HISTORICAL_SERVERLESS_PV_EXISTS=0 ;;
     "get pv test-debug-pv") [[ "$HISTORICAL_TEST_PV_EXISTS" == 1 ]] ;;
+    "get pv serverless-released-pv") [[ "$HISTORICAL_SERVERLESS_PV_EXISTS" == 1 ]] ;;
     *) return 0 ;;
     esac
 }
@@ -1200,7 +1420,11 @@ source "$historical_cleanup_source"
 cleanup_historical_test_pvs || fail 'non-interactive historical cleanup should complete when only an exact test PV qualifies'
 grep -q '^patch pv test-debug-pv ' "$HISTORICAL_CLEANUP_CALLS" || fail 'qualified historical test PV must be switched to Delete before deletion'
 grep -q '^delete pv test-debug-pv ' "$HISTORICAL_CLEANUP_CALLS" || fail 'qualified historical test PV must be deleted'
-! grep -q 'patch pv business-released-pv\|delete pv business-released-pv' "$HISTORICAL_CLEANUP_CALLS" || fail 'Released business PV must never be cleaned'
+grep -q '^patch pv serverless-released-pv ' "$HISTORICAL_CLEANUP_CALLS" || fail 'qualified Serverless historical test PV must be switched to Delete before deletion'
+grep -q '^delete pv serverless-released-pv ' "$HISTORICAL_CLEANUP_CALLS" || fail 'qualified Serverless historical test PV must be deleted'
+! grep -q 'patch pv business-released-pv\|delete pv business-released-pv\|patch pv serverless-non-test-pv\|delete pv serverless-non-test-pv' "$HISTORICAL_CLEANUP_CALLS" || fail 'Released business PVs and non-test Serverless names must never be cleaned'
 [[ "${RESULT_STATUS[*]}" == *PASS* ]] || fail 'successful historical cleanup must record PASS'
+
+require_text 'STORAGE_PV_RECLAIM_TIMEOUT="${STORAGE_PV_RECLAIM_TIMEOUT:-180}"'
 
 echo 'PASS: availability-check regression assertions'

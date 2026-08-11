@@ -1,5 +1,83 @@
 # 决策记录
 
+## 2026-08-10：te-disk未获初始化授权时以SKIP终止依赖探测
+
+- 现场证据：阿里Serverless仅有默认SC`te-disk-essd`。管理员保留旧SC后，旧逻辑返回成功并误报`te-disk`就绪，随后两个Virtual Kubelet各创建引用不存在`te-disk`的PVC并等待180秒，最终必然失败。
+- 决定：默认SC重命名确认与节点组规划一致等待300秒；仅Y/y授权变更。超时、非TTY及其他任意输入都明确提示“已保持原StorageClass不变，不会重新初始化te-disk”。
+- 状态：`ensure_storageclass`使用返回值0表示真实就绪、1表示初始化失败、2表示管理员未授权而安全保持原状。Serverless SC检查和每个虚拟节点的RWO验证均记SKIP，不创建PVC；Standard同类路径也跳过RWO。华为旧SC仍被业务卷引用的既有rc=2特例保持PASS并允许验证，不改变其安全迁移策略。
+
+## 2026-08-10：ta-admin可执行文件使用单层绝对路径
+
+- 现场事实：管理工具本身就是可执行文件`/data/app/.admin_manager_ta/ta-admin`，不是同名目录下的第二个`ta-admin`；双层路径会直接导致Kyverno自动重装失败。
+- 决定：主脚本以`TA_ADMIN_BIN=/data/app/.admin_manager_ta/ta-admin`作为唯一来源，自动执行和失败后的人工命令提示都由它生成，避免两处路径漂移。
+- 归档边界：`branch_k8sAvailCheck/k8sAvailcheck history version released/`内的v3.1/v3.2是历史发布快照，保留原始缺陷作为版本证据，不属于当前可执行入口；不得从该目录复制旧脚本替代主脚本。
+
+## 2026-08-10：集群名称作为总览信息行并与检查项对齐
+
+- 决定：有效license解析出的名称使用`[ 信息 ] 集群名称 —— XXX`展示，不再使用独立的`集群名：XXX`文本。
+- 对齐：`集群名称`参与总览名称列最大显示宽度计算，复用CJK显示宽度补齐逻辑，使其`——`与所有检查项详情列严格对齐。
+- 语义：该行仅提供环境上下文，不计入PASS、WARN、FAIL、SKIP及总项数；无有效license时仍完全省略。
+
+## 2026-08-10：检查总览仅在管理节点license有效时展示集群名
+
+- 决定：从`/data/app/.admin_manager_ta/*license`确定性选择首个可读文件，仅用`jq`提取字符串`company_name`，在“检查结果总览”标题后的首行打印`集群名：XXX`。
+- 缺省：无匹配license代表执行机不是管理节点，完全省略集群名行；jq缺失、JSON损坏、字段缺失/非字符串/纯空白时同样省略，不打印`unknown`，不改变检查状态。
+- 安全：不输出license路径或其他字段，并拒绝包含换行的company_name，避免异常内容扰乱结果总览。
+
+## 2026-08-10：Serverless历史测试PV纳入公共安全回收，CBS等待默认180秒
+
+- 现场证据：腾讯TKE单EKlet运行中，`pvc-c37c5c19-5187-498e-a273-e8518c32ad34`在删除PVC后60秒内仍存在而登记FAIL，但后续`kubectl get pv`已确认其不存在；同轮两个`te-nfs`临时PV在60秒内成功删除。这证明公共`_storage_e2e_cleanup`已执行且CBS删除最终成功，60秒不足以代表CSI故障。
+- 决定：本轮临时PV回收等待改为默认180秒，可用`STORAGE_PV_RECLAIM_TIMEOUT`覆盖。该变量只影响测试结果等待时长，不改变业务StorageClass或业务PV的回收策略。
+- 决定：历史残留候选除旧`te-csi-check-*`白名单外，加入`serverless_make_probe_id`生成的精确`sl-(disk|nfs|nfs-shared|nfs-cross)-<hash>-<HHMMSS>-<pid>`命名；Serverless正常收尾与Standard/Hybrid一样执行历史扫描、候选展示、交互确认、PV切换Delete和删除。
+- 安全边界：候选仍必须同时为`Released`、claim namespace=`debug`、不存在对应PVC、StorageClass=`te-disk/te-nfs`、CSI动态卷且provisioner与当前StorageClass一致。`te-agent`、`kube-system`及名称不符合精确测试格式的资源不会被处理。
+
+## 2026-08-07：MySQL网络探测以远端连接事实而非curl退出码判定
+
+- 决定：Standard与Serverless共用的MySQL TCP探测不再使用`telnet://`等待服务端关闭连接；改用短时HTTP请求触发MySQL协议不匹配快速退出，并读取curl的`remote_ip`、`remote_port`和`time_connect`。只要远端IP非空且远端端口等于目标端口，即认定TCP三次握手成功，curl退出码1/28以及四舍五入为`0.000000`的连接耗时都不能将其覆盖为失败。
+- 原因：腾讯Serverless现场Pod内`curl 10.11.0.12:3306`快速返回`Received HTTP/0.9 when not allowed`，证明已经收到MySQL握手；原`telnet://`却保持会话，外层`kubectl exec`在15秒后返回124。命令未正常收尾与TCP未建立是两个不同事实，按退出码判定造成假失败。
+- 失败边界：没有`remote_ip`时才按curl退出码区分DNS、拒绝连接和连接超时；外层124/137只描述API Server到Pod的exec流超时，不再直接归因于MySQL网络。延迟统计复用同一连接结果中的`time_connect`，避免Standard与Serverless逻辑分叉。
+- 不选：不依赖`mysql`、`nc`、容器内`bash`或`/dev/tcp`，因为当前统一探测镜像不保证提供这些工具；不使用curl退出0作为成功标准，因为MySQL本来就不是HTTP服务。
+
+## 2026-08-07：MySQL TCP探测同时限制curl与kubectl exec
+
+- 现场证据：Serverless已解析出`ta3:3306`并进入与Standard相同的`_mysql_curl_connect`，但输出停在目标解析之后。原实现只为容器内curl设置5秒超时；若`kubectl exec`流式通道建立或回收卡住，curl尚未启动或结果无法返回，内部超时无法保护脚本。
+- 决定：公共MySQL探测为整个`kubectl exec`增加默认15秒硬超时，执行前披露Pod、目标与时限。Linux优先使用coreutils `timeout`终止整个进程；缺少该命令时使用kubectl请求超时兜底。Standard与Serverless同时生效。
+- 诊断：外层超时使用独立原因，不再误报MySQL端口超时；避免重复执行可能再次卡住的exec诊断，只保存带请求超时的Pod YAML和describe。其他失败仍采集hosts、resolv.conf、getent与curl结果，且每个exec都有硬超时。
+
+## 2026-08-07：Standard与Serverless公共探测能力只保留一个实现
+
+- 公共前置：K8S连通后统一确保`debug`命名空间存在，避免纯Serverless在Standard创建资源前提前分流而遗漏namespace初始化。
+- 公共运行时：MySQL解析/TCP诊断、hostAliases、腾讯imc-operator Available状态、平台StorageClass准备、探测镜像、PVC容量和Pod失败分类均复用同一实现；模式分支只保留节点选择、Service类型和模式专属检查项。
+- 公共回收：Serverless资源增加本轮`probe-run`标签；PVC/PV复用Standard的安全回收流程，先把本轮绑定PV切换为Delete，再删除PVC并等待后端回收。回收失败登记FAIL，异常退出也执行同一窄范围流程。
+- 入口：`k8sServerlessAvailCheck.sh`已由管理员移入trash space并正式退役；Serverless唯一入口和实现均为`k8sAvailCheck.sh`，测试不再要求兼容脚本存在。
+
+## 2026-08-07：Serverless网络探测Pod复用Standard的hostAliases初始化
+
+- 现场证据：MySQL目标已通过历史配置降级正确解析为`ta3:3306`；执行机可将`ta3`解析为`10.11.0.12`，但Serverless Pod诊断中的`/etc/hosts`没有`ta3`，curl以exit 6明确报`Could not resolve host: ta3`。这不是MySQL端口或网络链路失败。
+- 根因：Standard探测Deployment调用`build_probe_host_aliases`同步执行机`/etc/hosts`，Serverless网络Deployment遗漏了同一初始化步骤。
+- 决定：Serverless网络探测Pod复用`build_probe_host_aliases`，仅注入通过有效IP、非回环、RFC1123主机名、去重和同名冲突门槛的条目；不复制原始hosts文本，也不为Serverless另写一套解析逻辑。
+- 展示：跨云用户可见文案统一使用“Serverless虚拟节点”，不再使用执行者不易理解的“调度域”；代码内部数据结构名称可以保留以避免无业务价值的重构。
+
+## 2026-08-07：删除无归属业务地址检查，统一MySQL目标解析
+
+- 决定：删除`SERVERLESS_NETWORK_TARGET`及其计划、执行和总览项。该扩展没有当前业务配置来源或明确验收对象，长期只产生SKIP噪音。
+- 决定：Serverless直接复用Standard的`parse_mysql_targets`。目标解析统一为优先`/data/home/ta/base_server_ta/application.yml`，无有效目标时回退`/data/home/ta/data_etl_ta/application.yml`；同一文件的全部有效目标去重后都必须由当前Serverless虚拟节点探测Pod进行TCP连接。
+- 失败语义：两个配置均无法解析时与Standard一致登记FAIL；解析成功后任一MySQL目标不可达即FAIL，并保留现有DNS、路由和TCP诊断物料。
+
+## 2026-08-07：检查计划不编号，Serverless执行过程必须即时可见
+
+- 现场证据：腾讯Serverless实测从计划发布到最终总览约3分钟没有任何前台信息；原因是内联函数只调用`record_result`写入结果数组，等待函数和各检查项没有使用主脚本的步骤与结果日志接口。`1-4`公共计划再接`S1-S12`后续计划也形成两套编号，破坏原有顺序感。
+- 决定：公共前置和环境识别后的模式计划继续分阶段发布，但所有计划项都使用无编号列表。执行时每项先打印统一横幅，完成后立即打印PASS/FAIL/WARN/SKIP并登记到同一结果数组；Pod/PVC长等待首次及每30秒打印状态。最终仍只输出一次总览。
+- 边界：本次仅调整计划与可观测性，不改变腾讯/阿里Serverless的调度、ClusterIP、RWO或RWX判定；Standard路径的既有检查逻辑保持不变。
+
+## 2026-08-07：Serverless作为主脚本的一等检查模式
+
+- 决定：`k8sAvailCheck.sh`是Serverless检查逻辑的唯一实现。启动阶段仅发布4项公共前置计划；识别云平台及`Serverless`、`Standard`、`Hybrid`模式后，动态发布对应计划。Serverless检查直接登记到主结果数组并复用同一日志、物料目录、资源清理和最终总览。
+- Hybrid边界：Serverless分支FAIL不阻断Standard分支；Standard节点枚举和存储探测显式排除虚拟节点，避免把EKlet或Virtual Kubelet误当标准节点。两类资源都清理后仅打印一次总览，任一FAIL均保留为总体失败。
+- 入口：`k8sServerlessAvailCheck.sh`已移入trash space，不再保留兼容入口；统一执行`bash k8sAvailCheck.sh`。
+- 不选：不再通过子进程委派独立脚本。子进程会形成第二套计划、结果数组、日志和总览，使Serverless表现为临时插入流程，并可能让Hybrid一侧失败被入口退出逻辑遮蔽。
+- 验收：本地覆盖模式识别、动态计划、统一结果和Hybrid标准节点隔离；现场继续以腾讯单/多EKlet、阿里Virtual Kubelet和Hybrid作为回灌矩阵。
+
 ## 2026-08-07：Serverless模式采用虚拟节点强指纹与逐调度域验证
 
 - 模式：腾讯虚拟节点以`instance-type=eklet`或`eks.tke.cloud.tencent.com/`前缀识别；阿里虚拟节点必须同时满足`type=virtual-kubelet`和阿里专属label/annotation。虚拟节点与标准节点计数决定纯Serverless、混合或标准模式；证据冲突、无Node或标准节点云归属未达到双重证据时FAIL停止。
@@ -124,7 +202,7 @@
 ## 2026-07-31：Kyverno 按 Pod 名和稳定镜像版本做 K8S 兼容性处理
 
 - 决定：在“K8S集群连通性检查”之后，仅从 `te-system` 与 `kube-system` 查找 Pod 名含 `kyverno` 的工作负载；解析其所有常规容器的稳定 `vX.Y.Z`/`X.Y.Z` image tag。
-- 规则：集群 K8S>=1.34 时，任一版本低于 `v1.18.0`、预发布 tag 或无法解析 tag 即执行一次 `/data/app/.admin_manager_ta/ta-admin/ta-admin te_k8s install -name kyverno`。未发现 Kyverno 为 SKIP；命名空间查询或服务端版本查询失败为 WARN；重装失败为 FAIL 并打印可复制的人工命令。
+- 规则：集群 K8S>=1.34 时，任一版本低于 `v1.18.0`、预发布 tag 或无法解析 tag 即执行一次 `/data/app/.admin_manager_ta/ta-admin te_k8s install -name kyverno`。未发现 Kyverno 为 SKIP；命名空间查询或服务端版本查询失败为 WARN；重装失败为 FAIL 并打印可复制的人工命令。
 - 原因：Kyverno 对 K8S 1.34+ 版本敏感，admission/background/预处理组件可能版本漂移；用镜像组件名白名单会漏掉 `kyvernopre:v1.10.3` 等实际格式。
 
 ## 2026-07-31：节点组业务规划作为云厂商 map 的第二层

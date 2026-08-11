@@ -1,6 +1,6 @@
 # K8S 可用性检查：待办与进度台账
 
-> 范围：`k8sAvailCheck.sh` 及其 Serverless / replicas 相关变体。
+> 范围：统一入口 `k8sAvailCheck.sh` 的 Standard / Serverless / Hybrid 检查，以及 replicas 相关变体。
 >
 > 更新节奏：**每半周至少更新一次**（建议周三、周六），并在完成、阻塞或发现回归时即时更新。
 > 本文只追踪尚未闭环的事项；已验证结论保留在“已确认基线”中，避免重复施工。
@@ -17,12 +17,13 @@
 | P2 | 阻塞（待授权/环境） | GKE Filestore `te-nfs` 成本与实例复用现场核验 | 记录每个 `instance-storageclass-label` 对应的 Filestore 实例数、容量、share 数和月度预算 | 需目标 GCP 项目 `filestore.instances.list/get` 与账单查看权限；优先使用已有多个 `te-nfs` PVC 的集群，避免为测试额外产生 1TiB Filestore 成本 | 用户/云平台管理员 |
 | P0 | 已现场验证 | 回灌线上确认的 `max-volume-size` | 仓库 `te-nfs` 模板与脚本均包含 `max-volume-size: "128Gi"`，且只维护 `te-nfs` 这个名称 | 2026-07-30 修复后新建 SC 已确认 `max-volume-size=128Gi`，并成功完成 RWX PVC 动态供给；实际实例/share 装箱和成本见下一项 | Codex/用户 |
 | P0 | 已现场验证 | 临时存储探测 PV / Filestore share 回收 | 任一 `te-csi-check-*` PVC 绑定的 PV 在清理前被显式切换为 `Delete`，删除 PVC 后不遗留 `Released` PV 或 share | 2026-07-30 二次 GKE 实测，3 个本轮临时 PV 均打印“已回收”；历史 Released PV 不由本轮自动删除 | 待定 |
+| P0 | 已定位并实施，待现场复验 | 腾讯 TKE Serverless 临时 PV 回收 | 本轮 `probe-run` 下每个临时 PVC 的绑定 PV 均先切为 `Delete`、PVC 删除后在可接受时限内消失；超时必须保留 PV/CSI 证据并准确失败 | `pvc-c37c5c19-5187-498e-a273-e8518c32ad34` 已在60秒后自行消失，根因是CBS异步回收超过旧60秒等待而非清理遗漏；默认等待已调整为180秒，可由`STORAGE_PV_RECLAIM_TIMEOUT`覆盖。待下一次单EKlet回灌确认无假FAIL | Codex/用户 |
 | P0 | 已现场验证 | 清理历史 `te-csi-check-*` Released PV / Filestore share | 仅清理已核验为 `Released`、`debug/te-csi-check-*`、Filestore CSI 且无 PVC/Pod 引用的历史 PV，并确认后端 share 消失 | 用户确认历史 9 个测试 PV/share 已按安全流程清理完成；禁止把业务 `te-nfs` SC 改为 Delete | 用户/云平台管理员 |
 | P1 | 已实现，待现场验证 | 收尾识别并清理历史测试残留 PV | 候选必须通过 Released/debug/固定测试 claim/te-disk 或 te-nfs/CSI 动态卷/SC provisioner/PVC 不存在的全部门槛；所有正常路径在总览前展示后 `N` 跳过，30 秒超时或非 TTY 默认清理 | 本地 mock 已覆盖合格候选删除与业务 Released PV 排除；待 CCE 或隔离环境回灌 Y、N、超时三条路径 | Codex/用户 |
 | P0 | 已现场验证 | GKE `te-nfs` RWX 跨节点共享验证 | Writer/Reader 位于不同节点，Reader 能读取 Writer 写入的 token，临时 PV/share 均回收 | 用户确认双节点真实验证已符合预期 | 用户/Codex |
 | P0 | 已现场验证 | GKE Filestore `te-nfs` 端到端验证 | CSI、StorageClass、PVC、挂载 Pod 与检查结论均正确 | SC 创建、RWX PVC Bound、Pod 挂载读写、临时 PV 回收及双节点 Writer/Reader 跨节点共享均已现场通过 | Codex/用户 |
 | P2 | 阻塞（待授权/环境） | 标准节点 `te-nfs` 异常分流回归 | 能准确区分：无 CSI、无 StorageClass、PVC 绑定失败、挂载失败和成功 | 需独立 GKE Standard 项目/VPC、可启停 Filestore CSI/API 与控制 NFS 网络的权限；先补 Event 分类逻辑后再跑异常矩阵 | 用户/云平台管理员 |
-| P0 | 待验证 | Serverless 检查脚本独立回归 | 保留平台识别，但完全不依赖 Node / NodePool 假设；输出明确结论 | 在至少一个 Serverless 集群完成运行验证 | 待定 |
+| P0 | 部分现场验证，待修复回收问题后闭环 | 腾讯 TKE Serverless（单 EKlet）统一主脚本回归 | 识别为 `Serverless`；虚拟节点固定调度、ClusterIP、历史MySQL配置回退、RWO、RWX基础、同虚拟节点双Pod共享、统一总览和本轮资源回收均符合预期 | 2026-08-07 回灌：前述功能检查全部通过；MySQL `ta3:3306` 已按 TCP 握手正确通过；跨虚拟节点 RWX 因仅一个健康虚拟节点 SKIP。仅 PV 回收失败，见“腾讯 TKE Serverless 临时 PV 回收”专项 | Codex/用户 |
 | P0 | 设计待review | AWS EKS回归统一标准检查流程 | 已有NodePool的EKS执行完整标准检查；零NodePool前置门禁只在明确确认后进入创建；存储与consolidation按真实问题暴露入口 | 已形成 `docs/superpowers/specs/2026-08-04-aws-eks-standard-check-and-special-actions-design.md`；review后进入实施计划 | Codex/用户 |
 | P1 | 已实现，待现场验证 | Kyverno K8S兼容性检查 | `te-system` / `kube-system` 中存在 Kyverno 且 K8S>=1.34 时，发现任一版本<1.18.0或无法解析版本即重装一次；失败明确提示人工命令 | 本地矩阵已覆盖未安装、低版本、`kyvernopre`、混合/无法解析、低 K8S 版本和重装失败；待真实环境回灌 | Codex/用户 |
 | P1 | 已现场验证 | 托管云节点组业务规划交互 | 预制业务方案和自定义节点组能统一驱动 Pod 探测、节点组契约及总览；菜单首层可直接输入合法自定义节点组；GCP/AWS OR 语义和 30 秒超时正确 | 2026-08-03 GKE 交互实测：直接输入 `reserved-4c32g` 后展开为 `reserved-4c32g|od-4c32g`、打印 OR 说明并选中现存 `od-4c32g`，规划及 Pod 探测均 PASS | Codex/用户 |
@@ -40,8 +41,9 @@
 
 ### 不应合并的边界
 
-- 标准 `k8sAvailCheck.sh` 面向普通节点、存储和网络可用性。
-- Serverless 版本必须独立维护：可复用平台识别，但不得把节点池假设塞回通用路径。
+- `k8sAvailCheck.sh` 是唯一入口：根据模式执行 Standard、Serverless 或 Hybrid 分支；不再维护独立 Serverless 脚本。
+- Serverless 可读取虚拟节点元数据用于模式识别和固定调度，但不得执行标准节点池容量、节点池契约、NodePort 或宿主机网络检查。
+- Standard 存储端到端与 Serverless 临时资源回收必须复用 `_storage_e2e_cleanup`：仅本轮临时 PV 在删 PVC 前切为 `Delete`，不得改变业务 StorageClass 的 `Retain`。
 - AWS 节点组生命周期检查继续与通用检查器分离，避免通用脚本被云厂商专属逻辑污染。
 
 ## 已确认基线
@@ -51,7 +53,7 @@
 | GKE Filestore 报 `PermissionDenied` 且涉及 `file.googleapis.com` | 优先确认并启用 Cloud Filestore API；这是环境前置条件。 |
 | 存储探测顺序 | 先检查 CSI，再检查 StorageClass，避免误导性报错。 |
 | 异常运行行为 | 无论调度或扩容是否失败，脚本都应完成并输出汇总。 |
-| Serverless 兼容策略 | 保留平台识别，移除 Node / NodePool 前提。 |
+| Serverless 兼容策略 | 读取虚拟节点元数据用于识别和固定调度；移除标准节点池、NodePort、宿主机网络前提。 |
 
 ## P0 执行说明：GKE Filestore 初始化 `te-nfs`
 
@@ -139,6 +141,8 @@ mountOptions:
 | 2026-07-30 | 二次 GKE 真实验证 P0/P2 修复 | 用户回灌日志 `k8sAvailCheckResult_2026-07-30_161230.log` | 新生成的 3 个临时 PV（`f7e...`、`3b85...`、`2faa...`）均已回收；成功节点池和实时延迟信息均完整展示。末尾 9 个 Released PV 是旧脚本遗留 | 历史 Released PV 另行盘点并经变更流程清理；GKE 自动创建 SC 分支仍待验证 | 用户/Codex |
 | 2026-07-30 | GKE Metadata network 修复后真实验证 | 用户回灌日志 `k8sAvailCheckResult_2026-07-30_234552.log` | 新建 `te-nfs` 的参数为 `network=default`、`max-volume-size=128Gi`；RWX PVC 动态供给、挂载读写及临时 PV 回收通过。单节点环境使跨节点验证正确 SKIP | 在至少两个节点的 GKE 集群验证 RWX 跨节点共享；核验 Filestore 实例/share 装箱和成本 | 用户/Codex |
 | 2026-07-30 | 核销 GKE 历史 PV 清理与双节点 RWX | 用户确认 | 历史 9 个 `debug/te-csi-check-*` Released PV/share 已清理；双节点 RWX 共享验证已通过 | 转向 Filestore 成本/实例复用核验与标准节点异常分流回归设计 | 用户/Codex |
+| 2026-08-07 | 腾讯 TKE Serverless 单 EKlet 主脚本回灌 | 用户提供的 `k8sAvailCheckResult_2026-08-07_212349.log` 摘要及 `kubectl get pv` | 模式识别、固定虚拟节点调度、ClusterIP、历史 MySQL 配置回退与 TCP 握手、`te-disk` RWO、`te-nfs` RWX基础和同虚拟节点双Pod共享均通过；跨虚拟节点 RWX 因单虚拟节点正确SKIP。本轮 `te-disk` PV 在 60 秒内未回收，且发现此前多轮 Serverless `te-nfs` Released PV | 按本轮 `probe-run=sl-20260807-212349-33285` 取证超时 PV 的回收策略、finalizer 和 CSI Event；确认公共 `_storage_e2e_cleanup` 在 TKE CBS 上的异步回收边界，再决定是否调整等待或分类 | 用户/Codex |
+| 2026-08-10 | 腾讯CBS回收阈值与Serverless历史残留追踪 | 用户确认异常PV后续已消失；`bash tests/test_k8s_avail_check.sh`、`bash tests/test_k8s_serverless_avail_check.sh` | 60秒是假失败窗口，不是CBS/CSI删除故障；本轮等待默认调整为180秒。历史扫描已安全纳入精确`sl-disk/sl-nfs/sl-nfs-shared/sl-nfs-cross`测试命名，Serverless收尾也执行同一历史PV清理流程 | 在腾讯现场确认候选仅包含现有Released `debug/sl-*`测试PV，确认清理后无残留且业务PV不受影响 | Codex/用户 |
 
 ## 回归矩阵
 
@@ -150,7 +154,10 @@ mountOptions:
 | 无 CSI | 无 | 任意 | 明确指出 CSI 缺失，不误报 SC/PVC | 待验证 | 待验证 | - |
 | 有 CSI、无匹配 SC | 有 | 无 | 明确指出 StorageClass 缺失 | 待验证 | 待验证 | - |
 | 调度失败 / 不触发扩容 | 有 | Pod Pending | 最终摘要包含失败原因和建议 | 待验证 | 待验证 | - |
-| Serverless | 平台相关 | 平台相关 | 不查询 Node / NodePool 也能完成检查 | 待验证 | 待验证 | - |
+| 腾讯 TKE Serverless + 单 EKlet | 腾讯CSI | `te-disk` RWO、`te-nfs` RWX | 虚拟节点固定调度、ClusterIP、MySQL、RWO、RWX基础和同虚拟节点共享通过；跨虚拟节点仅在至少两个健康虚拟节点时执行；本轮PV必须回收 | 2026-08-07 | 功能检查通过，跨虚拟节点RWX正确SKIP；`te-disk` PV回收超时，整体FAIL | 用户回灌 `k8sAvailCheckResult_2026-08-07_212349.log`；待补PV/CSI证据 |
+| 腾讯 TKE Serverless + 多 EKlet | 腾讯CSI | `te-disk` RWO、`te-nfs` RWX | 两个虚拟节点分别起服并完成跨虚拟节点RWX共享，临时PV均回收 | 待验证 | 待验证 | - |
+| 阿里 Serverless + Virtual Kubelet | 阿里CSI | `te-disk` RWO、`te-nfs` RWX | 正确识别、固定虚拟节点调度、ClusterIP、存储和回收均通过 | 待验证 | 待验证 | - |
+| Hybrid | 平台相关 | 两类临时资源 | Serverless失败不阻断Standard；最终统一汇总，任一FAIL保留 | 待验证 | 待验证 | - |
 
 ## 每次更新前的最小检查
 

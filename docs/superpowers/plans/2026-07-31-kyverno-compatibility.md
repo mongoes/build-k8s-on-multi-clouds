@@ -13,7 +13,7 @@
 - Only Pod names containing `kyverno` in `te-system` and `kube-system` are platform Kyverno candidates.
 - Kubernetes threshold is `1.34`; Kyverno minimum is `1.18.0`.
 - Any unparseable candidate image version is an upgrade fallback when Kubernetes is at least `1.34`.
-- Use `/data/app/.admin_manager_ta/ta-admin/ta-admin te_k8s install -name kyverno` exactly once at most.
+- Use `/data/app/.admin_manager_ta/ta-admin te_k8s install -name kyverno` exactly once at most.
 - Failed installer execution must record `FAIL` and print the copyable command.
 
 ---
