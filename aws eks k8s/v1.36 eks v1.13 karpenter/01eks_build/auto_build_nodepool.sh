@@ -63,14 +63,99 @@ checkUser() {
   fi
 }
 
+# 选择本轮唯一kubeconfig：有效显式路径优先，否则只回退Kubernetes默认路径。
+select_target_kubeconfig() {
+  local explicit_config="${KUBECONFIG:-}"
+  local default_config="${KUBECONFIG_DEFAULT_PATH:-${HOME}/.kube/config}"
+
+  if [[ -n "$explicit_config" && -f "$explicit_config" ]]; then
+    TARGET_KUBECONFIG="$explicit_config"
+  elif [[ -f "$default_config" ]]; then
+    if [[ -n "$explicit_config" ]]; then
+      echo "[WARN] 环境变量KUBECONFIG指向的文件不存在: ${explicit_config}"
+    fi
+    TARGET_KUBECONFIG="$default_config"
+    echo "[INFO] 已回退使用Kubernetes默认配置: ${TARGET_KUBECONFIG}"
+  else
+    log_error "未找到可用Kubeconfig：KUBECONFIG=${explicit_config:-未设置}，默认路径=${default_config}。"
+    return 1
+  fi
+  KUBECONFIG="$TARGET_KUBECONFIG"
+  export KUBECONFIG
+}
+
+# 只从当前kubeconfig context关联的标准EKS ARN解析目标身份，绝不从AWS集群列表猜测。
+resolve_target_eks_environment() {
+  local config_json cluster_ref arn_source
+  TARGET_CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null) || {
+    log_error "无法读取Kubeconfig current-context，拒绝继续。"
+    return 1
+  }
+  [[ -n "$TARGET_CURRENT_CONTEXT" ]] || {
+    log_error "Kubeconfig current-context为空，拒绝继续。"
+    return 1
+  }
+  config_json=$(kubectl config view --raw -o json 2>/dev/null) || {
+    log_error "无法读取Kubeconfig结构，拒绝继续。"
+    return 1
+  }
+  cluster_ref=$(printf '%s' "$config_json" | jq -er --arg context "$TARGET_CURRENT_CONTEXT" '.contexts[] | select(.name == $context) | .context.cluster' 2>/dev/null) || {
+    log_error "current-context未关联唯一Cluster配置，拒绝继续。"
+    return 1
+  }
+  TARGET_API_SERVER=$(printf '%s' "$config_json" | jq -er --arg cluster "$cluster_ref" '.clusters[] | select(.name == $cluster) | .cluster.server | select(type == "string" and length > 0)' 2>/dev/null) || {
+    log_error "无法解析当前Cluster的API Server，拒绝继续。"
+    return 1
+  }
+
+  arn_source="$cluster_ref"
+  [[ "$arn_source" == arn:*:eks:*:*:cluster/* ]] || arn_source="$TARGET_CURRENT_CONTEXT"
+  if [[ "$arn_source" =~ ^arn:(aws|aws-cn|aws-us-gov):eks:([^:]+):([0-9]{12}):cluster/(.+)$ ]]; then
+    TARGET_AWS_REGION="${BASH_REMATCH[2]}"
+    TARGET_AWS_ACCOUNT_ID="${BASH_REMATCH[3]}"
+    TARGET_CLUSTER_NAME="${BASH_REMATCH[4]}"
+  else
+    log_error "当前context无法证明为标准AWS EKS ARN，拒绝猜测集群名或Region: ${TARGET_CURRENT_CONTEXT}"
+    return 1
+  fi
+  [[ -n "$TARGET_CLUSTER_NAME" && -n "$TARGET_AWS_REGION" ]] || {
+    log_error "EKS集群名或Region解析为空，拒绝继续。"
+    return 1
+  }
+  AWS_DEFAULT_REGION="$TARGET_AWS_REGION"
+  export AWS_DEFAULT_REGION
+}
+
+confirm_target_eks_environment() {
+  local confirmation=""
+  echo ""
+  echo "========== 当前目标EKS环境确认 =========="
+  printf '%-18s %s\n' "Kubeconfig:" "$TARGET_KUBECONFIG"
+  printf '%-18s %s\n' "Current Context:" "$TARGET_CURRENT_CONTEXT"
+  printf '%-18s %s\n' "AWS Account:" "$TARGET_AWS_ACCOUNT_ID"
+  printf '%-18s %s\n' "AWS Region:" "$TARGET_AWS_REGION"
+  printf '%-18s %s\n' "EKS Cluster:" "$TARGET_CLUSTER_NAME"
+  printf '%-18s %s\n' "API Server:" "$TARGET_API_SERVER"
+  echo "========================================="
+  while true; do
+    if ! read_tty_input confirmation "请确认以上EKS是本次要操作的目标集群，是否继续 <y/n>: "; then
+      return 1
+    fi
+    case "$confirmation" in
+      y|Y) return 0 ;;
+      n|N)
+        echo "已取消，未执行节点组创建、测试或污点操作。"
+        return 2
+        ;;
+      *) log_error "输入无效，只允许输入 y 或 n，请重新确认目标环境。" ;;
+    esac
+  done
+}
+
 #K8S集群链接检查
 test_k8s_connection() {
   log_step "测试K8S集群连接"
-  #密钥文件
-  if [[ -z "${KUBECONFIG}" ]] || [[ ! -f "${KUBECONFIG}" ]]; then
-    log_error "未找到KUBECONFIG文件，请参考数数SOP配置K8S访问凭证"
-    exit 1
-  fi
+  select_target_kubeconfig || exit 1
 
   if ! kubectl cluster-info &>/dev/null; then
     log_error "无法连接到Kubernetes集群，请检查配置"
@@ -79,34 +164,20 @@ test_k8s_connection() {
   log_success "K8S集群连接正常"
 }
 
-# 获取EKS集群名的方法，EKS集群名是必要信息，尝试从多个来源获取EKS集群名
+# 获取 EKS 集群名；只接受当前 kubeconfig context 中可证明的集群名，绝不猜测账户中的第一个集群。
 get_cluster_name() {
   local cluster_name=""
 
-  # 1. 优先尝试从KUBECONFIG环境变量解析
-  #检查当前主机是否有KUBECONFIG的环境变量，数数ta1上要求必须要有，获取该环境变量并尝试解析EKS集群名
+  if [[ -n "${TARGET_CLUSTER_NAME:-}" ]]; then
+    echo "$TARGET_CLUSTER_NAME"
+    return 0
+  fi
+
+  # 只从 KUBECONFIG 的 current-context 解析。无法证明目标集群时由调用方失败退出。
   if [ -n "${KUBECONFIG}" ] && [ -f "${KUBECONFIG}" ]; then
     cluster_name=$(awk '/current-context:/ {split($2, a, "/"); print a[2]}' "${KUBECONFIG}" 2>/dev/null)
-  else
-    #如果不存在$KUBECONFIG变量，可能意味着当前并非ta1主机或者忘记配置环境变量
-    echo "当前终端可能非ta1主机环境或忘记配置KUBECONFIG环境变量，无法获取EKS集群名，尝试通过aws指令获取中~"
   fi
-
-  # 2. 如果KUBECONFIG解析失败，尝试AWS CLI
-  if [ -z "${cluster_name}" ]; then
-    echo "尝试通过AWS EKS API获取集群名..."
-    # 使用jq解析JSON输出，更可靠
-    if command -v jq >/dev/null 2>&1; then
-      cluster_name=$(aws eks list-clusters --query 'clusters[0]' --output json 2>/dev/null | jq -r . 2>/dev/null)
-    else
-      # 如果没有jq，使用grep+cut
-      cluster_name=$(aws eks list-clusters --output text 2>/dev/null | head -1 | cut -f2)
-    fi
-  fi
-
-  #输出cluster_name
   echo "${cluster_name}"
-
 }
 
 #获取可用区的方法
@@ -141,6 +212,153 @@ get_os_alias_version() {
   fi
 }
 
+# 从控制终端读取输入；历史配置复用和同名重输绝不接受管道/CI 输入。
+read_tty_input() {
+  local variable_name=$1 prompt=$2 value=""
+  if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+    log_error "需要在交互式终端确认，非交互环境不创建节点组。"
+    return 1
+  fi
+  printf '%s' "$prompt" >/dev/tty
+  if ! IFS= read -r -t 300 value </dev/tty; then
+    log_error "等待输入超时或读取失败，未创建节点组。"
+    return 1
+  fi
+  printf -v "$variable_name" '%s' "$value"
+}
+
+# NodePool 读取的唯一边界：只有合法 JSON 中的空 items 数组才表示“零 NodePool”。
+load_nodepools_json() {
+  local nodepools_json
+  nodepools_json=$(kubectl get nodepool -o json 2>/dev/null) || {
+    log_error "读取 NodePool 列表失败，无法判断集群现状，未创建节点组。"
+    return 1
+  }
+  printf '%s' "$nodepools_json" | jq -ce 'if (.items | type) == "array" then {items: .items} else error("NodePool JSON missing items array") end' 2>/dev/null || {
+    log_error "NodePool 列表返回格式无效，未创建节点组。"
+    return 1
+  }
+}
+
+# 读取并比较完整 NodePool/EC2NodeClass 网络配置：完全合规时自动采用当前规范，
+# 只有发现差异时才由操作者选择复用历史配置或采用当前规范。
+select_existing_nodepool_config() {
+  local nodepools_json nodepool_name nodepool_json nodeclass_json zone_json subnet_json security_group_json
+  local expected_zone_json expected_subnet_json expected_security_group_json expected_key key
+  local selection reuse_answer selected_key candidate_count=0 candidate_index existing_index
+  local duplicate existing_key difference
+  local -a candidate_keys=() candidate_sources=()
+
+  expected_zone_json=$(jq -nc --arg zone "$AvailabilityZone" '[ $zone ]')
+  expected_subnet_json=$(jq -nc --arg key "$subnetSelectorKey" --arg value "$subnetSelectorValue" '[{tags:{($key):$value}}] | sort_by(tojson)')
+  expected_security_group_json=$(jq -nc --arg key "$securityGroupSelectorKey" --arg value "$securityGroupSelectorValue" '[{tags:{($key):$value}}] | sort_by(tojson)')
+  expected_key="${expected_zone_json}|${expected_subnet_json}|${expected_security_group_json}"
+  HISTORICAL_CONFIG_SELECTED=false
+
+  nodepools_json=$(load_nodepools_json) || return 1
+  while IFS= read -r nodepool_name; do
+    [[ -n "$nodepool_name" ]] || continue
+    nodepool_json=$(kubectl get nodepool "$nodepool_name" -o json 2>/dev/null) || {
+      log_error "读取 NodePool ${nodepool_name} JSON 失败，未创建节点组。"
+      return 1
+    }
+    nodeclass_json=$(kubectl get ec2nodeclass "$nodepool_name" -o json 2>/dev/null) || {
+      log_error "NodePool ${nodepool_name} 缺少同名 EC2NodeClass，未创建节点组。"
+      return 1
+    }
+    zone_json=$(printf '%s' "$nodepool_json" | jq -ce '[.spec.template.spec.requirements[]? | select(.key == "topology.kubernetes.io/zone") | .values[]] | unique | sort | select(length > 0)') || {
+      log_error "NodePool ${nodepool_name} 缺少可用区 requirement，未创建节点组。"
+      return 1
+    }
+    subnet_json=$(printf '%s' "$nodeclass_json" | jq -ce '.spec.subnetSelectorTerms | select(type == "array" and length > 0) | sort_by(tojson)') || {
+      log_error "EC2NodeClass ${nodepool_name} 缺少 subnetSelectorTerms，未创建节点组。"
+      return 1
+    }
+    security_group_json=$(printf '%s' "$nodeclass_json" | jq -ce '.spec.securityGroupSelectorTerms | select(type == "array" and length > 0) | sort_by(tojson)') || {
+      log_error "EC2NodeClass ${nodepool_name} 缺少 securityGroupSelectorTerms，未创建节点组。"
+      return 1
+    }
+    key="${zone_json}|${subnet_json}|${security_group_json}"
+    duplicate=false
+    if [[ $candidate_count -gt 0 ]]; then
+      for existing_index in "${!candidate_keys[@]}"; do
+        existing_key=${candidate_keys[$existing_index]}
+        if [[ "$existing_key" == "$key" ]]; then
+          candidate_sources[$existing_index]="${candidate_sources[$existing_index]}, ${nodepool_name}"
+          duplicate=true
+          break
+        fi
+      done
+    fi
+    if ! $duplicate; then
+      candidate_keys[$candidate_count]="$key"
+      candidate_sources[$candidate_count]="$nodepool_name"
+      candidate_count=$((candidate_count + 1))
+    fi
+  done < <(printf '%s' "$nodepools_json" | jq -er '.items[]?.metadata.name')
+
+  if [[ $candidate_count -eq 0 ]]; then
+    log_error "未发现可复用的历史 NodePool 网络配置，未创建节点组。"
+    return 1
+  fi
+  if [[ $candidate_count -eq 1 && "${candidate_keys[0]}" == "$expected_key" ]]; then
+    echo "检测到存量节点池且确认其关键配置符合最佳规范！"
+    return 0
+  fi
+
+  echo "检测到存量节点池的关键配置与当前最佳规范存在差异："
+  for ((candidate_index=0; candidate_index<candidate_count; candidate_index++)); do
+    selected_key="${candidate_keys[$candidate_index]}"
+    IFS='|' read -r zone_json subnet_json security_group_json <<<"$selected_key"
+    echo "历史配置 [$((candidate_index + 1))]（来源 NodePool: ${candidate_sources[$candidate_index]}）"
+    echo "  Zone: ${zone_json}"
+    echo "  Subnet selector: ${subnet_json}"
+    echo "  SecurityGroup selector: ${security_group_json}"
+    difference=""
+    [[ "$zone_json" == "$expected_zone_json" ]] || difference="${difference} Zone"
+    [[ "$subnet_json" == "$expected_subnet_json" ]] || difference="${difference} Subnet-selector"
+    [[ "$security_group_json" == "$expected_security_group_json" ]] || difference="${difference} SecurityGroup-selector"
+    if [[ -n "$difference" ]]; then
+      echo "  差异项:${difference}"
+    else
+      echo "  差异项: 无（该候选符合当前最佳规范）"
+    fi
+  done
+  echo "当前最佳规范："
+  echo "  Zone: ${expected_zone_json}"
+  echo "  Subnet selector: ${expected_subnet_json}"
+  echo "  SecurityGroup selector: ${expected_security_group_json}"
+
+  while true; do
+    if ! read_tty_input reuse_answer "是否复用历史配置？输入 y 复用历史配置，输入 n 采用当前最佳规范 <y/n>: "; then return 1; fi
+    case "$reuse_answer" in
+      y|Y) break ;;
+      n|N)
+        echo "已选择当前最佳规范，将继续创建新的业务节点组。"
+        HISTORICAL_CONFIG_SELECTED=false
+        return 0
+        ;;
+      *) log_error "输入无效，只允许输入 y 或 n，请重新选择。" ;;
+    esac
+  done
+
+  if [[ $candidate_count -gt 1 ]]; then
+    while true; do
+      if ! read_tty_input selection "请输入要复用的历史配置序号 [1-${candidate_count}]: "; then return 1; fi
+      if [[ "$selection" =~ ^[0-9]+$ && "$selection" -ge 1 && "$selection" -le $candidate_count ]]; then
+        break
+      fi
+      log_error "配置序号无效，只允许输入 1-${candidate_count}，请重新选择。"
+    done
+  else
+    selection=1
+  fi
+  selected_key=${candidate_keys[$((selection - 1))]}
+  IFS='|' read -r HISTORICAL_ZONE_VALUES HISTORICAL_SUBNET_SELECTOR_TERMS HISTORICAL_SECURITY_GROUP_SELECTOR_TERMS <<<"$selected_key"
+  HISTORICAL_CONFIG_SELECTED=true
+  echo "已选择复用历史配置 [${selection}]（来源 NodePool: ${candidate_sources[$((selection - 1))]}）。"
+}
+
 #创建业务节点组
 build_nodepool_for_business() {
   #创建节点组需要操作系统(AMI)版本信息,此处获取并校验ssm/ec2相关权限
@@ -152,15 +370,8 @@ build_nodepool_for_business() {
   if [ -n "${CLUSTER_NAME}" ]; then
     echo "检测到当前终端加载到的EKS集群名为: ${CLUSTER_NAME}"
   else
-    read -p "未能自动获取到EKS集群名(EKS创建脚本或AWS EKS控制台可查)，请手动输入: " ZONE_INPUT
-    if [ -z "$ZONE_INPUT" ]; then
-      log_error "EKS集群名是创建节点组的必要条件，不得为空，请确认信息后重试本脚本！"
-      exit 1
-    else
-      CLUSTER_NAME=$ZONE_INPUT
-      log_message "INFO: 用户输入的EKS集群名信息为${CLUSTER_NAME}"
-    fi
-
+    log_error "无法从当前 KUBECONFIG 的 current-context 解析 EKS 集群名；为避免误操作其他集群，本次不创建节点组！"
+    exit 1
   fi
   #TE集群可用区信息， 必要信息！！！需做不为空判断!!!
   #脚本会尝试自动获取当前节点的可用区（默认在TA集群内节点上执行该脚本），如获取不到则要求用户手动输入
@@ -199,56 +410,15 @@ build_nodepool_for_business() {
   #如有先备份已有节点组的yaml配置,并检查已有节点组的名称、机型、子网标签key/value、安全组标签key/value，与数数规范对比；当不一致时询问用户是否需要复用老节点组配置
   #注意:无节点组时 kubectl get nodepool 会向stderr输出"No resources found",故用 2>/dev/null 抑制在kubectl处,避免裸露信息干扰用户
   echo "正在检测当前EKS环境是否已存在节点组......"
-  nodepool_records=$(kubectl get nodepool 2>/dev/null | grep -v 'NAME' | wc -l)
+  nodepools_json=$(load_nodepools_json) || exit 1
+  nodepool_records=$(printf '%s' "$nodepools_json" | jq '.items | length')
   if [ ${nodepool_records} -gt 0 ]; then
-    #如果检测到已有karpenter节点组记录，先备份留档
-    echo "检测完成:检测到当前EKS环境中存在如下 ${nodepool_records} 个节点组,正在检查已有节点组的关键配置是否符合规范,请稍等~"
+    echo "检测完成:检测到当前EKS环境中存在 ${nodepool_records} 个节点组，正在审查其历史网络配置。"
     kubectl get nodepool
     kubectl get karpenter -oyaml >${OUTPUT_DIR}/karpenter_backup.yaml
-
-    #获取已有节点组的可用区信息、安全组标签信息、子网标签信息
-    nodepool_name=$(kubectl get nodepool | grep -v 'NAME' | head -1 | awk '{print $1}')
-    zoneValue=$(kubectl get nodepool ${nodepool_name} -o jsonpath='{.spec.template.spec.requirements[?(@.key=="topology.kubernetes.io/zone")].values[*]}')
-    securityGroupSelector=$(kubectl get ec2nodeclass ${nodepool_name} -o jsonpath='{.spec.securityGroupSelectorTerms[0].tags}')
-    subnetSelector=$(kubectl get ec2nodeclass ${nodepool_name} -o jsonpath='{.spec.subnetSelectorTerms[0].tags}')
-    log_message "INFO: 检测到当前EKS环境中存在 ${nodepool_records} 个节点组，抽样节点组名为 ${nodepool_name},可用区信息为: ${zoneValue},安全组标签为: ${securityGroupSelector},子网标签为: ${subnetSelector}"
-    log_message "INFO: 数规范默认要求的可用区信息为：${AvailabilityZone},安全组标签为${securityGroupSelectorKey}: ${securityGroupSelectorValue},子网标签为 ${subnetSelectorKey}: ${subnetSelectorValue}"
-
-    #对比已有节点组中关键信息和数数规范，当不一致时需要询问用户是否需要复用已有节点组中的信息，一致的话省略信息提示并进入默认的节点组创建流程
-    exist_nodepool_securityGroupSelectorKey=$(echo ${securityGroupSelector} | jq -r 'keys_unsorted[]')
-    exist_nodepool_securityGroupSelectorValue=$(echo ${securityGroupSelector} | jq -r '.[]')
-    exist_nodepool_subnetSelectorKey=$(echo ${subnetSelector} | jq -r 'keys_unsorted[]')
-    exist_nodepool_subnetSelectorValue=$(echo ${subnetSelector} | jq -r '.[]')
-    if [[ ${zoneValue} == ${AvailabilityZone} && ${exist_nodepool_securityGroupSelectorKey} == ${securityGroupSelectorKey} && ${exist_nodepool_securityGroupSelectorValue} == ${securityGroupSelectorValue} && ${exist_nodepool_subnetSelectorKey} == ${subnetSelectorKey} && ${exist_nodepool_subnetSelectorValue} == ${subnetSelectorValue} ]]; then
-      log_message "INFO: 检查当前EKS环境中已有节点组的关键配置符合数数规范,配置一致"
-      echo "检查完成，确认已有节点组关键配置符合规范"
-    else
-      log_error "监测到当前EKS环境中存在如下所示 ${nodepool_records} 个节点组，组内关键配置与数数规范配置不一致"
-      log_error "已有节点组关键信息 可用区信息为: ${zoneValue},安全组标签为${exist_nodepool_securityGroupSelectorKey}: ${exist_nodepool_securityGroupSelectorValue},子网标签为${exist_nodepool_subnetSelectorKey}: ${exist_nodepool_subnetSelectorValue}"
-      log_error "数数规范期望信息   可用区信息为：${AvailabilityZone},安全组标签为${securityGroupSelectorKey}: ${securityGroupSelectorValue},子网标签为 ${subnetSelectorKey}: ${subnetSelectorValue}"
-
-      read -p "请确认是否复用已有节点组中的可用区、安全组、子网等信息 <y/n>" need_create_base_nodepool
-      # 将输入转换为小写进行统一判断
-      format_if_create_base=$(echo "$need_create_base_nodepool" | tr '[:upper:]' '[:lower:]')
-      if [ "${format_if_create_base}" == "y" ]; then
-        log_message "WARN: 创建新节点组时使用已有老节点组配置"
-        AvailabilityZone=${zoneValue}
-        securityGroupSelectorKey=${exist_nodepool_securityGroupSelectorKey}
-        securityGroupSelectorValue=${exist_nodepool_securityGroupSelectorValue}
-        subnetSelectorKey=${exist_nodepool_subnetSelectorKey}
-        subnetSelectorValue=${exist_nodepool_subnetSelectorValue}
-      else
-        log_message "WARN: 创建新节点组时使用数数规范"
-      fi
-    fi
+    select_existing_nodepool_config || exit 1
   else
-    #没有在用节点组，意味着是新EKS环境，直接预创建base节点组
-    echo "检测完成:当前EKS环境暂无节点组(全新环境),将自动预创建 base 基础节点组"
-    build_nodepool_for_base
-    #base门禁:base与后续业务节点组复用同一套子网/安全组发现标签,若base资源对象异常,业务节点组大概率也异常。
-    #故在全新环境下先校验base就绪(不通过则精准报错并退出),避免浪费时间创建注定失败的业务节点组。
-    echo "base 是后续业务节点组的基础设施探针(复用同套子网/安全组标签),先校验其就绪再继续......"
-    wait_nodepools_ready base-nodepool
+    echo "检测完成:当前EKS环境暂无Karpenter NodePool，将仅按后续输入创建业务节点组"
   fi
   ####EKS是否已有节点组检查 END####
 
@@ -270,6 +440,10 @@ build_nodepool_for_business() {
   read -p "请为每个节点组选择规格（例如:4c32g 16c64g 32c128g 64c256g,顺序需与节点组名称对应,多规格之间空格分隔）: " input_nodepool_sizes
   read -p "请为每个节点组指定付费类型（支持od spot,顺序需与节点组名称一一对应,多付费类型之间空格分隔）: " input_nodepool_billing_mode
   echo ""
+  if [[ -z "${input_nodepool_names//[[:space:]]/}" || -z "${input_nodepool_sizes//[[:space:]]/}" || -z "${input_nodepool_billing_mode//[[:space:]]/}" ]]; then
+    log_error "错误：节点组名称、规格和付费类型均为必填项；未声明业务节点组，不会创建任何资源！"
+    exit 1
+  fi
   # 转换为数组
   IFS=' ' read -ra NODEPOOL_NAMES <<<"$input_nodepool_names"
   IFS=' ' read -ra NODEPOOL_SIZES <<<"$input_nodepool_sizes"
@@ -302,10 +476,34 @@ build_nodepool_for_business() {
       exit 1
     fi
   done
+  if [[ "${HISTORICAL_CONFIG_SELECTED:-false}" == "true" ]]; then
+    NODEPOOL_ZONE_VALUES="$HISTORICAL_ZONE_VALUES"
+    NODEPOOL_SUBNET_SELECTOR_TERMS="$HISTORICAL_SUBNET_SELECTOR_TERMS"
+    NODEPOOL_SECURITY_GROUP_SELECTOR_TERMS="$HISTORICAL_SECURITY_GROUP_SELECTOR_TERMS"
+  else
+    NODEPOOL_ZONE_VALUES=$(jq -nc --arg zone "$AvailabilityZone" '[ $zone ]')
+    NODEPOOL_SUBNET_SELECTOR_TERMS=$(jq -nc --arg key "$subnetSelectorKey" --arg value "$subnetSelectorValue" '[{tags:{($key):$value}}]')
+    NODEPOOL_SECURITY_GROUP_SELECTOR_TERMS=$(jq -nc --arg key "$securityGroupSelectorKey" --arg value "$securityGroupSelectorValue" '[{tags:{($key):$value}}]')
+  fi
   echo -e "==========  开始创建指定的${#NODEPOOL_NAMES[@]}个业务节点组 "${NODEPOOL_NAMES[@]}" =========="
   # 创建每个节点组,建立节点组名、规格、付费类型映射
   for i in "${!NODEPOOL_NAMES[@]}"; do
     NODEPOOL_NAME="${NODEPOOL_NAMES[$i]}"
+    # 同名对象不接管、不覆盖；仅重新输入当前这一项名称，保留其规格和计费类型。
+    while true; do
+      name_conflict=false
+      if kubectl get nodepool "$NODEPOOL_NAME" >/dev/null 2>&1; then
+        name_conflict=true
+      fi
+      for previous_index in "${!NODEPOOL_NAMES[@]}"; do
+        [[ "$previous_index" -lt "$i" && "${NODEPOOL_NAMES[$previous_index]}" == "$NODEPOOL_NAME" ]] && name_conflict=true
+      done
+      $name_conflict || break
+      log_error "NodePool 名称 ${NODEPOOL_NAME} 已存在或在本轮输入中重复；不会 apply，请重新输入该节点组名称。"
+      if ! read_tty_input NODEPOOL_NAME "新的 NodePool 名称: "; then exit 1; fi
+      [[ -n "$NODEPOOL_NAME" ]] || { log_error "NodePool 名称不得为空。"; exit 1; }
+    done
+    NODEPOOL_NAMES[$i]="$NODEPOOL_NAME"
     SIZE="${NODEPOOL_SIZES[$i]}"
     # 获取实例类型列表
     INSTANCE_TYPES="${INSTANCE_TYPE_MAP[$SIZE]}"
@@ -352,7 +550,7 @@ spec:
       requirements:
         - key: topology.kubernetes.io/zone
           operator: In
-          values: ["${AvailabilityZone}"]
+          values: ${NODEPOOL_ZONE_VALUES}
         - key: node.kubernetes.io/instance-type
           operator: In
           values: 
@@ -374,7 +572,7 @@ $(for type in $INSTANCE_TYPES; do echo "            - $type"; done)
       expireAfter: Never
 $([[ -n "$TAINT_SECTION" ]] && echo "$TAINT_SECTION")
   limits:
-    cpu: 1000
+    cpu: 3200
   disruption:
     # consolidationPolicy: WhenEmpty 仅当节点为空(无非DaemonSet业务Pod)时才回收,不做低利用率合并,是数数线上沉淀的保守回收策略(官方默认WhenEmptyOrUnderutilized更激进)
     # consolidateAfter: 10m 节点变空后等待10分钟再回收,给短时Pod腾挪留缓冲,避免节点频繁抖动创建/销毁
@@ -395,12 +593,8 @@ spec:
     ebs:
       volumeSize: 150Gi
       volumeType: gp3
-  subnetSelectorTerms:
-    - tags:
-        "${subnetSelectorKey}": "${subnetSelectorValue}"
-  securityGroupSelectorTerms:
-    - tags:
-        "${securityGroupSelectorKey}": "${securityGroupSelectorValue}"
+  subnetSelectorTerms: ${NODEPOOL_SUBNET_SELECTOR_TERMS}
+  securityGroupSelectorTerms: ${NODEPOOL_SECURITY_GROUP_SELECTOR_TERMS}
   tags:
     name: eks-thinkingai
     owner: shushu
@@ -424,95 +618,6 @@ EOF
 
   log_success "********  所有业务节点组都已创建完成！nodepool配置文件保存在 $OUTPUT_DIR 目录 ********"
   echo ""
-}
-
-#创建基础节点组
-build_nodepool_for_base() {
-  echo ""
-  cat <<EOF >${OUTPUT_DIR}/nodepool-base-nodepool.yaml
-apiVersion: karpenter.sh/v1
-kind: NodePool
-metadata:
-  name: base-nodepool
-spec:
-  template:
-    metadata:
-      labels:
-        node.kubernetes.type: base-nodepool
-        node.k8s.te/nodepool-name: base-nodepool
-        node.k8s.te/nodepool-instancespec: 4c16g
-        node.k8s.te/billing-mode: od
-    spec:
-      requirements:
-        - key: topology.kubernetes.io/zone
-          operator: In
-          values: ["${AvailabilityZone}"]
-        - key: node.kubernetes.io/instance-type
-          operator: In
-          values: 
-          - m6a.xlarge
-          - m6i.xlarge
-          - m7a.xlarge
-          - m7i.xlarge
-          - m7i-flex.xlarge
-        - key: kubernetes.io/arch
-          operator: In
-          values: ["amd64"]
-        - key: kubernetes.io/os
-          operator: In
-          values: ["linux"]
-        - key: karpenter.sh/capacity-type
-          operator: In
-          values: ["on-demand"]
-      nodeClassRef:
-        name: base-nodepool
-        group: karpenter.k8s.aws
-        kind: EC2NodeClass
-      # expireAfter: Never 节点永不主动过期轮换,稳定优先(口径同业务节点组)
-      expireAfter: Never
-  limits:
-    cpu: 1000
-  disruption:
-    # consolidationPolicy: WhenEmpty 仅当节点为空时才回收,不做低利用率合并(数数线上保守回收策略)
-    # consolidateAfter: 10m 节点变空后等待10分钟再回收,避免节点频繁抖动
-    consolidationPolicy: WhenEmpty
-    consolidateAfter: 10m
----
-apiVersion: karpenter.k8s.aws/v1
-kind: EC2NodeClass
-metadata:
-  name: base-nodepool
-spec:
-  amiFamily: AL2023
-  amiSelectorTerms:
-    - alias: "al2023@${ALIAS_VERSION}"
-  role: "KarpenterNodeRole-${CLUSTER_NAME}"
-  blockDeviceMappings:
-  - deviceName: /dev/xvda
-    ebs:
-      volumeSize: 150Gi
-      volumeType: gp3
-  subnetSelectorTerms:
-    - tags:
-        "${subnetSelectorKey}": "${subnetSelectorValue}"
-  securityGroupSelectorTerms:
-    - tags:
-        "${securityGroupSelectorKey}": "${securityGroupSelectorValue}"
-  tags:
-    name: eks-thinkingai
-    owner: shushu
-EOF
-
-  kubectl apply -f ${OUTPUT_DIR}/nodepool-base-nodepool.yaml
-  # 检查应用结果
-  if [ $? -eq 0 ]; then
-    # 等待节点组就绪
-    sleep 10
-    title2_message "节点组 [base-nodepool] 创建成功!"
-  else
-    log_error "警告：节点组 [base-nodepool] 创建失败，请检查配置文件"
-    exit 1
-  fi
 }
 
 #根据 Pod 解析其顶层工作负载控制器,输出格式 "kind name"(如 Deployment trino-worker-ch-default)
@@ -866,13 +971,94 @@ taints_all_spot_nodepool() {
   echo "操作完成。"
 }
 
+# 尽力采集 NodePool -> NodeClaim -> Node -> EC2 运行证据，仅供事后审计。
+# 任一读取或写盘失败只记录 WARN，绝不改变既有可用性测试结论。
+collect_nodepool_runtime_evidence() {
+  local nodepool_name=$1 run_id=$2
+  local evidence_root="${NODEPOOL_EVIDENCE_DIR:-./nodepool_evidence}"
+  local evidence_dir="${evidence_root}/${run_id}/${nodepool_name}"
+  local warnings_file="${evidence_dir}/collection-warnings.txt"
+  local complete=true instance_ids="" instance_id
+
+  if ! mkdir -p "$evidence_dir" 2>/dev/null; then
+    echo "[WARN] 无法创建NodePool运行证据目录 ${evidence_dir}，不影响本轮可用性结论。"
+    return 0
+  fi
+  : >"$warnings_file" 2>/dev/null || {
+    echo "[WARN] 无法创建NodePool运行证据告警文件 ${warnings_file}，不影响本轮可用性结论。"
+    return 0
+  }
+
+  capture_evidence_command() {
+    local output_file=$1 description=$2
+    shift 2
+    if ! "$@" >"${evidence_dir}/${output_file}" 2>"${evidence_dir}/${output_file}.error"; then
+      complete=false
+      printf '[WARN] %s读取失败；原始错误见 %s.error\n' "$description" "$output_file" >>"$warnings_file" 2>/dev/null || true
+      return 0
+    fi
+    rm -f "${evidence_dir}/${output_file}.error" 2>/dev/null || true
+    return 0
+  }
+
+  capture_evidence_command nodepool.json "NodePool ${nodepool_name}" kubectl get nodepool "$nodepool_name" --request-timeout=10s -o json
+  capture_evidence_command ec2nodeclass.json "EC2NodeClass ${nodepool_name}" kubectl get ec2nodeclass "$nodepool_name" --request-timeout=10s -o json
+  capture_evidence_command nodeclaims.json "NodeClaim集合 ${nodepool_name}" kubectl get nodeclaims -l "karpenter.sh/nodepool=${nodepool_name}" --request-timeout=10s -o json
+  capture_evidence_command nodes.json "Node集合 ${nodepool_name}" kubectl get nodes -l "karpenter.sh/nodepool=${nodepool_name}" --request-timeout=10s -o json
+
+  if [[ -s "${evidence_dir}/nodeclaims.json" || -s "${evidence_dir}/nodes.json" ]]; then
+    instance_ids=$(
+      {
+        jq -r '.items[]? | (.status.providerID // .spec.providerID // empty)' "${evidence_dir}/nodeclaims.json" 2>/dev/null || true
+        jq -r '.items[]? | (.spec.providerID // empty)' "${evidence_dir}/nodes.json" 2>/dev/null || true
+      } | sed -n 's#^aws:///[^/]*/\(i-[0-9a-fA-F]*\)$#\1#p' | sort -u
+    )
+  fi
+  if [[ -n "$instance_ids" ]]; then
+    local -a instance_id_args=()
+    while IFS= read -r instance_id; do
+      [[ -n "$instance_id" ]] && instance_id_args+=("$instance_id")
+    done <<<"$instance_ids"
+    capture_evidence_command ec2-instances.json "EC2实例 ${instance_ids//$'\n'/,}" aws ec2 describe-instances --instance-ids "${instance_id_args[@]}" --output json --cli-connect-timeout 5 --cli-read-timeout 10
+  else
+    complete=false
+    printf '%s\n' '{"Reservations":[]}' >"${evidence_dir}/ec2-instances.json" 2>/dev/null || true
+    printf '[WARN] 未从NodeClaim/Node解析到EC2 InstanceId。\n' >>"$warnings_file" 2>/dev/null || true
+  fi
+
+  {
+    echo "NodePool运行证据摘要"
+    echo "RUN_ID=${run_id}"
+    echo "NODEPOOL=${nodepool_name}"
+    echo "COLLECTED_AT=$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    echo "--- NodeClaims ---"
+    jq -r '.items[]? | [(.metadata.name // "UNKNOWN"), (.status.providerID // .spec.providerID // "UNKNOWN"), (.metadata.labels["node.kubernetes.io/instance-type"] // "UNKNOWN"), (.metadata.labels["karpenter.sh/capacity-type"] // "UNKNOWN"), (.metadata.labels["topology.kubernetes.io/zone"] // "UNKNOWN"), ([.status.conditions[]? | select(.type == "Ready") | .status][0] // "UNKNOWN")] | @tsv' "${evidence_dir}/nodeclaims.json" 2>/dev/null || echo "UNKNOWN"
+    echo "--- Nodes ---"
+    jq -r '.items[]? | [(.metadata.name // "UNKNOWN"), (.spec.providerID // "UNKNOWN"), (.metadata.labels["node.kubernetes.io/instance-type"] // "UNKNOWN"), (.metadata.labels["karpenter.sh/capacity-type"] // "UNKNOWN"), (.metadata.labels["topology.kubernetes.io/zone"] // "UNKNOWN")] | @tsv' "${evidence_dir}/nodes.json" 2>/dev/null || echo "UNKNOWN"
+    echo "--- EC2 Instances ---"
+    jq -r '.Reservations[]?.Instances[]? | [(.InstanceId // "UNKNOWN"), (.InstanceType // "UNKNOWN"), (.InstanceLifecycle // "on-demand"), (.Placement.AvailabilityZone // "UNKNOWN"), (.SubnetId // "UNKNOWN"), (.VpcId // "UNKNOWN"), (.PrivateIpAddress // "UNKNOWN"), (.PublicIpAddress // "NONE")] | @tsv' "${evidence_dir}/ec2-instances.json" 2>/dev/null || echo "UNKNOWN"
+  } >"${evidence_dir}/evidence-summary.txt" 2>/dev/null || {
+    complete=false
+    printf '[WARN] evidence-summary.txt写入失败。\n' >>"$warnings_file" 2>/dev/null || true
+  }
+
+  if $complete; then
+    echo "[AUDIT] NodePool运行证据已保存: ${evidence_dir}"
+  else
+    echo "[WARN] NodePool运行证据采集不完整，不影响本轮可用性结论: ${evidence_dir}"
+  fi
+  return 0
+}
+
 #通用的节点组可用性测试
 test_nodepool() {
   local NODEPOOL_NAME=$1
+  local RUN_ID="$(date +%s)-$RANDOM"
   echo -e "\n******** 开始测试节点组 [$NODEPOOL_NAME] 可用性 ******"
 
-  # 创建测试 deployment，其名称带上节点组名
-  local DEPLOYMENT_NAME="debug-${NODEPOOL_NAME//[^a-zA-Z0-9]/-}"
+  # 每轮测试都有不可冲突的名称与标签，清理只影响本轮对象。
+  local DEPLOYMENT_NAME="debug-${NODEPOOL_NAME//[^a-zA-Z0-9]/-}-${RUN_ID}"
+  local TEST_SELECTOR="app=nginx-test,nodepool=${NODEPOOL_NAME},nodepool-test-run=${RUN_ID}"
 
   #如果AWS中国区则优先使用数数仓库镜像，避免从docker hub拉取镜像失败问题
   ZONE=$(get_zone)
@@ -891,6 +1077,7 @@ metadata:
   labels:
     app: nginx-test
     nodepool: ${NODEPOOL_NAME}
+    nodepool-test-run: ${RUN_ID}
 spec:
   replicas: 1
   selector:
@@ -900,6 +1087,7 @@ spec:
     metadata:
       labels:
         app: nginx-test
+        nodepool-test-run: ${RUN_ID}
         nodepool: ${NODEPOOL_NAME}
     spec:
       containers:
@@ -929,18 +1117,19 @@ spec:
         value: od
 EOF
 
-  # 等待Pod运行，确认POD状态
-  echo "等待Pod启动,预期3分钟内启动"
+  # 等待 Deployment Available、Pod Ready 和 Pod IP；Running 本身不足以证明服务可用。
+  echo "等待 Deployment Available、Pod Ready 和 Pod IP,预期3分钟内启动"
   sleep 5
   TIMEOUT=180
   ELAPSED=0
   POD_READY=false
   while [ $ELAPSED -lt $TIMEOUT ]; do
-    POD_STATUS=$(kubectl get pods -n $NAMESPACE -l app=nginx-test,nodepool=${NODEPOOL_NAME} -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
-    if [ "$POD_STATUS" == "Running" ]; then
+    DEPLOYMENT_AVAILABLE=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null)
+    POD_NAME=$(kubectl get pods -n "$NAMESPACE" -l "$TEST_SELECTOR" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    POD_READY_STATUS=$(kubectl get pods -n "$NAMESPACE" -l "$TEST_SELECTOR" -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+    POD_IP=$(kubectl get pods -n "$NAMESPACE" -l "$TEST_SELECTOR" -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
+    if [ "$DEPLOYMENT_AVAILABLE" == "True" ] && [ "$POD_READY_STATUS" == "True" ] && [ -n "$POD_IP" ]; then
       POD_READY=true
-      POD_NAME=$(kubectl get pods -n $NAMESPACE -l app=nginx-test,nodepool=${NODEPOOL_NAME} -o jsonpath='{.items[0].metadata.name}')
-      POD_IP=$(kubectl get pods -n $NAMESPACE -l app=nginx-test,nodepool=${NODEPOOL_NAME} -o jsonpath='{.items[0].status.podIP}')
       echo "节点组${NODEPOOL_NAME}启动Pod正常，Pod Name: $POD_NAME , Pod IP: $POD_IP"
       echo -e "\e[32m\e[1m测试结论：正常！${NODEPOOL_NAME} 节点组成功调度并启动nginx服务!\e[0m"
 
@@ -953,8 +1142,9 @@ EOF
 
   if ! $POD_READY; then
     log_error "测试结论：异常！Pod未在${TIMEOUT}秒内启动，请排查后重试，常见原因(按概率排序): "
-    echo -e "\e[31m\e[1m1. 节点组资源对象未就绪:请执行 kubectl get karpenter 确认 NodePool/EC2NodeClass 是否 READY=True;\n   若为 False,再执行 kubectl describe ec2nodeclass ${NODEPOOL_NAME} 查看 SubnetsReady/SecurityGroupsReady 等子条件(常见为子网/安全组未打 karpenter.sh/discovery 发现标签)\n2. K8S无实例可调度(如机型在该可用区无库存、超出limits)\n3. 节点组不通外网/镜像仓库导致镜像拉取失败\n排查明细请执行: kubectl describe pods -n $NAMESPACE -l app=nginx-test\e[0m"
-    exit 1
+    echo -e "\e[31m\e[1m1. 节点组资源对象未就绪:请执行 kubectl get karpenter 确认 NodePool/EC2NodeClass 是否 READY=True;\n   若为 False,再执行 kubectl describe ec2nodeclass ${NODEPOOL_NAME} 查看 SubnetsReady/SecurityGroupsReady 等子条件(常见为子网/安全组未打 karpenter.sh/discovery 发现标签)\n2. K8S无实例可调度(如机型在该可用区无库存、超出limits)\n3. K8S无实例可调度(如机型在该可用区无库存、超出limits)\n排查明细请执行: kubectl describe pods -n $NAMESPACE -l ${TEST_SELECTOR}\e[0m"
+    kubectl delete deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
+    return 1
   fi
 
   #开始检查本地服务器访问K8S环境nginx是否正常
@@ -964,6 +1154,8 @@ EOF
   else
     log_error "测试结论：异常！测试云主机访问nginx容器失败!"
     echo -e "\e[31m\e[1m可能是因为K8S环境节点组 ${NODEPOOL_NAME} 绑定安全组未放行集群所绑定的安全组,请联系客户放行 \e[0m"
+    kubectl delete deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
+    return 1
   fi
 
   #开始检查K8S环境pod访问集群本地服务器是否畅通,取ta1的19039 presto metric监控端口，用于后续K8S访问集群网络连通性测试
@@ -980,31 +1172,35 @@ EOF
   fi
 
   # 在Pod内执行curl命令
-  if kubectl exec -it $POD_NAME -n $NAMESPACE -- curl -LsS -m 10 "http://$LOCAL_SERVER_IP:$LOCAL_SERVER_PORT/metrics" &>/dev/null; then
+  if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- curl -LsS -m 10 "http://$LOCAL_SERVER_IP:$LOCAL_SERVER_PORT/metrics" &>/dev/null; then
     echo -e "\e[32m\e[1m测试结论：正常！容器访问云主机通畅！ \e[0m"
   else
     log_error "测试结论：异常！Pod无法访问云主机!"
     echo -e "\e[31m\e[1m可能原因:  \e[0m"
     echo -e "\e[31m\e[1m1. 本地服务器和POD并非统一内网网段，服务器iptables阻止了来自K8S网络的访问 \e[0m"
     echo -e "\e[31m\e[1m2. 本地服务器绑定安全组未放行K8S安全组,请联系客户放行 \e[0m"
+    kubectl delete deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
+    return 1
   fi
+
+  # 可用性结论已由Pod Ready及双向网络决定；以下采集仅供审计，失败不得阻断或跳过清理。
+  collect_nodepool_runtime_evidence "$NODEPOOL_NAME" "$RUN_ID" || \
+    echo "[WARN] NodePool运行证据采集出现未预期异常，不影响本轮可用性结论。"
   echo -e "******** 节点组 [$NODEPOOL_NAME] 可用性测试结束,请关注测试结论,如果有红色预警信息请跟进确认处理********"
 
-  kubectl get deploy -n $NAMESPACE -l app=nginx-test | grep -v 'NAME' | awk '{print $1}' | xargs kubectl patch deploy -n $NAMESPACE --patch '{"spec":{"replicas":0}}' &>/dev/null
+  kubectl delete deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
 
 }
 
 #清理测试资源即临时启动的deployment
 clean_check_resource() {
-  echo -e "Tips: 为避免测试造成的资源浪费，现将测试样例deployment置0。你可以手动调试或者再次执行本脚本检查节点组可用性"
-  kubectl get deploy -n $NAMESPACE -l app=nginx-test | grep -v 'NAME' | awk '{print $1}' | xargs kubectl patch deploy -n $NAMESPACE --patch '{"spec":{"replicas":0}}' &>/dev/null
+  echo -e "Tips: 每个测试 Deployment 已在本轮测试后精确删除；不会操作其他 nginx-test 资源。"
 }
 
 # 校验 NodePool 及其关联 EC2NodeClass 是否 Ready,是创建测试Pod的前提
 # 背景:节点组资源对象(NodePool/EC2NodeClass)Ready=False 时,Karpenter无法provision节点,测试Pod会一直Pending直到超时。
 #      提前校验可快速失败并给出准确原因(如子网/安全组发现标签缺失),避免干等180秒后才暴露问题。
 # 入参:可选,指定要校验的节点组名(空格分隔);【不传则校验当前所有NodePool】。
-#      base门禁校验会只传 base-nodepool,实现"base先行验证,不通过则快速失败,不浪费时间建后续业务节点组"。
 # 策略:最多轮询60秒;超时仍未Ready则打印精准原因线索(kubectl get karpenter + 未就绪资源的关键condition)后退出。
 wait_nodepools_ready() {
   log_step "校验节点组资源对象(NodePool/EC2NodeClass)是否就绪"
@@ -1078,8 +1274,10 @@ wait_nodepools_ready() {
 
 # 获取节点组并测试可用性
 test_all_nodepools() {
-  #获取当前所有节点组信息
-  NODEPOOL_NAMES=($(kubectl get karpenter | awk '/ec2nodeclass/ {split($1, a, "/"); print a[2]}'))
+  # 只从经过校验的 NodePool JSON 获取名称，不依赖 kubectl 聚合展示文本。
+  local nodepools_json
+  nodepools_json=$(load_nodepools_json) || exit 1
+  NODEPOOL_NAMES=($(printf '%s' "$nodepools_json" | jq -er '.items[].metadata.name'))
 
   if [ -z "${NODEPOOL_NAMES}" ]; then
     log_error "未获取到节点组信息，请确认是否需要重试本脚本尝试创建？"
@@ -1094,11 +1292,18 @@ test_all_nodepools() {
     fi
 
     # 测试所有节点组
+    local test_failed=false
     for np in "${NODEPOOL_NAMES[@]}"; do
-      test_nodepool "$np"
+      if ! test_nodepool "$np"; then
+        test_failed=true
+      fi
     done
     echo ""
-    log_success "****************** 所有节点组都已测试完成，请关注测试结论，如果有红色预警信息请跟进确认处理 ******************"
+    if $test_failed; then
+      log_error "****************** 至少一个节点组未通过可用性测试 ******************"
+      return 1
+    fi
+    log_success "****************** 所有节点组都已通过可用性测试 ******************"
 
     #所有业务节点组都测试完成后，清理测试资源，避免资源浪费
     clean_check_resource
@@ -1146,6 +1351,16 @@ main() {
 
   #检查k8s是否可访问
   test_k8s_connection
+
+  # 所有创建、测试和污点操作之前，先证明并由操作者确认唯一目标EKS环境。
+  resolve_target_eks_environment || exit 1
+  if confirm_target_eks_environment; then
+    :
+  else
+    confirmation_rc=$?
+    [[ $confirmation_rc -eq 2 ]] && return 0
+    exit 1
+  fi
 
   while true; do
     #询问用户是想要创建节点组并测试可用性 or 仅测试节点组可用性？
