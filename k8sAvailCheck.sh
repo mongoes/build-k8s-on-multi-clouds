@@ -15,12 +15,13 @@
 #11. 本地服务器访问Pod网络连通性检查(兼容性验证)
 #12. 本地服务器访问Kubernetes Service连通性检查(NodePort)
 #13. Pod访问本地服务器网络连通性检查
-#14. Pod访问集群内MySQL连通性检查(混合部署网络错配探测)
-#15. Pod访问集群内云主机延迟检查(<50ms, TCP握手近似RTT)
-#16. 端到端存储验证(块存储 te-disk, RWO: PVC->单Pod挂载->读写)
+#14. Pod访问数数公网仓库连通性检查(严格HTTPS)
+#15. Pod访问集群内MySQL连通性检查(混合部署网络错配探测)
+#16. Pod访问集群内云主机延迟检查(<50ms, TCP握手近似RTT)
+#17. 端到端存储验证(块存储 te-disk, RWO: PVC->单Pod挂载->读写)
 #18. 端到端存储验证(文件存储 te-nfs, RWX: PVC->单Pod挂载->读写)
-#18. 端到端存储验证(文件存储 te-nfs, RWX跨节点共享读写)
-#19. 测试PV清理(精确识别，可确认后回收)
+#19. 端到端存储验证(文件存储 te-nfs, RWX跨节点共享读写)
+#20. 测试PV清理(精确识别，可确认后回收)
 #    (端到端 SC->PVC->Pod 起服为存储服务就绪的唯一金标准)
 
 # ==================== 配置部分 ====================
@@ -40,10 +41,18 @@ PROBE_ID_SUFFIX="$(date +'%H%M%S')-$$"
 PROBE_LABEL="serverless-avail-probe"
 PROBE_RUN_LABEL="sl-$(date +'%Y%m%d-%H%M%S')-$$"
 PROBE_NAME="serverless-avail-probe-${RUN_TS}"
+TARGET_NODE_SELECTOR_PROBE_POD=""
 DISK_PVC="serverless-avail-disk-${RUN_TS}"
 NFS_PVC="serverless-avail-nfs-${RUN_TS}"
 NGINX_IMAGE="docker-ta.thinkingdata.cn/te/nginx:1.20"
 SERVERLESS_PROBE_IMAGE="${SERVERLESS_PROBE_IMAGE:-$NGINX_IMAGE}"
+# Pod 必须能够通过 HTTPS 访问两个业务制品仓库。严禁构造 HTTP 地址或在重定向时降级到 HTTP。
+PUBLIC_REPOSITORY_URLS=(
+    "https://ta-repository.oss-accelerate.aliyuncs.com/"
+    "https://docker-ta.thinkingdata.cn/"
+)
+PUBLIC_REPOSITORY_CONNECT_TIMEOUT="${PUBLIC_REPOSITORY_CONNECT_TIMEOUT:-5}"
+PUBLIC_REPOSITORY_MAX_TIME="${PUBLIC_REPOSITORY_MAX_TIME:-15}"
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-180}"
 SERVERLESS_DOMAINS=()
 READY_SERVERLESS_DOMAINS=()
@@ -1856,6 +1865,7 @@ spec:
       containers:
       - name: nginx-test
         image: ${current_image}
+        imagePullPolicy: Always
         ports:
         - containerPort: 80
         readinessProbe:
@@ -1928,6 +1938,182 @@ EOF
     log_success "K8S环境部署Pod正常"
     kubectl get pods -n $NAMESPACE -l app=${deployment_name} -o wide >>${LOG_FILE}
     return 0
+}
+
+# ==================== Pod访问数数公网仓库连通性检查 ====================
+# 判定边界：
+#   - 只允许 https:// 初始URL；curl重定向也只能继续使用HTTPS。
+#   - 2xx/3xx、401/403/404说明仓库端已通过TLS返回HTTP响应，视为网络连通。
+#   - DNS/TCP/TLS/超时、HTTP降级、5xx或无合格客户端均失败。
+#   - wget兜底使用 --max-redirect=0，不跟随任何重定向，从机制上保证不会降级访问HTTP。
+PUBLIC_REPOSITORY_LAST_DETAIL=""
+PUBLIC_REPOSITORY_LAST_ARTIFACT=""
+
+_repository_probe_name() {
+    case "$1" in
+    *ta-repository.oss-accelerate.aliyuncs.com*) printf 'ta-repository' ;;
+    *docker-ta.thinkingdata.cn*) printf 'docker-ta' ;;
+    *) printf 'unknown-repository' ;;
+    esac
+}
+
+_run_pod_https_repository_probe() {
+    local pod="$1" url="$2"
+    kubectl exec "$pod" -n "$NAMESPACE" -- sh -c '
+url="$1"
+connect_timeout="$2"
+max_time="$3"
+case "$url" in
+    https://*) ;;
+    *)
+        printf "probe_client=invalid;exit_code=2;http_code=000;url_effective=%s\n" "$url"
+        printf "HTTPS_REQUIRED: only https:// repository URLs are allowed\n" >&2
+        exit 2
+        ;;
+esac
+
+if command -v curl >/dev/null 2>&1; then
+    output=$(curl --proto "=https" --proto-redir "=https" --location \
+        --silent --show-error --output /dev/null \
+        --connect-timeout "$connect_timeout" --max-time "$max_time" \
+        --write-out "http_code=%{http_code};remote_ip=%{remote_ip};remote_port=%{remote_port};time_connect=%{time_connect};time_appconnect=%{time_appconnect};url_effective=%{url_effective}" \
+        "$url" 2>&1)
+    probe_rc=$?
+    http_code=$(printf "%s\n" "$output" | sed -n "s/.*http_code=\([0-9][0-9][0-9]\).*/\1/p" | tail -1)
+    effective=$(printf "%s\n" "$output" | sed -n "s/.*url_effective=\([^;]*\).*/\1/p" | tail -1)
+    printf "probe_client=curl;exit_code=%s;http_code=%s;url_effective=%s\n" \
+        "$probe_rc" "${http_code:-000}" "${effective:-$url}"
+    printf "%s\n" "$output"
+    exit "$probe_rc"
+fi
+
+if command -v wget >/dev/null 2>&1; then
+    output=$(wget --server-response --spider --timeout="$max_time" --tries=1 --max-redirect=0 "$url" 2>&1)
+    probe_rc=$?
+    http_code=$(printf "%s\n" "$output" | awk "/^  HTTP\// { code=\$2 } END { print code }")
+    redirect_location=$(printf "%s\n" "$output" | awk "tolower(\$1) == \"location:\" { location=\$2 } END { gsub(/\\r/, \"\", location); print location }")
+    printf "probe_client=wget;exit_code=%s;http_code=%s;url_effective=%s;redirect_location=%s\n" \
+        "$probe_rc" "${http_code:-000}" "$url" "$redirect_location"
+    printf "%s\n" "$output"
+    exit "$probe_rc"
+fi
+
+printf "probe_client=missing;exit_code=127;http_code=000;url_effective=%s\n" "$url"
+printf "PROBE_CLIENT_MISSING: neither strict-HTTPS curl nor wget exists in probe image\n" >&2
+exit 127
+' sh "$url" "$PUBLIC_REPOSITORY_CONNECT_TIMEOUT" "$PUBLIC_REPOSITORY_MAX_TIME"
+}
+
+_classify_https_repository_probe() {
+    local output="$1" command_rc="$2" header client probe_rc http_code effective redirect_location
+    header="$(printf '%s\n' "$output" | head -1)"
+    client="$(printf '%s' "$header" | sed -n 's/.*probe_client=\([^;]*\).*/\1/p')"
+    probe_rc="$(printf '%s' "$header" | sed -n 's/.*exit_code=\([0-9][0-9]*\).*/\1/p')"
+    http_code="$(printf '%s' "$header" | sed -n 's/.*http_code=\([0-9][0-9][0-9]\).*/\1/p')"
+    effective="$(printf '%s' "$header" | sed -n 's/.*url_effective=\([^;]*\).*/\1/p')"
+    redirect_location="$(printf '%s' "$header" | sed -n 's/.*redirect_location=\([^;]*\).*/\1/p')"
+    [[ -n "$client" && -n "$probe_rc" && -n "$http_code" && "$effective" == https://* ]] || return 1
+
+    case "$client" in
+    curl)
+        [[ "$probe_rc" -eq 0 ]] || return 1
+        case "$http_code" in
+        2?? | 3?? | 401 | 403 | 404) return 0 ;;
+        esac
+        ;;
+    wget)
+        # wget不跟随重定向；3xx仅在Location保持HTTPS或使用相对URL时通过。
+        case "$http_code" in
+        2?? | 401 | 403 | 404) return 0 ;;
+        3??)
+            case "$redirect_location" in
+            https://* | /* | ./* | ../* | \?*) return 0 ;;
+            *) return 1 ;;
+            esac
+            ;;
+        esac
+        ;;
+    esac
+    [[ "$command_rc" -eq 0 ]] || return 1
+    return 1
+}
+
+probe_pod_https_repository() {
+    local pod="$1" scope="$2" url="$3" repo_name safe_scope output rc=0 artifact
+    repo_name="$(_repository_probe_name "$url")"
+    safe_scope="$(printf '%s' "$scope" | tr -c 'A-Za-z0-9._-' '_')"
+    _ensure_artifact_dir
+    artifact="$ARTIFACT_DIR/https-repository-${safe_scope}-${repo_name}.txt"
+    if output="$(_run_pod_https_repository_probe "$pod" "$url" 2>&1)"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    {
+        printf 'scope=%s\npod=%s\nurl=%s\ncommand_exit_code=%s\n' "$scope" "$pod" "$url" "$rc"
+        printf '%s\n' "$output"
+    } >"$artifact"
+    PUBLIC_REPOSITORY_LAST_ARTIFACT="$artifact"
+    if _classify_https_repository_probe "$output" "$rc"; then
+        PUBLIC_REPOSITORY_LAST_DETAIL="${scope}->${url} HTTPS/DNS/TCP/TLS/HTTP响应正常"
+        log_success "${scope} Pod可通过HTTPS访问${url}"
+        return 0
+    fi
+    PUBLIC_REPOSITORY_LAST_DETAIL="${scope}->${url}失败(诊断:${artifact})"
+    log_error "${scope} Pod无法通过严格HTTPS访问${url}；不会回退HTTP。诊断: ${artifact}"
+    return 1
+}
+
+run_standard_public_repository_checks() {
+    local pname pod url total=0 failed=0 failures=""
+    if [[ -z "${PROBE_READY_POOLS// /}" ]]; then
+        record_result "Pod访问数数公网仓库连通性" "SKIP" "无就绪节点池可供测试"
+        return 0
+    fi
+    log_step "Pod访问数数公网仓库连通性检查(严格HTTPS)"
+    for pname in $PROBE_READY_POOLS; do
+        pod="${PROBE_POD_NAME[$pname]:-}"
+        if [[ -z "$pod" ]]; then
+            ((failed++))
+            failures="${failures} ${pname}->缺少就绪Pod"
+            continue
+        fi
+        for url in "${PUBLIC_REPOSITORY_URLS[@]}"; do
+            ((total++))
+            probe_pod_https_repository "$pod" "$pname" "$url" || {
+                ((failed++))
+                failures="${failures} ${PUBLIC_REPOSITORY_LAST_DETAIL}"
+            }
+        done
+    done
+    if [[ $failed -eq 0 ]]; then
+        record_result "Pod访问数数公网仓库连通性" "PASS" \
+            "$(wc -w <<<"$PROBE_READY_POOLS")个就绪节点池均可访问${#PUBLIC_REPOSITORY_URLS[@]}个HTTPS仓库"
+        return 0
+    fi
+    record_result "Pod访问数数公网仓库连通性" "FAIL" \
+        "${failed}/${total}个节点池×仓库组合失败:${failures# }"
+    return 1
+}
+
+run_serverless_public_repository_checks() {
+    local pod="$1" node="$2" url total=0 failed=0 failures=""
+    log_step "Serverless Pod访问数数公网仓库连通性检查(${node}, 严格HTTPS)"
+    for url in "${PUBLIC_REPOSITORY_URLS[@]}"; do
+        ((total++))
+        probe_pod_https_repository "$pod" "serverless-${node}" "$url" || {
+            ((failed++))
+            failures="${failures} ${PUBLIC_REPOSITORY_LAST_DETAIL}"
+        }
+    done
+    if [[ $failed -eq 0 ]]; then
+        serverless_record_result "Serverless/Pod访问数数公网仓库连通性(${node})" "PASS" \
+            "${#PUBLIC_REPOSITORY_URLS[@]}个HTTPS仓库均连通"
+        return 0
+    fi
+    serverless_record_result "Serverless/Pod访问数数公网仓库连通性(${node})" "FAIL" \
+        "${failed}/${total}个HTTPS仓库失败:${failures# }"
+    return 1
 }
 
 # ==================== iptables放行Pod网段 ====================
@@ -2451,6 +2637,7 @@ run_network_checks_per_pool() {
     if [[ -z "${PROBE_READY_POOLS// /}" ]]; then
         log_warning "无任何就绪探测Pod，跳过网络连通性测试"
         _clean_probe_deployments
+        record_result "Pod访问数数公网仓库连通性" "SKIP" "无就绪节点池可供测试"
         record_result "本地服务器访问Pod网络连通性" "SKIP" "无就绪节点池可供测试"
         record_result "本地服务器访问Kubernetes Service连通性" "SKIP" "无就绪节点池可供测试"
         record_result "Pod访问本地服务器网络连通性" "SKIP" "无就绪节点池可供测试"
@@ -2458,6 +2645,10 @@ run_network_checks_per_pool() {
         record_result "Pod访问集群内云主机延迟(<50ms)" "SKIP" "无就绪节点池可供测试"
         return 0
     fi
+
+    # 每个就绪节点池的探测Pod都必须通过严格HTTPS访问两个业务制品仓库。
+    # 失败只登记本检查项，不提前中断其余网络诊断，确保一次运行收集完整证据。
+    run_standard_public_repository_checks || true
 
     # 混合部署探测目标(集群外置 MySQL)解析一次, 供所有就绪池复用。
     # 所有非注释 JDBC MySQL 地址都必须可解析；任一配置异常即两项均 FAIL。
@@ -3001,6 +3192,8 @@ serverless_check_network_readiness() {
     fi
     pod="$SERVERLESS_READY_POD"
     serverless_record_result "Serverless/指定虚拟节点Pod部署启动(${node})" "PASS" "指定Serverless虚拟节点探测Pod已就绪"
+    # Serverless每个调度域均独立验证两个公网仓库；失败后继续收集ClusterIP/MySQL诊断。
+    run_serverless_public_repository_checks "$pod" "$node" || true
     log_step "Serverless Pod访问ClusterIP Service检查(${node})"
     service_host="${PROBE_NAME}.${NAMESPACE}.svc"
     if service_probe_output="$(serverless_probe_clusterip_service "$pod" "$service_host" 2>&1)"; then
@@ -3836,6 +4029,177 @@ EOF_HUAWEI_NFS
     return 0
 }
 
+# ==================== 指定节点标签专项检查 ====================
+# 该入口是完整检查流程之外的独立扩展：只接受精确匹配的 key=value 选择器，
+# 不复用或修改节点组规划、Serverless/Hybrid 分流及全量节点池探测状态。
+target_node_selector_validate() {
+    local selector="${1:-}" item key value
+    [[ -n "$selector" && "$selector" != *, && "$selector" != ,* && "$selector" != *,,* ]] || return 1
+
+    local IFS=','
+    read -r -a selector_items <<<"$selector"
+    ((${#selector_items[@]} > 0)) || return 1
+    for item in "${selector_items[@]}"; do
+        [[ "$item" != *[[:space:]]* && "$item" == *=* && "$item" != *"="*"="* ]] || return 1
+        key=${item%%=*}
+        value=${item#*=}
+        [[ -n "$key" && -n "$value" ]] || return 1
+        [[ "$key" =~ ^(([a-z0-9]([-a-z0-9.]*[a-z0-9])?)/)?[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$ ]] || return 1
+        [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+    return 0
+}
+
+target_node_selector_write_probe_yaml() {
+    local selector="$1" pod_name="$2" manifest="$3" item key value
+    {
+        cat <<EOF_TARGET_POD
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod_name}
+  namespace: ${NAMESPACE}
+  labels:
+    app: target-node-selector-check
+    probe-run: ${PROBE_RUN_LABEL}
+spec:
+  restartPolicy: Never
+  nodeSelector:
+EOF_TARGET_POD
+        local IFS=','
+        read -r -a selector_items <<<"$selector"
+        for item in "${selector_items[@]}"; do
+            key=${item%%=*}
+            value=${item#*=}
+            printf '    %s: "%s"\n' "$key" "$value"
+        done
+        cat <<EOF_TARGET_POD
+  tolerations:
+  - key: node.k8s.te/billing-mode
+    operator: Exists
+    effect: NoSchedule
+  containers:
+  - name: readiness
+    image: ${NGINX_IMAGE}
+    imagePullPolicy: Always
+EOF_TARGET_POD
+    } >"$manifest"
+}
+
+target_node_selector_cleanup_probe() {
+    local pod_name="$1" owner
+    owner=$(kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.metadata.labels.probe-run}' 2>/dev/null || true)
+    if [[ -z "$owner" ]]; then
+        TARGET_NODE_SELECTOR_PROBE_POD=""
+        return 0
+    fi
+    if [[ "$owner" != "$PROBE_RUN_LABEL" ]]; then
+        log_error "专项探测Pod归属标签不符，拒绝删除: ${NAMESPACE}/${pod_name}(probe-run=${owner})"
+        return 1
+    fi
+    if ! kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1; then
+        log_error "专项探测Pod清理失败: ${NAMESPACE}/${pod_name}，请人工确认后删除"
+        return 1
+    fi
+    TARGET_NODE_SELECTOR_PROBE_POD=""
+    return 0
+}
+
+run_target_node_selector_check() {
+    local selector="${1:-}" nodes_json node_count bad_nodes pod_name manifest timeout deadline ready scheduled_node
+    local probe_created=0 rc=0
+
+    if ! target_node_selector_validate "$selector"; then
+        log_error "节点标签选择器格式非法；仅接受逗号分隔的精确 key=value，不接受集合、存在性或否定表达式: ${selector:-空}"
+        return 1
+    fi
+    if [[ ",$selector," != *",node.k8s.te/nodepool-name="* ]]; then
+        log_error "专项入口必须显式包含 node.k8s.te/nodepool-name=<目标节点池>，避免误选整个集群"
+        return 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        log_error "专项检查依赖 jq 解析节点资源，请安装 jq 后重试"
+        return 1
+    fi
+
+    if ! nodes_json=$(kubectl get nodes -l "$selector" -o json 2>/dev/null); then
+        log_error "无法按选择器查询节点；请确认标签语法、kubectl权限和集群连接: ${selector}"
+        return 1
+    fi
+    if ! node_count=$(jq -er '.items | length' <<<"$nodes_json" 2>/dev/null); then
+        log_error "kubectl节点返回无法解析，专项检查停止"
+        return 1
+    fi
+    if ((node_count == 0)); then
+        log_error "指定标签未命中任何节点: ${selector}；未创建任何探测资源"
+        return 1
+    fi
+    log_info "指定节点标签专项检查: selector=${selector}，命中节点数=${node_count}"
+
+    bad_nodes=$(jq -r '
+      .items[] |
+      select((.spec.unschedulable // false) == true or
+             ([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length) == 0) |
+      [.metadata.name,
+       ([.status.conditions[]? | select(.type == "Ready") | .status][0] // "Missing"),
+       (.spec.unschedulable // false)] | @tsv
+    ' <<<"$nodes_json" 2>/dev/null) || {
+        log_error "节点Ready/调度状态解析失败，专项检查停止"
+        return 1
+    }
+    if [[ -n "$bad_nodes" ]]; then
+        while IFS=$'\t' read -r node ready unschedulable; do
+            [[ -n "$node" ]] && log_error "目标节点未就绪: ${node}(Ready=${ready},unschedulable=${unschedulable})"
+        done <<<"$bad_nodes"
+        log_error "目标集合中存在NotReady或已封锁节点；未创建调度探测Pod"
+        return 1
+    fi
+    log_success "全部 ${node_count} 个目标节点均Ready且允许调度"
+
+    _ensure_artifact_dir
+    pod_name="target-node-selector-${PROBE_ID_SUFFIX:-$(date +'%H%M%S')-$$}"
+    manifest="${ARTIFACT_DIR}/${pod_name}.yaml"
+    target_node_selector_write_probe_yaml "$selector" "$pod_name" "$manifest"
+
+    if kubectl get pod "$pod_name" -n "$NAMESPACE" >/dev/null 2>&1; then
+        log_error "专项探测Pod名称已存在，拒绝接管: ${NAMESPACE}/${pod_name}"
+        return 1
+    fi
+    if ! kubectl create -f "$manifest" >/dev/null; then
+        log_error "创建指定节点标签探测Pod失败，物料已保存: ${manifest}"
+        return 1
+    fi
+    probe_created=1
+    TARGET_NODE_SELECTOR_PROBE_POD="$pod_name"
+
+    timeout="${TARGET_NODE_SELECTOR_PROBE_TIMEOUT:-180}"
+    deadline=$((SECONDS + timeout))
+    ready=""
+    while ((SECONDS < deadline)); do
+        ready=$(kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+        [[ "$ready" == true ]] && break
+        sleep 3
+    done
+    if [[ "$ready" != true ]]; then
+        kubectl describe pod "$pod_name" -n "$NAMESPACE" >"${ARTIFACT_DIR}/${pod_name}-describe.txt" 2>&1 || true
+        log_error "指定节点标签探测Pod在 ${timeout}s 内未Ready；详情: ${ARTIFACT_DIR}/${pod_name}-describe.txt"
+        rc=1
+    else
+        scheduled_node=$(kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)
+        if [[ -z "$scheduled_node" ]] || ! jq -e --arg node "$scheduled_node" '.items | any(.metadata.name == $node)' <<<"$nodes_json" >/dev/null 2>&1; then
+            log_error "探测Pod实际节点不在本次目标集合内: ${scheduled_node:-空}"
+            rc=1
+        else
+            log_success "指定标签真实调度验证通过: 实际调度节点=${scheduled_node}，业务镜像=${NGINX_IMAGE}"
+        fi
+    fi
+
+    if ((probe_created == 1)) && ! target_node_selector_cleanup_probe "$pod_name"; then
+        rc=1
+    fi
+    return "$rc"
+}
+
 get_gce_primary_network() {
     local metadata_url='http://metadata.google.internal/computeMetadata/v1'
     local network_resource network_name
@@ -3861,6 +4225,131 @@ record_storageclass_result() {
     fi
 }
 
+ACK_TE_NFS_EXPECTED_PROVISIONER="nasplugin.csi.alibabacloud.com"
+ACK_TE_NFS_CONFIRM_TIMEOUT="${ACK_TE_NFS_CONFIRM_TIMEOUT:-300}"
+ACK_TE_NFS_REBUILT=false
+ACK_TE_NFS_REFERENCES=""
+
+ack_te_nfs_list_references() {
+    local pv_json
+    ACK_TE_NFS_REFERENCES=""
+    pv_json=$(kubectl get pv -o json 2>/dev/null) || return 1
+    ACK_TE_NFS_REFERENCES=$(jq -r '
+        [.items[]
+         | select(.spec.storageClassName == "te-nfs")
+         | [.metadata.name,
+            ((.spec.claimRef.namespace // "-") + "/" + (.spec.claimRef.name // "-")),
+            (.status.phase // "unknown")]
+         | @tsv] | .[]' <<<"$pv_json" 2>/dev/null || true)
+    return 0
+}
+
+_confirm_ack_te_nfs_rebuild() {
+    local answer="" input_path="${ACK_TE_NFS_CONFIRM_INPUT_PATH:-/dev/tty}"
+    local output_path="${ACK_TE_NFS_CONFIRM_OUTPUT_PATH:-/dev/tty}"
+
+    if [[ "$input_path" == /dev/tty && ! -t 0 ]]; then
+        log_error "当前为非TTY执行，禁止自动重建te-nfs；请由管理员在交互终端复核后重试"
+        return 1
+    fi
+    printf '是否重建同名te-nfs并将parameters.volumeAs修正为subpath？[y/N]（%s秒后取消）: ' \
+        "$ACK_TE_NFS_CONFIRM_TIMEOUT" >"$output_path" 2>/dev/null || true
+    if ! read -r -t "$ACK_TE_NFS_CONFIRM_TIMEOUT" answer <"$input_path"; then
+        log_error "${ACK_TE_NFS_CONFIRM_TIMEOUT}秒内未收到确认，未修改te-nfs"
+        return 1
+    fi
+    [[ "$answer" =~ ^[Yy]$ ]] || {
+        log_warning "管理员未确认重建，已保持te-nfs及现有PV/PVC/Pod不变"
+        return 1
+    }
+}
+
+ack_te_nfs_audit_and_repair() {
+    local volume_as provisioner server original_server uid resource_version current_uid current_rv
+    local backup restore_manifest candidate_manifest
+
+    volume_as=$(kubectl get sc te-nfs -o jsonpath='{.parameters.volumeAs}' 2>/dev/null) || {
+        log_error "无法读取te-nfs parameters.volumeAs"
+        return 1
+    }
+    if [[ "$volume_as" == subpath ]]; then
+        log_success "ACK te-nfs挂载隔离模式校验通过(parameters.volumeAs=subpath)"
+        return 0
+    fi
+
+    provisioner=$(kubectl get sc te-nfs -o jsonpath='{.provisioner}' 2>/dev/null || true)
+    server=$(kubectl get sc te-nfs -o jsonpath='{.parameters.server}' 2>/dev/null || true)
+    original_server="$server"
+    log_error "ACK te-nfs挂载方式不符合预期(parameters.volumeAs=${volume_as:-空}，预期subpath)"
+    log_warning "继续引用当前SC可能使不同PVC映射到同一NAS目录，存在多Pod写入覆盖、删除或抢占数据的风险"
+    ack_te_nfs_list_references || true
+    if [[ -n "$ACK_TE_NFS_REFERENCES" ]]; then
+        log_warning "当前te-nfs引用(PV<TAB>PVC<TAB>状态)："
+        while IFS= read -r ref; do log_warning "  $ref"; done <<<"$ACK_TE_NFS_REFERENCES"
+    fi
+    log_warning "重建StorageClass只影响未来新建PVC；既有PV/PVC不会迁移，也不会被本脚本修改或删除"
+
+    if [[ "$provisioner" != "$ACK_TE_NFS_EXPECTED_PROVISIONER" ]]; then
+        log_error "te-nfs provisioner=${provisioner:-空}，并非受支持的ACK NAS CSI；为避免套用错误模板，禁止自动重建"
+        return 1
+    fi
+    if [[ -z "$server" ]]; then
+        log_error "te-nfs parameters.server为空，无法安全重建"
+        return 1
+    fi
+    _confirm_ack_te_nfs_rebuild || return 1
+
+    mkdir -p "$ARTIFACT_DIR"
+    backup="$ARTIFACT_DIR/ack_te_nfs_before_rebuild.yaml"
+    restore_manifest="$ARTIFACT_DIR/ack_te_nfs_restore.json"
+    candidate_manifest="$ARTIFACT_DIR/ack_te_nfs_subpath.json"
+    if ! kubectl get sc te-nfs -o json >"$backup"; then
+        log_error "无法备份te-nfs，取消重建"
+        return 1
+    fi
+    if ! jq '
+        del(.metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp,
+            .metadata.generation, .metadata.selfLink, .metadata.managedFields,
+            .metadata.annotations."kubectl.kubernetes.io/last-applied-configuration", .status)
+    ' "$backup" >"$restore_manifest"; then
+        log_error "无法生成可恢复的te-nfs备份，取消重建"
+        return 1
+    fi
+    if ! jq '.parameters.volumeAs = "subpath"' "$restore_manifest" >"$candidate_manifest"; then
+        log_error "无法生成te-nfs subpath候选清单，取消重建"
+        return 1
+    fi
+
+    uid=$(jq -r '.metadata.uid // empty' "$backup")
+    resource_version=$(jq -r '.metadata.resourceVersion // empty' "$backup")
+    current_uid=$(kubectl get sc te-nfs -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+    current_rv=$(kubectl get sc te-nfs -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)
+    if [[ -z "$uid" || -z "$resource_version" || "$uid" != "$current_uid" || "$resource_version" != "$current_rv" ]]; then
+        log_error "te-nfs在确认期间发生变化，取消重建；请重新执行检查"
+        return 1
+    fi
+
+    if ! kubectl delete sc te-nfs; then
+        log_error "删除旧te-nfs失败，未执行创建；恢复物料：$restore_manifest"
+        return 1
+    fi
+    if ! kubectl apply -f "$candidate_manifest"; then
+        log_error "应用subpath版te-nfs失败；请执行 kubectl apply -f '$restore_manifest' 恢复"
+        return 1
+    fi
+
+    volume_as=$(kubectl get sc te-nfs -o jsonpath='{.parameters.volumeAs}' 2>/dev/null || true)
+    provisioner=$(kubectl get sc te-nfs -o jsonpath='{.provisioner}' 2>/dev/null || true)
+    server=$(kubectl get sc te-nfs -o jsonpath='{.parameters.server}' 2>/dev/null || true)
+    if [[ "$volume_as" != subpath || "$provisioner" != "$ACK_TE_NFS_EXPECTED_PROVISIONER" || "$server" != "$original_server" ]]; then
+        log_error "重建后回读失败(volumeAs=${volume_as:-空}, provisioner=${provisioner:-空}, server=${server:-空})；请使用 $restore_manifest 人工恢复"
+        return 1
+    fi
+    ACK_TE_NFS_REBUILT=true
+    log_success "ACK te-nfs已重建并回读确认volumeAs=subpath；既有PV/PVC/Pod未被修改"
+    return 0
+}
+
 ensure_nfs_storageclass() {
     local cloud_platform="$1" result_prefix="${2:-}"
     log_step "网络存储StorageClass就绪检查(te-nfs)"
@@ -3880,6 +4369,12 @@ ensure_nfs_storageclass() {
     fi
 
     if kubectl get sc te-nfs &>/dev/null; then
+        if [[ "$cloud_platform" == *alibaba* || "$cloud_platform" == *ali* ]]; then
+            if ! ack_te_nfs_audit_and_repair; then
+                record_storageclass_result "$result_prefix" "网络存储SC就绪检查(te-nfs)" "FAIL" "ACK te-nfs volumeAs不是subpath且未完成安全修复；已跳过依赖该SC的存储验证"
+                return 1
+            fi
+        fi
         if [[ "$cloud_platform" == *huawei* ]]; then
             local configured_vpc configured_provisioner mismatch_reason
             configured_vpc=$(kubectl get sc te-nfs -o jsonpath='{.parameters.everest\.io/share-access-to}' 2>/dev/null)
@@ -4445,6 +4940,94 @@ EOF_PVC
     return 0
 }
 
+verify_ack_te_nfs_pvc_isolation() {
+    local suffix="${PROBE_ID_SUFFIX:-$(date +'%H%M%S')-$$}"
+    local pvc_a="ack-nfs-iso-a-${suffix}" pvc_b="ack-nfs-iso-b-${suffix}"
+    local pod_a="ack-nfs-iso-a-${suffix}" pod_b="ack-nfs-iso-b-${suffix}"
+    local prefix="ack-nfs-isolation-${suffix}" pv_a="" pv_b="" failed=0
+    local created_a=false created_b=false pvc
+    local marker_a="marker-a-${RUN_TS}-${RANDOM}" marker_b="marker-b-${RUN_TS}-${RANDOM}"
+
+    log_step "ACK te-nfs PVC目录隔离验证(PVC-A/PVC-B不可互见)"
+    ensure_namespace
+    _ensure_artifact_dir
+    for pvc in "$pvc_a" "$pvc_b"; do
+        if kubectl get pvc "$pvc" -n "$NAMESPACE" &>/dev/null; then
+            log_error "隔离测试资源名已存在，拒绝接管或清理: ${NAMESPACE}/${pvc}"
+            failed=1
+            break
+        fi
+        cat >"${ARTIFACT_DIR}/${pvc}.yaml" <<EOF_ACK_ISO_PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${pvc}
+  namespace: ${NAMESPACE}
+  labels:
+    app: te-csi-check
+    e2e-test: ${prefix}
+    probe-run: ${PROBE_RUN_LABEL}
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: te-nfs
+  resources:
+    requests:
+      storage: ${E2E_PVC_SIZE}
+EOF_ACK_ISO_PVC
+        if ! kubectl create -f "${ARTIFACT_DIR}/${pvc}.yaml" >/dev/null 2>&1; then
+            log_error "创建ACK te-nfs隔离验证PVC失败: ${pvc}"
+            failed=1
+            break
+        fi
+        if [[ "$pvc" == "$pvc_a" ]]; then created_a=true; else created_b=true; fi
+    done
+
+    if [[ $failed -eq 0 ]]; then
+        _apply_csi_check_pod "$pod_a" "$pvc_a" "$NGINX_IMAGE" "isolation-a" "$prefix" || failed=1
+        _apply_csi_check_pod "$pod_b" "$pvc_b" "$NGINX_IMAGE" "isolation-b" "$prefix" || failed=1
+    fi
+    if [[ $failed -eq 0 ]] && { ! _wait_for_storage_pod "$pod_a" || ! _wait_for_storage_pod "$pod_b"; }; then
+        log_error "ACK te-nfs隔离验证Pod未全部Running"
+        _storage_e2e_capture_diagnostics "$pvc_a" "$prefix-a" "$pod_a"
+        _storage_e2e_capture_diagnostics "$pvc_b" "$prefix-b" "$pod_b"
+        failed=1
+    fi
+    if [[ $failed -eq 0 ]]; then
+        pv_a=$(kubectl get pvc "$pvc_a" -n "$NAMESPACE" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
+        pv_b=$(kubectl get pvc "$pvc_b" -n "$NAMESPACE" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
+        if [[ -z "$pv_a" || -z "$pv_b" || "$pv_a" == "$pv_b" ]]; then
+            log_error "PVC-A/PVC-B未绑定到两个不同PV(PV-A=${pv_a:-空}, PV-B=${pv_b:-空})"
+            failed=1
+        fi
+    fi
+    if [[ $failed -eq 0 ]] && ! kubectl exec "$pod_a" -n "$NAMESPACE" -- sh -c "printf '%s\\n' '$marker_a' > /data/.ack-nfs-isolation-a" >/dev/null 2>&1; then
+        log_error "PVC-A写入隔离标记失败"
+        failed=1
+    fi
+    if [[ $failed -eq 0 ]] && ! kubectl exec "$pod_b" -n "$NAMESPACE" -- sh -c 'test ! -e /data/.ack-nfs-isolation-a' >/dev/null 2>&1; then
+        log_error "隔离验证失败：PVC-B能够看到PVC-A文件，当前te-nfs仍存在目录共享/写入覆盖风险"
+        failed=1
+    fi
+    if [[ $failed -eq 0 ]] && ! kubectl exec "$pod_b" -n "$NAMESPACE" -- sh -c "printf '%s\\n' '$marker_b' > /data/.ack-nfs-isolation-b" >/dev/null 2>&1; then
+        log_error "PVC-B写入隔离标记失败"
+        failed=1
+    fi
+    if [[ $failed -eq 0 ]] && ! kubectl exec "$pod_a" -n "$NAMESPACE" -- sh -c 'test ! -e /data/.ack-nfs-isolation-b' >/dev/null 2>&1; then
+        log_error "隔离验证失败：PVC-A能够看到PVC-B文件，当前te-nfs仍存在目录共享/写入覆盖风险"
+        failed=1
+    fi
+
+    # 两个PVC分别按本轮实际PV回收；任一回收失败都不能宣称验证通过。
+    if $created_a; then _storage_e2e_cleanup "$pvc_a" "$pod_a" || failed=1; fi
+    if $created_b; then _storage_e2e_cleanup "$pvc_b" "$pod_b" || failed=1; fi
+    if [[ $failed -ne 0 ]]; then
+        log_error "ACK te-nfs PVC目录隔离验证未通过或测试资源未完整回收"
+        return 1
+    fi
+    log_success "ACK te-nfs PVC目录隔离验证通过：两个PVC绑定不同PV且文件双向不可见"
+    return 0
+}
+
 verify_nfs_rwx_cross_node() {
     # 参数: StorageClass 资源前缀 失败附加提示。调用方负责确保至少两个可调度节点。
     local storage_class="$1" res_prefix="$2" extra_hint="${3:-}"
@@ -4870,6 +5453,7 @@ print_standard_check_plan() {
     log_info "- 本地服务器访问Pod网络连通性检查(兼容性验证)"
     log_info "- 本地服务器访问Kubernetes Service连通性检查(NodePort)"
     log_info "- Pod访问本地服务器网络连通性检查"
+    log_info "- Pod访问数数公网仓库连通性检查(严格HTTPS)"
     log_info "- Pod访问集群内MySQL连通性检查"
     log_info "- Pod访问集群内云主机延迟检查(<${HOST_LATENCY_THRESHOLD_MS}ms)"
     log_info "- 端到端存储验证(te-disk RWO)"
@@ -4883,6 +5467,7 @@ print_serverless_check_plan() {
     log_info "- 云平台Serverless特性检查"
     log_info "- 每个Serverless虚拟节点健康检查"
     log_info "- 指定Serverless虚拟节点Pod部署启动检查"
+    log_info "- Pod访问数数公网仓库连通性检查(严格HTTPS)"
     log_info "- Pod访问ClusterIP Service检查"
     log_info "- Pod访问MySQL网络检查"
     log_info "- te-disk StorageClass与RWO端到端验证"
@@ -4914,6 +5499,42 @@ print_mode_specific_plan() {
 
 # ==================== 主执行流程 ====================
 main() {
+    local cli_mode="full"
+    local target_node_selector=""
+    if [[ ${1:-} == "--ack-te-nfs-check" ]]; then
+        cli_mode="ack-te-nfs"
+        shift
+    elif [[ ${1:-} == "--node-selector" ]]; then
+        cli_mode="target-node-selector"
+        if [[ $# -lt 2 || -z ${2:-} ]]; then
+            log_error "--node-selector必须提供逗号分隔的精确标签选择器"
+            SCRIPT_COMPLETED=true
+            return 2
+        fi
+        target_node_selector="$2"
+        shift 2
+    elif [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
+        cat <<'EOF_USAGE'
+用法:
+  bash k8sAvailCheck.sh                     # 完整K8S就绪性检查
+  bash k8sAvailCheck.sh --ack-te-nfs-check  # 仅检查/修正ACK te-nfs并验证PVC目录隔离
+  bash k8sAvailCheck.sh --node-selector 'node.k8s.te/nodepool-name=reserved-64c256g,kubernetes.io/arch=amd64'
+                                            # 仅检查指定标签命中的目标节点池及真实调度能力
+EOF_USAGE
+        SCRIPT_COMPLETED=true
+        return 0
+    elif [[ $# -gt 0 ]]; then
+        log_error "未知参数: $1"
+        log_info "可用专项入口: --ack-te-nfs-check、--node-selector '<key=value,...>'"
+        SCRIPT_COMPLETED=true
+        return 2
+    fi
+    if [[ $# -gt 0 ]]; then
+        log_error "专项入口不接受额外参数: $*"
+        SCRIPT_COMPLETED=true
+        return 2
+    fi
+
     echo -e "${BOLD}$(_banner_rule)"
     log_info "K8S 就绪可用性确保脚本 v3.0"
     log_info "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -4928,6 +5549,7 @@ main() {
     log_info "- Hybrid：分别执行Serverless与Standard检查，统一汇总且互不遮蔽失败"
     log_info "- 存储动态供给、挂载与读写：按模式验证te-disk(RWO)和te-nfs(RWX)"
     log_info "- Pod、Service/NodePort 与云主机网络连通性：NodePort和宿主机项仅适用于Standard分支"
+    log_info "- Pod访问数数公网仓库连通性：所有Pod调度域严格通过HTTPS访问两个数数仓库，不回退HTTP"
     log_info "执行期间会在 namespace=debug 创建临时探测资源（Deployment、Service、PVC、Pod），结束后自动清理；测试yaml与诊断信息保留在物料目录。"
 
     print_common_preflight_plan
@@ -4938,6 +5560,50 @@ main() {
     record_result "kubectl检查" "PASS" "kubectl已就绪(版本匹配目标${K8S_VERSION})"
     test_k8s_connection
     record_result "K8S集群连通性检查" "PASS" "集群连接正常"
+
+    if [[ "$cli_mode" == "target-node-selector" ]]; then
+        cloud_platform=$(detect_cloud_platform)
+        record_result "K8S所属环境检查" "PASS" "云平台=${cloud_platform}；进入指定节点标签专项检查"
+        ensure_namespace
+        local target_check_rc=0
+        if run_target_node_selector_check "$target_node_selector"; then
+            record_result "指定节点标签专项检查" "PASS" "全部命中节点就绪，且业务镜像Pod已真实调度成功"
+        else
+            target_check_rc=1
+            record_result "指定节点标签专项检查" "FAIL" "标签未命中、节点未就绪或真实调度验证失败，详见日志与物料"
+        fi
+        print_summary
+        log_info "指定节点标签专项检查结束；未执行Kyverno、Serverless/Hybrid分流、节点组规划、其他节点池、存储、网络、MySQL或历史PV清理"
+        SCRIPT_COMPLETED=true
+        return "$target_check_rc"
+    fi
+
+    if [[ "$cli_mode" == "ack-te-nfs" ]]; then
+        cloud_platform=$(detect_cloud_platform)
+        if [[ "$cloud_platform" != *alibaba* && "$cloud_platform" != *ali* ]]; then
+            record_result "ACK te-nfs专项入口" "FAIL" "当前云平台=${cloud_platform}，该入口仅允许阿里云ACK"
+            print_summary
+            SCRIPT_COMPLETED=true
+            return 1
+        fi
+        record_result "K8S所属环境检查" "PASS" "云平台=${cloud_platform}；进入ACK te-nfs专项检查"
+        ensure_namespace
+        if ensure_nfs_storageclass "$cloud_platform"; then
+            record_result "网络存储SC就绪检查(te-nfs)" "PASS" "ACK te-nfs volumeAs=subpath并已回读确认"
+            if verify_ack_te_nfs_pvc_isolation; then
+                record_result "ACK te-nfs双PVC目录隔离验证" "PASS" "PVC-A/PVC-B绑定不同PV且文件双向不可见"
+            else
+                record_result "ACK te-nfs双PVC目录隔离验证" "FAIL" "两个PVC目录未证明隔离或测试资源回收失败，详见日志与物料"
+            fi
+        else
+            record_result "ACK te-nfs双PVC目录隔离验证" "SKIP" "te-nfs SC配置未就绪，未创建测试PVC"
+        fi
+        print_summary
+        log_info "ACK te-nfs专项检查结束；未执行Kyverno、节点/节点组、网络、MySQL或te-disk检查"
+        SCRIPT_COMPLETED=true
+        return 0
+    fi
+
     ensure_namespace
     check_kyverno_compatibility
 
@@ -5077,6 +5743,15 @@ main() {
         [[ "$cloud_platform" == *aws* ]] && _aws_mark_storage_repair_needed "te-disk端到端验证失败"
     fi
 
+    # ACK重建SC后补充双PVC隔离验证；已有合规SC在专项入口也会执行该验证。
+    if [[ $nfs_ready -eq 1 && "$cloud_platform" == *alibaba* && "$ACK_TE_NFS_REBUILT" == true ]]; then
+        if verify_ack_te_nfs_pvc_isolation; then
+            record_result "ACK te-nfs双PVC目录隔离验证" "PASS" "重建后两个PVC绑定不同PV且文件双向不可见"
+        else
+            record_result "ACK te-nfs双PVC目录隔离验证" "FAIL" "重建后未证明PVC目录隔离或测试资源回收失败，详见日志与物料"
+        fi
+    fi
+
     # 文件存储 te-nfs: RWX 基础读写 + 条件性的跨节点共享读写验证。
     if [[ $nfs_ready -eq 1 ]]; then
         local nfs_hint=""
@@ -5126,6 +5801,10 @@ main() {
 # EXIT trap: 脚本未正常完成时清理可能残留的测试资源，避免nginx-test/np-probe-*遗留计费节点
 cleanup_on_exit() {
     if ! $SCRIPT_COMPLETED; then
+        if [[ -n "${TARGET_NODE_SELECTOR_PROBE_POD:-}" ]]; then
+            target_node_selector_cleanup_probe "$TARGET_NODE_SELECTOR_PROBE_POD" || \
+                log_error "异常退出时指定节点标签专项探测Pod未完成回收: ${NAMESPACE}/${TARGET_NODE_SELECTOR_PROBE_POD}"
+        fi
         # Serverless异常退出同样按本轮run-id执行安全PV/PVC回收，避免误删并发检查或遗留计费卷。
         cleanup_serverless_resources false || log_error "异常退出时部分Serverless临时资源未完成回收，请按probe-run=${PROBE_RUN_LABEL}复核"
         # 兼容旧测试资源(nginx-test)与新探测资源(np-probe-*),按label批量清理

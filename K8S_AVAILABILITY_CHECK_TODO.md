@@ -13,6 +13,8 @@
 
 | 优先级 | 状态 | 待办 | 完成标准 | 当前阻塞 / 下一步 | 责任人 |
 | --- | --- | --- | --- | --- | --- |
+| P1 | 已定位，暂缓实施 | Hybrid中不可调度Serverless域重复串行等待 | 某Serverless域的定向网络Pod确认`no-nodepool`或最终不可调度后，该域的te-disk/te-nfs/同域RWX登记SKIP且不再各等待180秒；只有真实Pod Ready的域才能进入跨域RWX候选 | ACK Hybrid现场证明并非无限循环：两个ARM虚拟节点各串行等待网络、te-disk、te-nfs约9分钟，且调度失败域过早加入`READY_SERVERLESS_DOMAINS`。当前按用户要求先暂缓，优先实现标签选择器专项入口 | Codex/用户 |
+| P0 | 已实现，待现场验证 | 按节点标签选择器执行目标节点池专项检查 | 接受标准`key=value,key=value`选择器；核验全部命中节点Ready且未cordon，并用数数业务镜像定向Pod证明真实调度；无参数入口行为不变，专项入口不得执行Serverless、其他节点池、存储、MySQL或全量网络 | 示例：`--node-selector 'node.k8s.te/nodepool-name=reserved-64c256g,kubernetes.io/arch=amd64'`。本地行为及旧入口反向回归通过；待真实ACK Hybrid现场确认全部目标AMD64节点被命中、Pod落入目标集合且资源回收。池内规格/付费标签/污点的专项详细披露可在现场基础链路通过后按业务需要继续增强，不复用全量节点规划状态 | Codex/用户 |
 | P0 | 已现场验证 | GKE Filestore `te-nfs` 网络参数自动注入 | StorageClass 使用由执行主机主网卡 Metadata 路径提取的网络短名称，不再隐式依赖 `default` | 2026-07-30 修复后实测：SC 创建为 `network=default`，RWX PVC 成功动态供给、挂载读写；完整 Metadata 路径不再直传 Filestore | Codex/用户 |
 | P2 | 阻塞（待授权/环境） | GKE Filestore `te-nfs` 成本与实例复用现场核验 | 记录每个 `instance-storageclass-label` 对应的 Filestore 实例数、容量、share 数和月度预算 | 需目标 GCP 项目 `filestore.instances.list/get` 与账单查看权限；优先使用已有多个 `te-nfs` PVC 的集群，避免为测试额外产生 1TiB Filestore 成本 | 用户/云平台管理员 |
 | P0 | 已现场验证 | 回灌线上确认的 `max-volume-size` | 仓库 `te-nfs` 模板与脚本均包含 `max-volume-size: "128Gi"`，且只维护 `te-nfs` 这个名称 | 2026-07-30 修复后新建 SC 已确认 `max-volume-size=128Gi`，并成功完成 RWX PVC 动态供给；实际实例/share 装箱和成本见下一项 | Codex/用户 |
