@@ -1,5 +1,14 @@
 # 决策记录
 
+## 2026-11-17：配套脚本采用不可变版本目录，固定路径仅作为最新版兼容入口
+
+- 决定：`k8sAvailCheck.sh`与`auto_build_nodepool.sh`作为一个发布单元，正式物料放入`ta/tools/k8s-readiness/releases/<release>/`；本次release为`v3.0.20261117.1`。
+- 配对方式：主脚本内置release、版本化NodePool下载URL及其SHA256。运行时只允许下载该版本目录中的子脚本并校验SHA，不再把会变化的`ta/tools/auto_build_nodepool.sh`作为生产依赖。
+- 兼容方式：`ta/tools/k8sAvailCheck.sh`和`ta/tools/auto_build_nodepool.sh`继续存在并始终指向当前最新版，避免破坏既有下载习惯；`archive/`只保留历史对象，不作为执行入口。
+- 发布顺序：先上传并回读版本化NodePool脚本，再上传并回读引用它的版本化主脚本；随后恢复固定主脚本入口，再恢复固定NodePool入口；最后必须从四个公网URL重新下载并做字节、SHA和语法回读。
+- 安全取舍：固定入口与严格SHA无法保证“任意旧主脚本+最新版子脚本”继续运行。旧主脚本出现SHA不匹配属于期望中的安全失败，处理方式是重新下载最新主脚本，禁止降低或跳过完整性校验。
+- 本次证据：固定及版本化主脚本SHA均为`fb1edb1f4a1d47a7a6ecf1a4703fb38ea94865e419668d6d1bdf3eab5d5bd19c`；固定及版本化NodePool脚本SHA均为`3bd59dd3fe0e97e3307b0fa2c66aab6a36bd39900becb490b228c413d11b2823`，四份公网对象均与本地权威文件逐字节一致且`bash -n`通过。release、NodePool URL和SHA作为一个固定信任单元写入主脚本，不允许调用环境单独覆盖其中任一项。
+
 ## 2026-11-17：NodePool创建与K8S完整可用性检查分层而不合并脚本
 
 - 决定：保留`auto_build_nodepool.sh`独立物料，但把它收敛为AWS写操作入口；`k8sAvailCheck.sh`是唯一完整可用性判定者。子脚本成功后不得要求管理员重跑，也不得提前结束本轮主流程。

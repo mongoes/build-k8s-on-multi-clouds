@@ -1,5 +1,15 @@
 # 项目状态
 
+## 2026-11-17：K8S就绪性检查与AWS NodePool物料已完成版本化及兼容发布
+
+- 正式版本为`v3.0.20261117.1`，两份配套脚本已发布到不可变目录`ta/tools/k8s-readiness/releases/v3.0.20261117.1/`。
+- 为兼容既有同事和环境的下载习惯，已在`ta/tools/`恢复`k8sAvailCheck.sh`和`auto_build_nodepool.sh`两个固定入口；归档目录中的旧对象保持不动。
+- 主脚本不再从会变化的固定入口下载NodePool脚本，而是固定下载同版本目录下的`auto_build_nodepool.sh`，并以SHA256硬校验配对内容。
+- 当前主脚本SHA256为`fb1edb1f4a1d47a7a6ecf1a4703fb38ea94865e419668d6d1bdf3eab5d5bd19c`；NodePool脚本SHA256为`3bd59dd3fe0e97e3307b0fa2c66aab6a36bd39900becb490b228c413d11b2823`。主脚本内的release、子脚本URL与SHA为不可由环境变量覆盖的固定信任单元。
+- 已从两个固定公网地址和两个版本化公网地址分别重新下载，四份对象均与本地权威文件逐字节一致，且`bash -n`通过；固定入口继续代表“当前最新版”，版本化路径用于严格复现。
+- 兼容边界：已经下载到本地的旧版主脚本若仍指向固定NodePool入口，其内置旧SHA会在固定入口更新后安全阻断。此类环境必须重新下载最新`k8sAvailCheck.sh`，不能绕过SHA校验。
+- 当前分支完成最终回归后推送`codex/k8s-readiness-node-snapshot-refactor`；尚不直接合并`main`。
+
 ## 2026-11-17：AWS NodePool创建脚本职责收敛已完成内部EKS现场验收
 
 - `auto_build_nodepool.sh`继续作为可独立下载执行的AWS创建入口，但只负责目标EKS身份确认、Karpenter前置检查、NodePool/EC2NodeClass创建和本轮对象Ready回读。

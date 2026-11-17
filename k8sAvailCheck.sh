@@ -65,9 +65,13 @@ AWS_SPECIAL_ACTION_TIMEOUT=300
 AWS_NODEPOOL_ACTION_MAX_ATTEMPTS=3
 AWS_NODEPOOL_READY_TIMEOUT=300
 AWS_NODEPOOL_CANCELLED_RC=10
+# AWS NodePool创建脚本使用不可变版本化路径，避免固定“latest”对象在主、子
+# 脚本分批发布时产生SHA错配。旧固定路径继续保留，供人工获取最新脚本。
+K8S_AVAIL_RELEASE="v3.0.20261117.1"
+AWS_AUTO_BUILD_NODEPOOL_URL="${AWS_TOOL_BASE_URL}/k8s-readiness/releases/${K8S_AVAIL_RELEASE}/auto_build_nodepool.sh"
 # 固定为当前本地权威auto_build_nodepool.sh的SHA256。发布OSS物料和主脚本时必须
 # 成对同步；任一端不匹配时安全阻断。
-AWS_AUTO_BUILD_NODEPOOL_SHA256="${AWS_AUTO_BUILD_NODEPOOL_SHA256:-3bd59dd3fe0e97e3307b0fa2c66aab6a36bd39900becb490b228c413d11b2823}"
+AWS_AUTO_BUILD_NODEPOOL_SHA256="3bd59dd3fe0e97e3307b0fa2c66aab6a36bd39900becb490b228c413d11b2823"
 AWS_STORAGE_REPAIR_NEEDED=false
 AWS_STORAGE_REPAIR_REASONS=""
 AWS_CONSOLIDATION_CANDIDATES=""
@@ -5606,7 +5610,10 @@ _download_and_run_aws_tool() {
     esac
 
     script_path="/tmp/thinkingai/${script_name}"
-    script_url="${AWS_TOOL_BASE_URL}/${script_name}"
+    case "$script_name" in
+    auto_build_nodepool.sh) script_url="$AWS_AUTO_BUILD_NODEPOOL_URL" ;;
+    *) script_url="${AWS_TOOL_BASE_URL}/${script_name}" ;;
+    esac
     mkdir -p /tmp/thinkingai || {
         log_error "无法创建AWS工具临时目录: /tmp/thinkingai"
         return 1

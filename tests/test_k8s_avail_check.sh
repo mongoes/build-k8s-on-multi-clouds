@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT="${1:-$(cd "$(dirname "$0")/.." && pwd)/k8sAvailCheck.sh}"
 NODEPOOL_SCRIPT="$(cd "$(dirname "$SCRIPT")" && pwd)/aws eks k8s/v1.36 eks v1.13 karpenter/01eks_build/auto_build_nodepool.sh"
+test_tmp="$(mktemp -d)"
+trap 'rm -rf "$test_tmp"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 require_text() { grep -qF "$1" "$SCRIPT" || fail "missing required text: $1"; }
 forbid_text() { ! grep -qF -- "$1" "$SCRIPT" || fail "forbidden text remains: $1"; }
@@ -57,7 +59,7 @@ require_text '请选择本次AWS EKS环境操作类型'
 require_text '新建或补充NodePool'
 require_text '检查现有NodePool及EKS可用性'
 require_text 'AWS_AUTO_BUILD_NODEPOOL_SHA256='
-require_text "AWS_AUTO_BUILD_NODEPOOL_SHA256=\"\${AWS_AUTO_BUILD_NODEPOOL_SHA256:-${NODEPOOL_SCRIPT_SHA256}}\""
+require_text 'script_url="$AWS_AUTO_BUILD_NODEPOOL_URL"'
 require_text 'sha256sum'
 forbid_text 'new_names="$(comm -13'
 require_text 'KUBECTL_DEFAULT_RELEASE="v1.36.0"'
@@ -71,6 +73,22 @@ require_text 'shasum -a 256 -c -'
 require_text 'curl -fsSL'
 forbid_text 'curl -sLO "$kubectl_url"'
 forbid_text 'kubectl-1.34-${TARGET_ARCH}'
+
+# 正式发布的release、NodePool URL和SHA是一个不可分割的信任单元；调用者环境
+# 不得把其中任一项改到其他版本或对象。变更配对必须修改并重新发布主脚本。
+release_source="$test_tmp/k8sAvailCheck.release-settings.sh"
+sed -n '/^AWS_TOOL_BASE_URL=/,/^AWS_STORAGE_REPAIR_NEEDED=/p' "$SCRIPT" | sed '$d' >"$release_source"
+release_values=$(
+    K8S_AVAIL_RELEASE='v0.0.0-test' \
+        AWS_AUTO_BUILD_NODEPOOL_URL='https://attacker.invalid/auto_build_nodepool.sh' \
+        AWS_AUTO_BUILD_NODEPOOL_SHA256='override-sha' \
+        bash -c 'source "$1"; printf "%s\n%s\n%s\n" "$K8S_AVAIL_RELEASE" "$AWS_AUTO_BUILD_NODEPOOL_URL" "$AWS_AUTO_BUILD_NODEPOOL_SHA256"' _ "$release_source"
+)
+expected_release_values="v3.0.20261117.1
+https://download-thinkingdata.oss-cn-shanghai.aliyuncs.com/ta/tools/k8s-readiness/releases/v3.0.20261117.1/auto_build_nodepool.sh
+${NODEPOOL_SCRIPT_SHA256}"
+[[ "$release_values" == "$expected_release_values" ]] || fail 'environment variables must not override the published NodePool release URL/SHA trust unit'
+
 require_text 'kubectl get crd nodepools.karpenter.sh -o name'
 require_text "kubectl get nodepools.karpenter.sh -o jsonpath="
 require_text 'AWS_TOOL_BASE_URL='
@@ -109,9 +127,6 @@ require_text 'SERVERLESS_MODE="Standard"'
 require_text 'if [[ "$SERVERLESS_MODE" == "Serverless" ]]'
 forbid_text 'sh "${script_path}"'
 forbid_text 'AWS EKS环境经由特殊流程(auto_build_nodepool.sh)处理，不再进行其他检测'
-
-test_tmp=$(mktemp -d)
-trap 'rm -rf "$test_tmp"' EXIT
 
 # kubectl目标版本只接受已经在OSS维护的1.34/1.36两条交付线：能读取Server时按
 # Server minor决定；没有kubectl或Server不可读时由调用方传空值并回退v1.36.0。
