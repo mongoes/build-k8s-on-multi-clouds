@@ -2,9 +2,15 @@
 set -euo pipefail
 
 SCRIPT="${1:-$(cd "$(dirname "$0")/.." && pwd)/k8sAvailCheck.sh}"
+NODEPOOL_SCRIPT="$(cd "$(dirname "$SCRIPT")" && pwd)/aws eks k8s/v1.36 eks v1.13 karpenter/01eks_build/auto_build_nodepool.sh"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 require_text() { grep -qF "$1" "$SCRIPT" || fail "missing required text: $1"; }
 forbid_text() { ! grep -qF -- "$1" "$SCRIPT" || fail "forbidden text remains: $1"; }
+if command -v sha256sum >/dev/null 2>&1; then
+    NODEPOOL_SCRIPT_SHA256="$(sha256sum "$NODEPOOL_SCRIPT" | awk '{print $1}')"
+else
+    NODEPOOL_SCRIPT_SHA256="$(shasum -a 256 "$NODEPOOL_SCRIPT" | awk '{print $1}')"
+fi
 
 require_text 'get_huawei_cce_vpc_id()'
 require_text '检查项说明'
@@ -15,6 +21,10 @@ require_text 'Pod、Service/NodePort 与云主机网络连通性'
 require_text '执行期间会在 namespace=debug 创建临时探测资源'
 require_text 'HUAWEI_CCE_VPC_ID'
 require_text 'capture_huawei_csi_nas_diagnostics warning'
+require_text 'HUAWEI_TE_NFS_ACTION_TIMEOUT="${HUAWEI_TE_NFS_ACTION_TIMEOUT:-300}"'
+require_text '请选择华为CCE te-nfs处理方式'
+require_text '沿用当前te-nfs，并继续端到端可用性验证'
+require_text '重新初始化为华为CCE推荐te-nfs'
 require_text 'SERVICE_DATA_PLANE_RETRY_TIMEOUT=30'
 require_text 'curl_service_with_retry()'
 require_text '_classify_probe_failure()'
@@ -39,13 +49,35 @@ require_text 'HISTORICAL_TEST_PV_CONFIRM_TIMEOUT=30'
 require_text 'HISTORICAL_TEST_PV_DELETE_TIMEOUT=60'
 require_text 'finalize_availability_check()'
 require_text 'check_aws_nodepool_gate()'
-require_text 'K8S_VERSION="1.34"'
-require_text 'K8S_MINOR_VERSION="34"'
+require_text '_aws_select_nodepool_action()'
+require_text '_aws_wait_nodepool_resources_ready()'
+require_text '_aws_kube_identity()'
+require_text 'AWS_SPECIAL_ACTION_TIMEOUT=300'
+require_text '请选择本次AWS EKS环境操作类型'
+require_text '新建或补充NodePool'
+require_text '检查现有NodePool及EKS可用性'
+require_text 'AWS_AUTO_BUILD_NODEPOOL_SHA256='
+require_text "AWS_AUTO_BUILD_NODEPOOL_SHA256=\"\${AWS_AUTO_BUILD_NODEPOOL_SHA256:-${NODEPOOL_SCRIPT_SHA256}}\""
+require_text 'sha256sum'
+forbid_text 'new_names="$(comm -13'
+require_text 'KUBECTL_DEFAULT_RELEASE="v1.36.0"'
+require_text 'KUBECTL_OSS_RELEASE_BASE="${AWS_TOOL_BASE_URL}/kubernetes/release"'
+require_text 'select_kubectl_target_release()'
+require_text 'kubectl_downloaded_version_matches()'
+require_text 'kubectl version -o json --request-timeout=10s'
+require_text '/${target_release}/bin/linux/${TARGET_ARCH}/kubectl'
+require_text 'kubectl.sha256'
+require_text 'shasum -a 256 -c -'
+require_text 'curl -fsSL'
+forbid_text 'curl -sLO "$kubectl_url"'
+forbid_text 'kubectl-1.34-${TARGET_ARCH}'
 require_text 'kubectl get crd nodepools.karpenter.sh -o name'
 require_text "kubectl get nodepools.karpenter.sh -o jsonpath="
 require_text 'AWS_TOOL_BASE_URL='
 require_text 'bash -n "$script_path"'
 require_text 'bash "$script_path"'
+require_text 'AWS_NODEPOOL_CANCELLED_RC=10'
+forbid_text 'green "Karpenter NodePool与EC2NodeClass创建后回读全部Ready'
 require_text 'storage_ready_for_existing_eks.sh'
 require_text 'check_aws_consolidation_policy()'
 require_text 'detect_serverless_mode()'
@@ -80,6 +112,28 @@ forbid_text 'AWS EKS环境经由特殊流程(auto_build_nodepool.sh)处理，不
 
 test_tmp=$(mktemp -d)
 trap 'rm -rf "$test_tmp"' EXIT
+
+# kubectl目标版本只接受已经在OSS维护的1.34/1.36两条交付线：能读取Server时按
+# Server minor决定；没有kubectl或Server不可读时由调用方传空值并回退v1.36.0。
+kubectl_version_source="$test_tmp/k8sAvailCheck.kubectl-version.functions.sh"
+awk '/^select_kubectl_target_release\(\)/ { capture=1 } capture && /^install_kubectl\(\)/ { exit } capture { print }' "$SCRIPT" >"$kubectl_version_source"
+KUBECTL_DEFAULT_RELEASE='v1.36.0'
+# shellcheck disable=SC1090
+source "$kubectl_version_source"
+[[ "$(select_kubectl_target_release 'v1.34.12')" == 'v1.34.0' ]] || fail 'Kubernetes 1.34 server must select the approved v1.34.0 client line'
+[[ "$(select_kubectl_target_release 'v1.36.2-eks-bca9cf6')" == 'v1.36.0' ]] || fail 'Kubernetes 1.36 server must select the approved v1.36.0 client line'
+[[ "$(select_kubectl_target_release '')" == 'v1.36.0' ]] || fail 'missing/unreadable server version must fall back to v1.36.0'
+if select_kubectl_target_release 'v1.35.9' >/dev/null 2>&1; then
+    fail 'an unsupported readable server minor must fail closed instead of silently choosing another kubectl minor'
+fi
+kubectl_downloaded_version_matches 'v1.34.0' 'v1.34.0' || fail 'official-style v1.34.0 object must accept its exact approved patch'
+if kubectl_downloaded_version_matches 'v1.34.0' 'v1.34.7'; then
+    fail 'official-style v1.34.0 object must reject an unexpected patch'
+fi
+kubectl_downloaded_version_matches 'v1.36.0' 'v1.36.0' || fail 'new official-style object must accept its exact approved patch'
+if kubectl_downloaded_version_matches 'v1.36.0' 'v1.36.1'; then
+    fail 'new official-style v1.36.0 object must reject an unexpected patch'
+fi
 
 # 总览集群名来自管理节点 license 的 company_name；缺文件或无有效字段时必须完全不打印。
 cluster_name_source="$test_tmp/k8sAvailCheck.cluster-name.functions.sh"
@@ -214,10 +268,107 @@ sed -n '/^main()/,/^# ==================== 资源清理/p' "$SCRIPT" >"$main_sou
 ! grep -q 'cleanup_historical_test_pvs || true' "$main_source" || fail 'test PV cleanup must not run before the end of the main flow'
 [[ "$(grep -c 'finalize_availability_check' "$main_source")" -eq 3 ]] || fail 'Serverless scope, auto Serverless, and completed Standard/Hybrid paths must each finalize exactly once'
 grep -q 'check_aws_nodepool_gate' "$main_source" || fail 'AWS NodePool gate must run before nodepool plan and storage checks'
+aws_gate_line="$(grep -n 'check_aws_nodepool_gate' "$main_source" | head -1 | cut -d: -f1)"
+mode_plan_line="$(grep -n 'print_mode_specific_plan' "$main_source" | head -1 | cut -d: -f1)"
+[[ -n "$aws_gate_line" && -n "$mode_plan_line" && "$aws_gate_line" -lt "$mode_plan_line" ]] || fail 'AWS NodePool inventory and action selection must run immediately after environment detection, before publishing the Standard plan'
+! grep -q 'aws_gate_rc -eq 10' "$main_source" || fail 'AWS NodePool creation must no longer require a second checker run'
+! grep -A14 'check_aws_nodepool_gate' "$main_source" | grep -q 'return 0' || fail 'AWS NodePool gate failure must not be converted into process success'
 grep -q 'print_common_preflight_plan' "$main_source" || fail 'main must publish the common preflight plan before mode detection'
 grep -q 'print_mode_specific_plan' "$main_source" || fail 'main must publish a mode-specific plan after environment detection'
 grep -q 'run_serverless_checks_inline' "$main_source" || fail 'main must execute Serverless checks in-process'
 grep -q 'run_serverless_checks_inline' "$main_source" && grep -q 'select_nodepool_business_plan' "$main_source" || fail 'Hybrid path must retain both Serverless and Standard branches'
+
+# AWS创建后验收只应阻断本轮新增/修正目标；已有但不相关的历史NodePool交由后续
+# 标准检查披露，不能导致一个新建成功的业务池永远卡在创建入口。
+aws_nodepool_source="$test_tmp/k8sAvailCheck.aws-nodepool.functions.sh"
+sed -n '/^_aws_read_nodepool_action()/,/^check_aws_consolidation_policy()/p' "$SCRIPT" | sed '$d' >"$aws_nodepool_source"
+unset -f jq
+log_info() { :; }
+log_warning() { :; }
+log_error() { :; }
+log_success() { :; }
+sleep() { :; }
+record_result() { :; }
+_aws_interactive_tty_available() { return 0; }
+# shellcheck disable=SC1090
+source "$aws_nodepool_source"
+AWS_NODEPOOL_READY_TIMEOUT=6
+AWS_NODEPOOL_ACTION_MAX_ATTEMPTS=3
+AWS_SPECIAL_ACTION_TIMEOUT=300
+_aws_nodepool_inventory_json() {
+    cat <<'EOF_AWS_NODEPOOLS'
+{"items":[
+ {"metadata":{"name":"legacy-broken"},"spec":{"template":{"spec":{"nodeClassRef":{"name":"legacy-broken"}}}},"status":{"conditions":[{"type":"Ready","status":"False"}]}},
+ {"metadata":{"name":"new-ready"},"spec":{"template":{"spec":{"nodeClassRef":{"name":"new-ready"}}}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}
+]}
+EOF_AWS_NODEPOOLS
+}
+kubectl() {
+    case "$*" in
+    'get ec2nodeclasses.karpenter.k8s.aws new-ready -o json')
+        printf '%s\n' '{"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
+        ;;
+    *) return 1 ;;
+    esac
+}
+_aws_wait_nodepool_resources_ready 'legacy-broken' || fail 'a newly created Ready NodePool must not be blocked by an unrelated pre-existing non-Ready NodePool'
+
+# 创建脚本返回成功但NodePool集合没有新增项时，不能用存量Ready对象冒充本轮创建成功。
+_aws_nodepool_inventory_json() {
+    cat <<'EOF_AWS_EXISTING_NODEPOOL'
+{"items":[
+ {"metadata":{"name":"legacy-ready"},"spec":{"template":{"spec":{"nodeClassRef":{"name":"legacy-ready"}}}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}
+]}
+EOF_AWS_EXISTING_NODEPOOL
+}
+no_delta_rc=0
+_aws_wait_nodepool_resources_ready 'legacy-ready' || no_delta_rc=$?
+[[ $no_delta_rc -eq 2 ]] || fail "no NodePool delta must return rc=2 instead of reporting creation success, got rc=${no_delta_rc}"
+
+# NodeClass引用为空时，库存展示只能披露Missing，不得发起空资源名查询。
+EMPTY_NODECLASS_KUBECTL_CALLS=0
+kubectl() { ((EMPTY_NODECLASS_KUBECTL_CALLS += 1)); return 1; }
+_aws_print_nodepool_inventory '{"items":[{"metadata":{"name":"missing-ref"},"spec":{"template":{"spec":{}}},"status":{"conditions":[{"type":"Ready","status":"False"}]}}]}'
+[[ $EMPTY_NODECLASS_KUBECTL_CALLS -eq 0 ]] || fail 'an unset EC2NodeClass reference must not trigger kubectl with an empty resource name'
+
+# 非交互执行永不创建高权限资源：已有池继续检查，零池安全阻断；管理员明确
+# 选择2时，即使零池也允许继续收集完整诊断。
+_aws_interactive_tty_available() { return 1; }
+_aws_select_nodepool_action 1 || fail 'non-TTY AWS run with an existing NodePool must continue in check mode'
+[[ "$AWS_NODEPOOL_ACTION" == check ]] || fail 'non-TTY existing-NodePool action must be check'
+if _aws_select_nodepool_action 0; then
+    fail 'non-TTY AWS run with zero NodePools must not create or continue implicitly'
+fi
+_aws_interactive_tty_available() { return 0; }
+_aws_read_nodepool_action() { printf '%s\n' 2; }
+_aws_select_nodepool_action 0 || fail 'an explicit option 2 must allow zero-NodePool diagnostic checking'
+[[ "$AWS_NODEPOOL_ACTION" == check ]] || fail 'explicit option 2 must select check mode'
+
+# 子脚本明确返回“用户取消”时，父脚本必须回到1/2菜单，不能记录创建失败或
+# 继续执行创建后Ready验收。第二次选择检查模式后才允许进入标准检查。
+AWS_NODEPOOL_CANCELLED_RC=10
+AWS_AUTO_BUILD_NODEPOOL_SHA256=test-sha256
+AWS_NODEPOOL_ACTION_CALLS=0
+_aws_select_nodepool_action() {
+    AWS_NODEPOOL_ACTION_CALLS=$((AWS_NODEPOOL_ACTION_CALLS + 1))
+    if [[ $AWS_NODEPOOL_ACTION_CALLS -eq 1 ]]; then
+        AWS_NODEPOOL_ACTION=create
+    else
+        AWS_NODEPOOL_ACTION=check
+    fi
+}
+_aws_nodepool_inventory_json() {
+    printf '%s\n' '{"items":[{"metadata":{"name":"legacy-ready"},"spec":{"template":{"spec":{"nodeClassRef":{"name":"legacy-ready"}}}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}'
+}
+_aws_print_nodepool_inventory() { :; }
+_aws_kube_identity() { printf '%s\n' 'eks-context|https://eks.example'; }
+_download_and_run_aws_tool() { return "$AWS_NODEPOOL_CANCELLED_RC"; }
+_aws_wait_nodepool_resources_ready() { fail 'cancelled creation must not enter post-create Ready validation'; }
+kubectl() {
+    [[ "$*" == 'get crd nodepools.karpenter.sh -o name' ]] && printf '%s\n' 'customresourcedefinition.apiextensions.k8s.io/nodepools.karpenter.sh'
+}
+check_aws_nodepool_gate || fail 'cancelled child flow must return to the AWS action menu and allow check mode'
+[[ $AWS_NODEPOOL_ACTION_CALLS -eq 2 ]] || fail 'cancelled child flow must prompt for the AWS action again'
 
 # 计划展示必须先公共前置、后模式专属；Serverless计划不得混入标准节点检查项。
 plan_source="$test_tmp/k8sAvailCheck.plan.functions.sh"
@@ -451,6 +602,10 @@ kubectl() {
     "describe sc csi-nas"*)
         printf 'Name: csi-nas\n'
         ;;
+    *'get sc te-nfs'*'jsonpath='*provisioner*)
+        [[ "${MOCK_TE_NFS_EXISTS:-0}" == 1 || -s "${MOCK_APPLIED_MANIFEST:-/nonexistent}" ]] || return 1
+        printf '%s' "${MOCK_TE_NFS_PROVISIONER:-everest-csi-provisioner}"
+        ;;
     *'get sc te-nfs'*'jsonpath='*)
         [[ "${MOCK_TE_NFS_EXISTS:-0}" == 1 || -s "${MOCK_APPLIED_MANIFEST:-/nonexistent}" ]] || return 1
         printf '%s' "${MOCK_TE_NFS_VPC:-}"
@@ -489,13 +644,14 @@ curl() {
 }
 
 run_huawei_case() {
-    local csi_vpc="$1" manual_vpc="$2" te_nfs_exists="$3" te_nfs_vpc="$4"
+    local csi_vpc="$1" manual_vpc="$2" te_nfs_exists="$3" te_nfs_vpc="$4" provisioner="${5:-everest-csi-provisioner}"
     RESULT_NAMES=() RESULT_STATUS=() RESULT_DETAIL=()
     HUAWEI_CCE_VPC_ID="$manual_vpc"
     HUAWEI_CCE_VPC_ID_RESOLVED=""
     MOCK_CSI_NAS_VPC="$csi_vpc"
     MOCK_TE_NFS_EXISTS="$te_nfs_exists"
     MOCK_TE_NFS_VPC="$te_nfs_vpc"
+    MOCK_TE_NFS_PROVISIONER="$provisioner"
     MOCK_APPLIED_MANIFEST="$test_tmp/applied-${RANDOM}.yaml"
     ARTIFACT_DIR="$test_tmp/artifacts-${RANDOM}"
     LOG_FILE="$test_tmp/k8s.log"
@@ -510,17 +666,44 @@ grep -qF 'everest.io/share-access-to: auto-vpc' "$MOCK_APPLIED_MANIFEST" || fail
 run_huawei_case '' 'manual-vpc' 0 '' || fail 'manual VPC ID should create te-nfs when csi-nas is unavailable'
 grep -qF 'everest.io/share-access-to: manual-vpc' "$MOCK_APPLIED_MANIFEST" || fail 'te-nfs must use manual VPC ID fallback'
 
-# 自动来源与人工值冲突、已有 te-nfs VPC 不一致，都必须失败并登记 FAIL。
+# 自动来源与人工值冲突在缺少te-nfs时必须失败；已有同名te-nfs不符合推荐
+# 模板时，管理员选择沿用后必须返回可测试状态，不能跳过端到端验证。
 if run_huawei_case 'auto-vpc' 'other-vpc' 0 ''; then
     fail 'conflicting automatic and manual VPC IDs must fail'
 fi
 [[ "${RESULT_STATUS[0]:-}" == FAIL ]] || fail 'VPC source conflict must record FAIL'
 find "$ARTIFACT_DIR" -name 'huawei_csi_nas_diagnostic.txt' -print -quit | grep -q . || fail 'VPC source conflict must save diagnostics'
 
-if run_huawei_case 'auto-vpc' '' 1 'wrong-vpc'; then
-    fail 'existing te-nfs with a different VPC ID must fail'
-fi
-[[ "${RESULT_STATUS[0]:-}" == FAIL ]] || fail 'te-nfs VPC mismatch must record FAIL'
+select_huawei_te_nfs_action() { HUAWEI_TE_NFS_ACTION="${MOCK_HUAWEI_ACTION:-reuse}"; return 0; }
+MOCK_HUAWEI_ACTION='reuse'
+run_huawei_case 'auto-vpc' '' 1 'wrong-vpc' 'nfs-provisioner' || fail 'existing nonstandard te-nfs selected for reuse must remain eligible for E2E'
+[[ "${HUAWEI_TE_NFS_OUTCOME:-}" == reused ]] || fail 'existing nonstandard te-nfs reuse must be exposed to callers as a warning outcome'
+
+# 特殊CCE可能完全没有csi-nas/SFS能力；只要同名nfs-provisioner SC存在，沿用路径
+# 不得要求VPC ID，也不得因模板不匹配跳过E2E。
+MOCK_HUAWEI_ACTION='reuse'
+run_huawei_case '' '' 1 '' 'nfs-provisioner' || fail 'existing nfs-provisioner te-nfs must not require csi-nas or VPC ID when reused'
+[[ "${HUAWEI_TE_NFS_OUTCOME:-}" == reused ]] || fail 'nfs-provisioner reuse must produce the reused outcome'
+
+# 真实交互函数：1=沿用、2=重建；EOF/超时按安全策略沿用，绝不能默认执行破坏性重建。
+unset -f select_huawei_te_nfs_action
+# shellcheck disable=SC1090
+source "$source_script"
+HUAWEI_TE_NFS_ACTION_TIMEOUT=1
+HUAWEI_TE_NFS_ACTION_OUTPUT_PATH=/dev/null
+: >"$test_tmp/huawei-action-eof"
+HUAWEI_TE_NFS_ACTION_INPUT_PATH="$test_tmp/huawei-action-eof"
+select_huawei_te_nfs_action || fail 'EOF must safely select reuse'
+[[ "$HUAWEI_TE_NFS_ACTION" == reuse ]] || fail 'EOF must default to reuse'
+printf '1\n' >"$test_tmp/huawei-action-reuse"
+HUAWEI_TE_NFS_ACTION_INPUT_PATH="$test_tmp/huawei-action-reuse"
+select_huawei_te_nfs_action || fail 'option 1 must select reuse'
+[[ "$HUAWEI_TE_NFS_ACTION" == reuse ]] || fail 'option 1 must keep existing te-nfs'
+printf '2\n' >"$test_tmp/huawei-action-rebuild"
+HUAWEI_TE_NFS_ACTION_INPUT_PATH="$test_tmp/huawei-action-rebuild"
+select_huawei_te_nfs_action || fail 'option 2 must select rebuild'
+[[ "$HUAWEI_TE_NFS_ACTION" == rebuild ]] || fail 'option 2 must select recommended SC rebuild'
+unset HUAWEI_TE_NFS_ACTION_INPUT_PATH HUAWEI_TE_NFS_ACTION_OUTPUT_PATH
 
 # 没有自动或人工来源时必须失败并写入 csi-nas 诊断物料。
 if run_huawei_case '' '' 0 ''; then
@@ -583,8 +766,8 @@ fi
 grep -qF 'Google Cloud控制台确认network信息' "$LOG_FILE" || fail 'GKE Metadata failure must direct the operator to Google Cloud Console'
 grep -qF 'network: "<NETWORK_NAME>"' "$LOG_FILE" || fail 'GKE Metadata failure must print a Filestore-compatible manual network template'
 
-# 华为不合规且仍被引用的 te-nfs 只能经明确确认替换同名 StorageClass；PV/PVC/Pod
-# 只允许读取，绝不能成为删除目标。
+# 华为不合规且仍被引用的 te-nfs 只有明确选择重新初始化时才替换；PV/PVC/Pod
+# 只允许读取，绝不能成为删除目标。默认/超时/非TTY均沿用并进入E2E。
 HUAWEI_CCE_VPC_ID_RESOLVED='trusted-vpc'
 MOCK_REPLACE_CALLS="$test_tmp/huawei-te-nfs-replace.calls"
 : >"$MOCK_REPLACE_CALLS"
@@ -618,7 +801,9 @@ kubectl() {
     fi
     case "$cmd" in
     "get pv -o jsonpath="*) printf 'pvc-legacy-nfs|te-agent/pvc-nfs-share|Bound\n' ;;
-    "get sc te-nfs -o yaml") printf 'kind: StorageClass\nmetadata:\n  name: te-nfs\n' ;;
+    "get sc te-nfs -o json")
+        printf '%s\n' '{"apiVersion":"storage.k8s.io/v1","kind":"StorageClass","metadata":{"name":"te-nfs","uid":"old-uid","resourceVersion":"42"},"provisioner":"nfs-provisioner","reclaimPolicy":"Retain","volumeBindingMode":"Immediate"}'
+        ;;
     "delete sc te-nfs") MOCK_REPLACE_SC_EXISTS=0 ;;
     "get pod storage-image -n debug -o jsonpath={.status.phase}") printf 'Pending' ;;
     "get pod storage-image -n debug -o jsonpath={.status.containerStatuses[0].state.waiting.reason}") printf 'ImagePullBackOff' ;;
@@ -629,34 +814,38 @@ kubectl() {
         MOCK_REPLACE_PROVISIONER='everest-csi-provisioner'
         MOCK_REPLACE_VPC='trusted-vpc'
         ;;
+    "apply -f "*"huawei_te_nfs_restore.json")
+        MOCK_REPLACE_SC_EXISTS=1
+        MOCK_REPLACE_PROVISIONER='nfs-provisioner'
+        MOCK_REPLACE_VPC=''
+        ;;
     *) return 0 ;;
     esac
 }
-read_huawei_te_nfs_replacement_confirmation() { [[ "${MOCK_REPLACE_CONFIRM:-}" == yes ]]; }
-forbid_text '$(read_huawei_te_nfs_replacement_confirmation)'
+select_huawei_te_nfs_action() { HUAWEI_TE_NFS_ACTION="${MOCK_REPLACE_ACTION:-reuse}"; return 0; }
 
-MOCK_REPLACE_CONFIRM=''
-if huawei_te_nfs_replace_after_confirmation; then
-    fail 'blank confirmation must not replace te-nfs'
-fi
+MOCK_REPLACE_ACTION='reuse'
+HUAWEI_TE_NFS_ACTION="$MOCK_REPLACE_ACTION"
 ! grep -q '^delete sc te-nfs$' "$MOCK_REPLACE_CALLS" || fail 'blank confirmation must not delete te-nfs'
 
 : >"$MOCK_REPLACE_CALLS"
-MOCK_REPLACE_CONFIRM='yes'
-huawei_te_nfs_replace_after_confirmation || fail 'exact yes must replace incompatible te-nfs'
+MOCK_REPLACE_ACTION='rebuild'
+huawei_te_nfs_rebuild || fail 'explicit rebuild choice must replace incompatible te-nfs'
 grep -q '^delete sc te-nfs$' "$MOCK_REPLACE_CALLS" || fail 'confirmed replacement must delete only te-nfs StorageClass'
 grep -q '^apply -f -$' "$MOCK_REPLACE_CALLS" || fail 'confirmed replacement must create standard te-nfs'
 ! grep -Eq '^delete (pv|pvc|pod) ' "$MOCK_REPLACE_CALLS" || fail 'te-nfs replacement must never delete PV PVC or Pod'
 grep -qF 'provisioner: everest-csi-provisioner' "$test_tmp/huawei-te-nfs-replaced.yaml" || fail 'replacement must apply the Everest CCE template'
+jq -e '.kind == "StorageClass" and .metadata.name == "te-nfs" and .provisioner == "nfs-provisioner"' "$ARTIFACT_DIR/huawei_te_nfs_restore.json" >/dev/null || fail 'rebuild must retain a valid sanitized manifest for restoring the original StorageClass'
 
 : >"$MOCK_REPLACE_CALLS"
-MOCK_REPLACE_CONFIRM='yes'
+MOCK_REPLACE_ACTION='rebuild'
 MOCK_REPLACE_APPLY_FAIL=1
 rm -f "$test_tmp/huawei-te-nfs-replaced.yaml"
-if huawei_te_nfs_replace_after_confirmation; then
-    fail 'failed te-nfs recreation must fail'
-fi
-grep -qF '手动恢复' "$REPLACE_LOG" || fail 'failed recreation must print manual restore guidance'
+rebuild_rc=0
+huawei_te_nfs_rebuild || rebuild_rc=$?
+[[ $rebuild_rc -eq 2 ]] || fail 'failed recommended SC creation with successful old-SC restore must return reusable status 2'
+grep -qF '已恢复原te-nfs' "$REPLACE_LOG" || fail 'failed recreation must restore and disclose the original SC'
+grep -q 'apply -f .*huawei_te_nfs_restore.json' "$MOCK_REPLACE_CALLS" || fail 'failed recommended SC creation must apply the original SC restore manifest'
 MOCK_REPLACE_APPLY_FAIL=0
 
 # Service Endpoint 就绪后，数据面可能尚未完成同步；首次失败、下次成功必须重试。

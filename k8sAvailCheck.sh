@@ -61,15 +61,25 @@ SERVERLESS_WAIT_REASON=""
 STANDARD_NODES=()
 STANDARD_NODE_COUNT=0
 AWS_TOOL_BASE_URL="https://download-thinkingdata.oss-cn-shanghai.aliyuncs.com/ta/tools"
-AWS_SPECIAL_ACTION_TIMEOUT=30
+AWS_SPECIAL_ACTION_TIMEOUT=300
+AWS_NODEPOOL_ACTION_MAX_ATTEMPTS=3
+AWS_NODEPOOL_READY_TIMEOUT=300
+AWS_NODEPOOL_CANCELLED_RC=10
+# 固定为当前本地权威auto_build_nodepool.sh的SHA256。发布OSS物料和主脚本时必须
+# 成对同步；任一端不匹配时安全阻断。
+AWS_AUTO_BUILD_NODEPOOL_SHA256="${AWS_AUTO_BUILD_NODEPOOL_SHA256:-a50006e043b7f5b588012f797115abb9afcbaa7de013bd9cca34d17ef9c01747}"
 AWS_STORAGE_REPAIR_NEEDED=false
 AWS_STORAGE_REPAIR_REASONS=""
 AWS_CONSOLIDATION_CANDIDATES=""
 
-# ==================== 版本配置（跟随K8S社区迭代更新） ====================
-K8S_VERSION="1.34"
+# ==================== kubectl版本与物料 ====================
+# 能读取Server Version时按Server minor选择经过验证的kubectl版本；
+# 未安装kubectl或Server不可读时，固定回退v1.36.0，不猜测中间版本。
+KUBECTL_DEFAULT_RELEASE="v1.36.0"
+KUBECTL_OSS_RELEASE_BASE="${AWS_TOOL_BASE_URL}/kubernetes/release"
+K8S_VERSION="1.36"
 K8S_MAJOR_VERSION="1"
-K8S_MINOR_VERSION="34"
+K8S_MINOR_VERSION="36"
 # 可用性检查统一从数数镜像仓库拉取, 与实际服务部署来源保持一致(不再走 docker hub / GCR 备用)。
 # 若从此仓库拉取失败, 大概率是容器集群网络策略未放行, 视为不符合部署需求并强提示。
 # 拉取失败时的统一强提示文案(容器集群网络策略未放行 docker-ta.thinkingdata.cn)
@@ -723,6 +733,37 @@ checkUser() {
     fi
 }
 
+# 返回项目已批准的kubectl精确补丁版本。参数为服务端gitVersion；
+# 空值表示未安装kubectl或无法读取Server Version，回退默认v1.36.0。
+select_kubectl_target_release() {
+    local server_git_version="${1:-}"
+    case "$server_git_version" in
+    "") printf '%s\n' "$KUBECTL_DEFAULT_RELEASE" ;;
+    v1.34.* | v1.34) printf '%s\n' 'v1.34.0' ;;
+    v1.36.* | v1.36) printf '%s\n' 'v1.36.0' ;;
+    *) return 1 ;;
+    esac
+}
+
+kubectl_downloaded_version_matches() {
+    local target_release="$1" downloaded_version="$2"
+    [[ "$downloaded_version" == "$target_release" ]]
+}
+
+verify_kubectl_sha256() {
+    local download_dir="$1"
+    local expected_sha
+    expected_sha="$(tr -d '[:space:]' <"${download_dir}/kubectl.sha256")"
+    if [[ ! "$expected_sha" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        return 1
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        (cd "$download_dir" && printf '%s  kubectl\n' "$expected_sha" | sha256sum -c - >/dev/null)
+    else
+        (cd "$download_dir" && printf '%s  kubectl\n' "$expected_sha" | shasum -a 256 -c - >/dev/null)
+    fi
+}
+
 # ==================== kubectl检查 ====================
 install_kubectl() {
     log_step "kubectl检查"
@@ -741,43 +782,78 @@ install_kubectl() {
         ;;
     esac
 
-    if ! command -v kubectl &>/dev/null; then
-        log_info "未检测到kubectl，开始安装 K8S ${K8S_VERSION}"
-    else
-        # 从 v1.34.0 中提取主版本号(X)和次版本号(Y)，忽略补丁号(Z)
-        local installed_full=$(kubectl version --client 2>/dev/null | head -1)
-        local installed_major=$(echo "$installed_full" | grep -oP 'v\K[0-9]+' | head -1)
-        local installed_minor=$(echo "$installed_full" | grep -oP 'v[0-9]+\.\K[0-9]+' | head -1)
-        log_info "检测到已安装kubectl，版本: $installed_full"
-        log_info "目标版本: ${K8S_VERSION} (Major=${K8S_MAJOR_VERSION}, Minor=${K8S_MINOR_VERSION})"
-        log_info "当前版本: $installed_major.$installed_minor"
-
-        if [[ "$installed_major" == "${K8S_MAJOR_VERSION}" && "$installed_minor" == "${K8S_MINOR_VERSION}" ]]; then
-            log_success "kubectl版本($installed_major.$installed_minor)已匹配目标版本(${K8S_VERSION})，无需重新安装"
-            return 0
-        else
-            log_info "kubectl版本($installed_major.$installed_minor)与目标版本(${K8S_VERSION})不一致，开始更新"
-            # 保存原始kubectl路径，备份后command -v将失效，故此处先记录
-            ORIG_KUBECTL_PATH="$(command -v kubectl)"
-            BACKUP_FILE="/usr/local/bin/kubectl_bak_$(date +%Y%m%d_%H%M%S)"
-            mv "${ORIG_KUBECTL_PATH}" "${BACKUP_FILE}"
-            log_info "已将老版本kubectl备份至: $BACKUP_FILE"
+    local server_version_json=""
+    local server_git_version=""
+    local installed_full=""
+    local installed_major=""
+    local installed_minor=""
+    if command -v kubectl >/dev/null 2>&1; then
+        installed_full="$(kubectl version --client -o json 2>/dev/null | grep -m1 -oE '"gitVersion"[[:space:]]*:[[:space:]]*"[^"]+"' | grep -oE 'v[0-9][^"]*' || true)"
+        server_version_json="$(kubectl version -o json --request-timeout=10s 2>/dev/null || true)"
+        if [[ "$server_version_json" == *'"serverVersion"'* ]]; then
+            server_git_version="$(printf '%s\n' "$server_version_json" | grep -oE '"gitVersion"[[:space:]]*:[[:space:]]*"[^"]+"' | tail -1 | grep -oE 'v[0-9][^"]*' || true)"
         fi
+        log_info "检测到已安装kubectl，版本: ${installed_full:-无法解析}"
+    else
+        log_info "未检测到kubectl，无法读取Server Version"
     fi
 
-    local kubectl_url="https://download-thinkingdata.oss-cn-shanghai.aliyuncs.com/ta/tools/kubectl-${K8S_VERSION}-${TARGET_ARCH}"
-    log_info "架构: $ARCH -> ${TARGET_ARCH}, 下载地址: $kubectl_url"
-    if ! curl -sLO "$kubectl_url"; then
-        log_error "kubectl下载失败，请参考K8S官网文档手动下载https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/#install-kubectl-on-linux"
-        if [[ -n "${BACKUP_FILE}" ]] && [[ -f "${BACKUP_FILE}" ]]; then
-            mv "${BACKUP_FILE}" "${ORIG_KUBECTL_PATH}"
-            log_info "已回滚到备份版本: ${ORIG_KUBECTL_PATH}"
-        fi
+    local target_release
+    if ! target_release="$(select_kubectl_target_release "$server_git_version")"; then
+        log_error "已读取集群服务端版本 ${server_git_version}，但仓库尚未维护对应minor的kubectl物料；为避免客户端与服务端版本错配，本次阻断"
         exit 1
     fi
-    cp -f "kubectl-${K8S_VERSION}-${TARGET_ARCH}" /usr/local/bin/kubectl
-    chmod +x /usr/local/bin/kubectl
-    log_success "kubectl安装完成, 版本: $(kubectl version --client 2>/dev/null | head -1)"
+    [[ -z "$server_git_version" ]] && log_warning "无法读取Server Version，按默认策略选择 ${target_release}"
+
+    K8S_VERSION="${target_release#v}"
+    K8S_VERSION="${K8S_VERSION%.*}"
+    K8S_MAJOR_VERSION="${K8S_VERSION%%.*}"
+    K8S_MINOR_VERSION="${K8S_VERSION##*.}"
+    installed_major="${installed_full#v}"
+    installed_major="${installed_major%%.*}"
+    installed_minor="${installed_full#v*.}"
+    installed_minor="${installed_minor%%.*}"
+
+    log_info "Server Version: ${server_git_version:-不可读}"
+    log_info "目标kubectl: ${target_release} (Major=${K8S_MAJOR_VERSION}, Minor=${K8S_MINOR_VERSION})"
+    if [[ "$installed_major" == "$K8S_MAJOR_VERSION" && "$installed_minor" == "$K8S_MINOR_VERSION" ]]; then
+        log_success "kubectl版本($installed_major.$installed_minor)已匹配Server minor(${K8S_VERSION})，无需重新安装"
+        return 0
+    fi
+
+    local kubectl_url="${KUBECTL_OSS_RELEASE_BASE}/${target_release}/bin/linux/${TARGET_ARCH}/kubectl"
+    local checksum_url="${kubectl_url}.sha256"
+    log_info "架构: $ARCH -> ${TARGET_ARCH}, 下载地址: $kubectl_url"
+
+    local download_dir
+    download_dir="$(mktemp -d /tmp/kubectl-install.XXXXXX)" || exit 1
+    if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 -o "${download_dir}/kubectl" "$kubectl_url"; then
+        log_error "kubectl下载失败，未改动当前kubectl；请检查OSS链接或参考K8S官方文档"
+        return 1
+    fi
+    if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 -o "${download_dir}/kubectl.sha256" "$checksum_url" ||
+       ! verify_kubectl_sha256 "$download_dir"; then
+        log_error "kubectl SHA256校验失败，未改动当前kubectl"
+        return 1
+    fi
+    chmod +x "${download_dir}/kubectl"
+
+    local downloaded_version
+    downloaded_version="$(${download_dir}/kubectl version --client -o json 2>/dev/null | grep -m1 -oE '"gitVersion"[[:space:]]*:[[:space:]]*"[^"]+"' | grep -oE 'v[0-9][^"]*' || true)"
+    if ! kubectl_downloaded_version_matches "$target_release" "$downloaded_version"; then
+        log_error "kubectl二进制版本回读不符：期望 ${target_release}，实际 ${downloaded_version:-无法解析}；未改动当前kubectl"
+        return 1
+    fi
+
+    local backup_file=""
+    if [[ -f /usr/local/bin/kubectl ]]; then
+        backup_file="/usr/local/bin/kubectl_bak_$(date +%Y%m%d_%H%M%S)"
+        cp -p /usr/local/bin/kubectl "$backup_file"
+        log_info "已备份原 /usr/local/bin/kubectl 至: ${backup_file}"
+    fi
+    install -m 0755 "${download_dir}/kubectl" /usr/local/bin/kubectl
+    hash -r
+    log_success "kubectl安装完成, 版本: $(kubectl version --client -o json 2>/dev/null | grep -m1 -oE '"gitVersion"[[:space:]]*:[[:space:]]*"[^"]+"' | grep -oE 'v[0-9][^"]*')"
 }
 
 test_k8s_connection() {
@@ -3244,7 +3320,11 @@ serverless_ensure_storageclass() {
         ;;
     te-nfs)
         if ensure_nfs_storageclass "$cloud_platform" "Serverless/"; then
-            serverless_record_result "Serverless/StorageClass就绪检查(te-nfs)" "PASS" "te-nfs已按${cloud_platform}平台策略就绪"
+            case "$HUAWEI_TE_NFS_OUTCOME" in
+            reused) serverless_record_result "Serverless/StorageClass就绪检查(te-nfs)" "WARN" "沿用非推荐te-nfs，继续端到端验证" ;;
+            fallback) serverless_record_result "Serverless/StorageClass就绪检查(te-nfs)" "WARN" "推荐SC初始化未完成但同名te-nfs仍存在，继续端到端验证" ;;
+            *) serverless_record_result "Serverless/StorageClass就绪检查(te-nfs)" "PASS" "te-nfs已按${cloud_platform}平台策略就绪" ;;
+            esac
             return 0
         fi
         return 1
@@ -3950,52 +4030,67 @@ get_huawei_cce_vpc_id() {
     return 1
 }
 
-HUAWEI_TE_NFS_REPLACE_CONFIRM_TIMEOUT=30
+HUAWEI_TE_NFS_ACTION_TIMEOUT="${HUAWEI_TE_NFS_ACTION_TIMEOUT:-300}"
 HUAWEI_TE_NFS_REFERENCES=""
+HUAWEI_TE_NFS_ACTION=""
+HUAWEI_TE_NFS_OUTCOME=""
 
 huawei_te_nfs_list_references() {
     HUAWEI_TE_NFS_REFERENCES=$(kubectl get pv -o jsonpath='{range .items[?(@.spec.storageClassName=="te-nfs")]}{.metadata.name}{"|"}{.spec.claimRef.namespace}{"/"}{.spec.claimRef.name}{"|"}{.status.phase}{"\n"}{end}' 2>/dev/null)
     [[ -n "$HUAWEI_TE_NFS_REFERENCES" ]]
 }
 
-read_huawei_te_nfs_replacement_confirmation() {
-    local answer=""
-    if [[ ! -t 0 ]]; then
-        log_warning "当前为非交互式运行，无法确认替换 te-nfs，保留旧StorageClass"
-        return 1
+select_huawei_te_nfs_action() {
+    local answer="" input_path="${HUAWEI_TE_NFS_ACTION_INPUT_PATH:-/dev/tty}"
+    local output_path="${HUAWEI_TE_NFS_ACTION_OUTPUT_PATH:-/dev/tty}"
+    HUAWEI_TE_NFS_ACTION="reuse"
+    if [[ "$input_path" == /dev/tty && ! -t 0 ]]; then
+        log_warning "当前为非TTY执行，按安全策略沿用现有te-nfs，并继续端到端可用性验证"
+        return 0
     fi
-    printf '\n%s\n' "================ 华为CCE te-nfs 安全替换确认 ================"
-    printf '%s\n' "检测到现有 te-nfs 不符合 CCE 文件存储规范，但已有业务PV/PVC引用。"
-    printf '%s\n' "将执行：仅删除 StorageClass/te-nfs，再创建同名标准 CCE te-nfs。"
-    printf '%s\n' "绝不执行：删除、修改或重建任何 PV、PVC、Pod。"
-    printf '%s\n' "如未确认，请直接回车或输入任意非 yes 内容，30 秒后也会安全取消。"
-    printf '%s' "请输入完整 yes 以继续替换: "
-    if ! read -r -t "$HUAWEI_TE_NFS_REPLACE_CONFIRM_TIMEOUT" answer; then
-        log_warning "等待 te-nfs 替换确认超时，保留旧StorageClass"
-        return 1
+    {
+        printf '\n%s\n' "================ 华为CCE te-nfs 处理方式选择 ================"
+        printf '%s\n' "请选择华为CCE te-nfs处理方式："
+        printf '%s\n' "  1. 沿用当前te-nfs，并继续端到端可用性验证"
+        printf '%s\n' "  2. 重新初始化为华为CCE推荐te-nfs"
+        printf '请输入选项[1-2]（%s秒后默认沿用当前SC）: ' "$HUAWEI_TE_NFS_ACTION_TIMEOUT"
+    } >"$output_path" 2>/dev/null || true
+    if ! read -r -t "$HUAWEI_TE_NFS_ACTION_TIMEOUT" answer <"$input_path"; then
+        log_warning "等待te-nfs处理方式选择超时，沿用现有te-nfs并继续端到端验证"
+        return 0
     fi
-    [[ "$answer" == yes ]] || {
-        log_info "未收到完整 yes，保留旧StorageClass"
-        return 1
-    }
+    case "$answer" in
+    2) HUAWEI_TE_NFS_ACTION="rebuild" ;;
+    1 | "") HUAWEI_TE_NFS_ACTION="reuse" ;;
+    *)
+        log_warning "输入选项无效，按安全策略沿用现有te-nfs并继续端到端验证"
+        HUAWEI_TE_NFS_ACTION="reuse"
+        ;;
+    esac
     return 0
 }
 
-huawei_te_nfs_replace_after_confirmation() {
-    local backup provisioner configured_vpc
-    if ! read_huawei_te_nfs_replacement_confirmation; then
-        return 1
-    fi
-
+huawei_te_nfs_rebuild() {
+    local backup restore_manifest provisioner configured_vpc
     _ensure_artifact_dir
-    backup="${ARTIFACT_DIR}/huawei_te_nfs_before_replacement.yaml"
-    if ! kubectl get sc te-nfs -o yaml >"$backup"; then
-        log_error "无法备份旧 te-nfs，取消替换"
-        return 1
+    backup="${ARTIFACT_DIR}/huawei_te_nfs_before_replacement.json"
+    restore_manifest="${ARTIFACT_DIR}/huawei_te_nfs_restore.json"
+    if ! kubectl get sc te-nfs -o json >"$backup"; then
+        log_error "无法备份旧te-nfs，取消重新初始化；保留并沿用现有SC进入端到端验证"
+        return 2
+    fi
+    if ! jq -e '
+        select(.kind == "StorageClass" and .metadata.name == "te-nfs")
+        | del(.metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp,
+            .metadata.generation, .metadata.selfLink, .metadata.managedFields,
+            .metadata.annotations."kubectl.kubernetes.io/last-applied-configuration", .status)
+    ' "$backup" >"$restore_manifest"; then
+        log_error "无法生成可恢复的te-nfs备份，取消重新初始化；保留并沿用现有SC进入端到端验证"
+        return 2
     fi
     if ! kubectl delete sc te-nfs; then
-        log_error "删除旧 te-nfs 失败；未修改PV/PVC/Pod，旧SC备份保留在 ${backup}"
-        return 1
+        log_error "删除旧te-nfs失败；现有SC仍保留，将继续端到端验证。备份: ${restore_manifest}"
+        return 2
     fi
     if ! cat <<EOF_HUAWEI_NFS | kubectl apply -f -; then
 allowVolumeExpansion: true
@@ -4014,16 +4109,20 @@ provisioner: everest-csi-provisioner
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
 EOF_HUAWEI_NFS
+        log_error "创建推荐te-nfs失败，立即尝试恢复原StorageClass"
+        if kubectl apply -f "$restore_manifest" && kubectl get sc te-nfs &>/dev/null; then
+            log_error "推荐te-nfs创建失败，但已恢复原te-nfs；将沿用恢复后的SC继续端到端验证"
+            return 2
+        fi
         capture_huawei_csi_nas_diagnostics error
-        log_error "创建标准 te-nfs 失败；未修改PV/PVC/Pod。请使用 ${backup} 手动恢复旧StorageClass"
+        log_error "创建推荐te-nfs失败且原SC恢复失败；当前无可信te-nfs，停止文件存储验证。恢复物料: ${restore_manifest}"
         return 1
     fi
     provisioner=$(kubectl get sc te-nfs -o jsonpath='{.provisioner}' 2>/dev/null)
     configured_vpc=$(kubectl get sc te-nfs -o jsonpath='{.parameters.everest\.io/share-access-to}' 2>/dev/null)
     if [[ "$provisioner" != everest-csi-provisioner || "$configured_vpc" != "$HUAWEI_CCE_VPC_ID_RESOLVED" ]]; then
-        capture_huawei_csi_nas_diagnostics error
-        log_error "重建后的 te-nfs 校验失败(provisioner=${provisioner:-空}, VPC=${configured_vpc:-空})；未修改PV/PVC/Pod。请使用 ${backup} 手动恢复旧StorageClass"
-        return 1
+        log_error "重新初始化后的te-nfs仍不符合推荐模板(provisioner=${provisioner:-空}, VPC=${configured_vpc:-空})；同名SC仍存在，将交由端到端验证裁决"
+        return 2
     fi
     log_success "已按确认替换为标准 CCE te-nfs；本次仅删除并创建StorageClass，未触碰PV/PVC/Pod"
     return 0
@@ -4353,20 +4452,7 @@ ack_te_nfs_audit_and_repair() {
 ensure_nfs_storageclass() {
     local cloud_platform="$1" result_prefix="${2:-}"
     log_step "网络存储StorageClass就绪检查(te-nfs)"
-
-    if [[ "$cloud_platform" == *huawei* ]]; then
-        if ! get_huawei_cce_vpc_id; then
-            capture_huawei_csi_nas_diagnostics
-            log_error "华为CCE文件存储前置检查失败: ${HUAWEI_CCE_VPC_ID_ERROR}"
-            log_error "请修复csi-nas后重试；若云管理员已确认集群VPC ID，可使用: HUAWEI_CCE_VPC_ID='<vpc-uuid>' bash k8sAvailCheck.sh"
-            record_storageclass_result "$result_prefix" "网络存储SC就绪检查(te-nfs)" "FAIL" "无法取得可信VPC ID，未创建或使用te-nfs；详见csi-nas诊断物料"
-            return 1
-        fi
-        if [[ "$HUAWEI_CCE_VPC_ID_SOURCE" == "manual" ]]; then
-            capture_huawei_csi_nas_diagnostics warning
-            log_warning "未能从csi-nas自动读取VPC ID，已使用云管理员提供的HUAWEI_CCE_VPC_ID继续检查"
-        fi
-    fi
+    HUAWEI_TE_NFS_OUTCOME=""
 
     if kubectl get sc te-nfs &>/dev/null; then
         if [[ "$cloud_platform" == *alibaba* || "$cloud_platform" == *ali* ]]; then
@@ -4376,31 +4462,75 @@ ensure_nfs_storageclass() {
             fi
         fi
         if [[ "$cloud_platform" == *huawei* ]]; then
-            local configured_vpc configured_provisioner mismatch_reason
+            local configured_vpc configured_provisioner mismatch_reason rebuild_rc
             configured_vpc=$(kubectl get sc te-nfs -o jsonpath='{.parameters.everest\.io/share-access-to}' 2>/dev/null)
             configured_provisioner=$(kubectl get sc te-nfs -o jsonpath='{.provisioner}' 2>/dev/null)
             mismatch_reason=""
             [[ "$configured_provisioner" == everest-csi-provisioner ]] || mismatch_reason="provisioner=${configured_provisioner:-空}，预期everest-csi-provisioner"
-            if [[ "$configured_vpc" != "$HUAWEI_CCE_VPC_ID_RESOLVED" ]]; then
+            if get_huawei_cce_vpc_id && [[ "$configured_vpc" != "$HUAWEI_CCE_VPC_ID_RESOLVED" ]]; then
                 mismatch_reason="${mismatch_reason:+${mismatch_reason}; }share-access-to=${configured_vpc:-空}，预期${HUAWEI_CCE_VPC_ID_RESOLVED}"
+            elif [[ "$configured_provisioner" == everest-csi-provisioner && -z "$HUAWEI_CCE_VPC_ID_RESOLVED" ]]; then
+                mismatch_reason="${mismatch_reason:+${mismatch_reason}; }无法取得可信VPC ID以校验share-access-to"
             fi
             if [[ -n "$mismatch_reason" ]]; then
                 huawei_te_nfs_list_references || true
-                log_error "te-nfs 不符合华为CCE文件存储规范(${mismatch_reason})"
+                log_warning "te-nfs 不符合华为CCE推荐文件存储模板(${mismatch_reason})"
                 if [[ -n "$HUAWEI_TE_NFS_REFERENCES" ]]; then
                     log_warning "te-nfs 当前PV引用(PV|PVC|状态): ${HUAWEI_TE_NFS_REFERENCES}"
                 fi
-                log_warning "管理员确认后可仅删除旧StorageClass/te-nfs并创建同名标准SC；不会删除、修改或重建PV/PVC/Pod"
-                if huawei_te_nfs_replace_after_confirmation; then
+                log_warning "配置差异只作为风险披露；是否可用将由PVC动态供给、Pod挂载和读写验证裁决"
+                select_huawei_te_nfs_action
+                if [[ "$HUAWEI_TE_NFS_ACTION" != rebuild ]]; then
+                    HUAWEI_TE_NFS_OUTCOME="reused"
+                    log_warning "已沿用现有te-nfs；不会修改SC/PV/PVC/Pod，继续端到端可用性验证"
                     return 0
                 fi
-                record_storageclass_result "$result_prefix" "网络存储SC就绪检查(te-nfs)" "FAIL" "te-nfs 不符合CCE文件存储规范；未获完整yes确认或替换失败，已保留PV/PVC/Pod"
-                return 1
+                if [[ -z "$HUAWEI_CCE_VPC_ID_RESOLVED" ]] && ! get_huawei_cce_vpc_id; then
+                    capture_huawei_csi_nas_diagnostics warning
+                    HUAWEI_TE_NFS_OUTCOME="reused"
+                    log_error "无法取得可信VPC ID，不能重新初始化推荐SC；保留现有te-nfs并继续端到端验证"
+                    return 0
+                fi
+                if [[ "$HUAWEI_CCE_VPC_ID_SOURCE" == manual ]]; then
+                    capture_huawei_csi_nas_diagnostics warning
+                    log_warning "已使用云管理员提供的HUAWEI_CCE_VPC_ID重新初始化te-nfs"
+                fi
+                rebuild_rc=0
+                huawei_te_nfs_rebuild || rebuild_rc=$?
+                case "$rebuild_rc" in
+                0)
+                    HUAWEI_TE_NFS_OUTCOME="rebuilt"
+                    return 0
+                    ;;
+                2)
+                    HUAWEI_TE_NFS_OUTCOME="fallback"
+                    return 0
+                    ;;
+                *)
+                    record_storageclass_result "$result_prefix" "网络存储SC就绪检查(te-nfs)" "FAIL" "推荐SC重新初始化及原SC恢复均失败，当前无可用同名te-nfs"
+                    return 1
+                    ;;
+                esac
             fi
+            HUAWEI_TE_NFS_OUTCOME="recommended"
             log_success "te-nfs VPC授权校验通过(csi-nas)"
         fi
         log_success "已存在网络存储StorageClass: te-nfs，无需创建"
         return 0
+    fi
+
+    if [[ "$cloud_platform" == *huawei* ]]; then
+        if ! get_huawei_cce_vpc_id; then
+            capture_huawei_csi_nas_diagnostics
+            log_error "华为CCE文件存储前置检查失败: ${HUAWEI_CCE_VPC_ID_ERROR}"
+            log_error "当前不存在te-nfs，无法沿用；请修复csi-nas后重试，或由云管理员提供 HUAWEI_CCE_VPC_ID"
+            record_storageclass_result "$result_prefix" "网络存储SC就绪检查(te-nfs)" "FAIL" "未发现te-nfs且无法取得可信VPC ID，无法创建推荐SC"
+            return 1
+        fi
+        if [[ "$HUAWEI_CCE_VPC_ID_SOURCE" == manual ]]; then
+            capture_huawei_csi_nas_diagnostics warning
+            log_warning "未能从csi-nas自动读取VPC ID，已使用云管理员提供的HUAWEI_CCE_VPC_ID创建te-nfs"
+        fi
     fi
 
     if [[ "$cloud_platform" == *aws* ]]; then
@@ -5279,7 +5409,7 @@ _aws_confirm_full_yes() {
 }
 
 _download_and_run_aws_tool() {
-    local script_name="$1" script_path script_url rc
+    local script_name="$1" expected_sha256="${2:-}" script_path script_url rc actual_sha256
     case "$script_name" in
     auto_build_nodepool.sh | storage_ready_for_existing_eks.sh) ;;
     *)
@@ -5302,6 +5432,20 @@ _download_and_run_aws_tool() {
         log_error "${script_name} 下载内容为空，拒绝执行: ${script_url}"
         return 1
     fi
+    if [[ -n "$expected_sha256" ]]; then
+        if ! command -v sha256sum >/dev/null 2>&1; then
+            log_error "缺少sha256sum，无法校验高权限AWS工具完整性，拒绝执行: ${script_name}"
+            return 1
+        fi
+        actual_sha256="$(sha256sum "$script_path" 2>/dev/null | awk '{print $1}')"
+        if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+            log_error "${script_name} SHA256校验失败，拒绝执行"
+            log_error "期望: ${expected_sha256}"
+            log_error "实际: ${actual_sha256:-读取失败}"
+            return 1
+        fi
+        log_success "${script_name} SHA256校验通过"
+    fi
     if ! bash -n "$script_path"; then
         log_error "${script_name} Bash语法检查失败，拒绝执行: ${script_path}"
         return 1
@@ -5309,6 +5453,10 @@ _download_and_run_aws_tool() {
     log_info "${script_name} 已下载并通过Bash语法检查，开始执行"
     bash "$script_path"
     rc=$?
+    if [[ "$script_name" == "auto_build_nodepool.sh" && $rc -eq $AWS_NODEPOOL_CANCELLED_RC ]]; then
+        log_warning "管理员已在auto_build_nodepool.sh中取消目标EKS操作；未执行节点组创建，返回AWS EKS操作类型选择"
+        return "$AWS_NODEPOOL_CANCELLED_RC"
+    fi
     if [[ $rc -ne 0 ]]; then
         log_error "${script_name} 执行失败(退出码:${rc})；请检查上述输出，或手动执行: bash ${script_path}"
         return "$rc"
@@ -5317,8 +5465,143 @@ _download_and_run_aws_tool() {
     return 0
 }
 
+_aws_read_nodepool_action() {
+    local answer=""
+    printf "%b" "${YELLOW}${BOLD}请选择本次AWS EKS环境操作类型：\n  1. 新建或补充NodePool\n  2. 检查现有NodePool及EKS可用性\n请输入选项[1-2]（${AWS_SPECIAL_ACTION_TIMEOUT}秒后按安全策略处理）: ${NC}" >/dev/tty
+    read -r -t "$AWS_SPECIAL_ACTION_TIMEOUT" answer </dev/tty || return 1
+    printf '%s\n' "$answer"
+}
+
+_aws_select_nodepool_action() {
+    local nodepool_count="$1" attempt answer
+    AWS_NODEPOOL_ACTION=""
+    if ! _aws_interactive_tty_available; then
+        if [[ "$nodepool_count" -gt 0 ]]; then
+            AWS_NODEPOOL_ACTION="check"
+            log_info "当前为非交互式运行且已存在NodePool，默认检查现有Karpenter NodePool可用性"
+            return 0
+        fi
+        log_error "当前为非交互式运行且NodePool数量为0；未获得高权限创建授权，本轮停止"
+        return 1
+    fi
+    for ((attempt = 1; attempt <= AWS_NODEPOOL_ACTION_MAX_ATTEMPTS; attempt++)); do
+        answer="$(_aws_read_nodepool_action)" || answer=""
+        case "$answer" in
+        1)
+            AWS_NODEPOOL_ACTION="create"
+            return 0
+            ;;
+        2)
+            AWS_NODEPOOL_ACTION="check"
+            return 0
+            ;;
+        "")
+            if [[ "$nodepool_count" -gt 0 ]]; then
+                AWS_NODEPOOL_ACTION="check"
+                log_info "交互输入超时，已存在NodePool，默认进入现有NodePool可用性检查"
+                return 0
+            fi
+            log_error "交互输入超时且NodePool数量为0；未创建资源，本轮停止"
+            return 1
+            ;;
+        *) log_warning "无效选项，仅接受1或2（剩余 $((AWS_NODEPOOL_ACTION_MAX_ATTEMPTS - attempt)) 次）" ;;
+        esac
+    done
+    if [[ "$nodepool_count" -gt 0 ]]; then
+        AWS_NODEPOOL_ACTION="check"
+        log_info "连续${AWS_NODEPOOL_ACTION_MAX_ATTEMPTS}次输入无效，已存在NodePool，默认进入可用性检查"
+        return 0
+    fi
+    log_error "连续${AWS_NODEPOOL_ACTION_MAX_ATTEMPTS}次输入无效且NodePool数量为0；未创建资源，本轮停止"
+    return 1
+}
+
+_aws_nodepool_inventory_json() {
+    local output
+    output="$(kubectl get nodepools.karpenter.sh -o json 2>&1)" || {
+        log_error "NodePool资源查询失败，不能误判为零对象: ${output}"
+        return 1
+    }
+    jq -e '.items | type == "array"' >/dev/null 2>&1 <<<"$output" || {
+        log_error "NodePool查询结果不是合法items数组，拒绝继续"
+        return 1
+    }
+    printf '%s\n' "$output"
+}
+
+_aws_kube_identity() {
+    local context server
+    context="$(kubectl config current-context 2>/dev/null)" || return 1
+    server="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)" || return 1
+    [[ -n "$context" && -n "$server" ]] || return 1
+    printf '%s|%s\n' "$context" "$server"
+}
+
+_aws_print_nodepool_inventory() {
+    local inventory="$1" name ready nodeclass nodeclass_ready
+    if [[ "$(jq '.items | length' <<<"$inventory")" -eq 0 ]]; then
+        log_warning "当前未发现Karpenter NodePool业务节点池资源"
+        return 0
+    fi
+    log_info "当前Karpenter NodePool资源："
+    while IFS=$'\t' read -r name ready nodeclass; do
+        [[ -n "$name" ]] || continue
+        if [[ -z "$nodeclass" ]]; then
+            nodeclass_ready="Missing"
+        else
+            nodeclass_ready="$(kubectl get ec2nodeclasses.karpenter.k8s.aws "$nodeclass" -o json 2>/dev/null | jq -r '[.status.conditions[]? | select(.type=="Ready")][-1].status // "Unknown"' 2>/dev/null || echo Missing)"
+        fi
+        log_info "  NodePool ${name}  Ready=${ready:-Unknown}  EC2NodeClass=${nodeclass:-<unset>}  Ready=${nodeclass_ready:-Unknown}"
+    done < <(jq -r '.items[] | [.metadata.name, ([.status.conditions[]? | select(.type=="Ready")][-1].status // "Unknown"), (.spec.template.spec.nodeClassRef.name // "")] | @tsv' <<<"$inventory")
+}
+
+_aws_wait_nodepool_resources_ready() {
+    local before_names="${1:-}" t=0 inventory count pending name ready nodeclass nodeclass_ready target_names current_names new_names candidate
+    while [[ $t -lt $AWS_NODEPOOL_READY_TIMEOUT ]]; do
+        inventory="$(_aws_nodepool_inventory_json)" || return 1
+        count="$(jq '.items | length' <<<"$inventory")"
+        pending=""
+        if [[ "$count" -gt 0 ]]; then
+            current_names="$(jq -r '.items[].metadata.name' <<<"$inventory" | sort -u)"
+            new_names=""
+            while IFS= read -r candidate; do
+                [[ -n "$candidate" ]] || continue
+                grep -Fxq "$candidate" <<<"$before_names" || new_names="${new_names}${new_names:+$'\n'}${candidate}"
+            done <<<"$current_names"
+            if [[ -z "$new_names" ]]; then
+                log_warning "auto_build_nodepool.sh执行完成，但本轮未发现新增NodePool；不将存量Ready资源记为创建成功"
+                _aws_print_nodepool_inventory "$inventory"
+                return 2
+            fi
+            target_names="$new_names"
+            while IFS=$'\t' read -r name ready nodeclass; do
+                [[ -n "$name" ]] || continue
+                grep -Fxq "$name" <<<"$target_names" || continue
+                if [[ "$ready" != "True" || -z "$nodeclass" ]]; then
+                    pending="${pending}${name}(NodePool=${ready:-Unknown},EC2NodeClass=${nodeclass:-unset}) "
+                    continue
+                fi
+                nodeclass_ready="$(kubectl get ec2nodeclasses.karpenter.k8s.aws "$nodeclass" -o json 2>/dev/null | jq -r '[.status.conditions[]? | select(.type=="Ready")][-1].status // "Unknown"' 2>/dev/null || echo Missing)"
+                [[ "$nodeclass_ready" == "True" ]] || pending="${pending}${name}(EC2NodeClass ${nodeclass}=${nodeclass_ready:-Unknown}) "
+            done < <(jq -r '.items[] | [.metadata.name, ([.status.conditions[]? | select(.type=="Ready")][-1].status // "Unknown"), (.spec.template.spec.nodeClassRef.name // "")] | @tsv' <<<"$inventory")
+            if [[ -z "$pending" ]]; then
+                log_success "本轮新增的Karpenter NodePool与EC2NodeClass回读全部Ready；继续本轮标准检查"
+                _aws_print_nodepool_inventory "$inventory"
+                return 0
+            fi
+        else
+            pending="仍无NodePool资源"
+        fi
+        log_info "等待Karpenter资源Ready（${t}/${AWS_NODEPOOL_READY_TIMEOUT}s）: ${pending}"
+        sleep 6
+        ((t += 6))
+    done
+    log_error "Karpenter NodePool/EC2NodeClass未在${AWS_NODEPOOL_READY_TIMEOUT}秒内全部Ready，本轮停止"
+    return 1
+}
+
 check_aws_nodepool_gate() {
-    local crd_output nodepools_output
+    local crd_output inventory nodepool_count before_names kube_identity_before kube_identity_after tool_rc ready_rc
 
     if ! crd_output=$(kubectl get crd nodepools.karpenter.sh -o name 2>&1); then
         if [[ "$crd_output" == *"NotFound"* || "$crd_output" == *"not found"* ]]; then
@@ -5331,32 +5614,65 @@ check_aws_nodepool_gate() {
         return 1
     fi
 
-    if ! nodepools_output=$(kubectl get nodepools.karpenter.sh -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>&1); then
-        log_error "NodePool资源查询失败，不能误判为零对象: ${nodepools_output}"
-        record_result "AWS EKS NodePool前置检查" "FAIL" "NodePool查询失败，请检查RBAC get nodepools权限"
-        return 1
-    fi
-    if [[ -n "$nodepools_output" ]]; then
-        log_success "检测到Karpenter NodePool资源: $(echo "$nodepools_output" | tr '\n' ' ')"
-        record_result "AWS EKS NodePool前置检查" "PASS" "已存在NodePool，继续标准可用性检查"
-        return 0
-    fi
+    while true; do
+        if ! inventory="$(_aws_nodepool_inventory_json)"; then
+            record_result "AWS EKS NodePool前置检查" "FAIL" "NodePool查询失败，请检查RBAC get nodepools权限"
+            return 1
+        fi
+        nodepool_count="$(jq '.items | length' <<<"$inventory")"
+        before_names="$(jq -r '.items[].metadata.name' <<<"$inventory" | sort -u)"
+        _aws_print_nodepool_inventory "$inventory"
+        if ! _aws_select_nodepool_action "$nodepool_count"; then
+            record_result "AWS EKS NodePool操作入口" "FAIL" "未获得创建授权且当前无可检查NodePool；本轮停止"
+            return 1
+        fi
 
-    log_error "未检测到标准的EKS节点组(NodePool资源对象为空)"
-    if ! _aws_interactive_tty_available; then
-        log_warning "当前为非交互式运行，未获得高权限节点组创建授权"
-    fi
-    if ! _aws_confirm_short_yes "是否下载执行 auto_build_nodepool.sh 创建节点组？输入 Y/y 确认（${AWS_SPECIAL_ACTION_TIMEOUT}秒后取消）: "; then
-        record_result "AWS EKS NodePool前置检查" "FAIL" "NodePool为空且未授权执行auto_build_nodepool.sh；本轮停止"
-        log_info "人工执行入口: wget -O /tmp/thinkingai/auto_build_nodepool.sh ${AWS_TOOL_BASE_URL}/auto_build_nodepool.sh && bash /tmp/thinkingai/auto_build_nodepool.sh"
-        return 1
-    fi
-    if _download_and_run_aws_tool "auto_build_nodepool.sh"; then
-        record_result "AWS EKS NodePool创建入口" "PASS" "auto_build_nodepool.sh执行完成；需重新运行可用性检查"
-        return 10
-    fi
-    record_result "AWS EKS NodePool创建入口" "FAIL" "auto_build_nodepool.sh执行失败；本轮停止"
-    return 1
+        if [[ "$AWS_NODEPOOL_ACTION" == "check" ]]; then
+            record_result "AWS EKS节点组操作模式" "PASS" "检查现有Karpenter NodePool可用性"
+            if [[ "$nodepool_count" -eq 0 ]]; then
+                log_warning "当前无Karpenter NodePool；管理员已明确选择继续，规划内节点池调度项预计失败，但仍收集完整诊断"
+            fi
+            return 0
+        fi
+
+        kube_identity_before="$(_aws_kube_identity)" || {
+            log_error "无法冻结创建前Kubernetes context/API Server身份，拒绝执行高权限节点组创建"
+            return 1
+        }
+        tool_rc=0
+        _download_and_run_aws_tool "auto_build_nodepool.sh" "$AWS_AUTO_BUILD_NODEPOOL_SHA256" || tool_rc=$?
+        if [[ $tool_rc -eq $AWS_NODEPOOL_CANCELLED_RC ]]; then
+            log_info "节点组创建已取消，请重新选择本次AWS EKS环境操作类型"
+            continue
+        fi
+        if [[ $tool_rc -ne 0 ]]; then
+            record_result "AWS EKS NodePool创建入口" "FAIL" "auto_build_nodepool.sh下载、完整性校验或执行失败"
+            return 1
+        fi
+        record_result "AWS EKS节点组操作模式" "PASS" "新建或补充Karpenter NodePool"
+        kube_identity_after="$(_aws_kube_identity)" || {
+            log_error "无法读取创建后Kubernetes context/API Server身份，本轮停止"
+            return 1
+        }
+        if [[ "$kube_identity_after" != "$kube_identity_before" ]]; then
+            log_error "节点组创建前后Kubernetes目标发生漂移，拒绝继续标准检查"
+            log_error "创建前: ${kube_identity_before}"
+            log_error "创建后: ${kube_identity_after}"
+            return 1
+        fi
+        ready_rc=0
+        _aws_wait_nodepool_resources_ready "$before_names" || ready_rc=$?
+        if [[ $ready_rc -eq 2 ]]; then
+            record_result "AWS EKS NodePool创建后验收" "WARN" "创建脚本成功返回，但本轮未发现新增NodePool；按现有NodePool继续标准检查"
+            return 0
+        fi
+        if [[ $ready_rc -ne 0 ]]; then
+            record_result "AWS EKS NodePool创建后验收" "FAIL" "本轮新增NodePool或EC2NodeClass未Ready"
+            return 1
+        fi
+        record_result "AWS EKS NodePool创建后验收" "PASS" "本轮新增NodePool与EC2NodeClass已Ready；继续标准检查"
+        return 0
+    done
 }
 
 check_aws_consolidation_policy() {
@@ -5627,6 +5943,19 @@ EOF_USAGE
         ;;
     esac
 
+    # AWS EKS 的操作类型会决定本轮是先创建/补充业务节点池，还是直接执行现有
+    # NodePool及EKS可用性检查。应在环境识别完成后立即确认，再发布后续计划；
+    # 这样计划和后续执行都建立在管理员已经选定的本轮目标之上。
+    # 显式Serverless兼容入口保持原有隔离，不进入AWS NodePool操作流程。
+    if [[ "$K8S_CHECK_SCOPE" == "auto" && "$cloud_platform" == *aws* ]]; then
+        if ! check_aws_nodepool_gate; then
+            print_summary
+            log_error "AWS EKS NodePool操作入口未通过，本轮停止"
+            SCRIPT_COMPLETED=true
+            return 1
+        fi
+    fi
+
     if [[ "$K8S_CHECK_SCOPE" == "serverless" && "$SERVERLESS_MODE" == "Standard" ]]; then
         print_serverless_skip_plan
     elif [[ "$K8S_CHECK_SCOPE" == "serverless" ]]; then
@@ -5655,21 +5984,6 @@ EOF_USAGE
         return 0
     elif [[ "$SERVERLESS_MODE" == "Hybrid" ]]; then
         run_serverless_checks_inline
-    fi
-
-    if [[ "$cloud_platform" == *aws* ]]; then
-        check_aws_nodepool_gate
-        local aws_gate_rc=$?
-        if [[ $aws_gate_rc -ne 0 ]]; then
-            print_summary
-            if [[ $aws_gate_rc -eq 10 ]]; then
-                log_info "EKS节点组创建流程已完成，请重新运行本脚本执行完整标准可用性检查"
-            else
-                log_error "AWS EKS NodePool前置检查未通过，本轮停止，避免继续执行无效探测"
-            fi
-            SCRIPT_COMPLETED=true
-            return 0
-        fi
     fi
 
     select_nodepool_business_plan "$cloud_platform"
@@ -5702,7 +6016,12 @@ EOF_USAGE
     # 须在 AWS 提前 return 之前调用, 以便 AWS 也能打印 te-nfs 模版。
     local nfs_ready=1
     if ensure_nfs_storageclass "$cloud_platform"; then
-        record_result "网络存储SC就绪检查(te-nfs)" "PASS" "网络存储StorageClass(te-nfs)已就绪"
+        case "$HUAWEI_TE_NFS_OUTCOME" in
+        reused) record_result "网络存储SC就绪检查(te-nfs)" "WARN" "沿用非推荐te-nfs；配置差异已披露，继续端到端验证" ;;
+        fallback) record_result "网络存储SC就绪检查(te-nfs)" "WARN" "推荐SC初始化未完成但同名te-nfs仍存在；继续端到端验证" ;;
+        rebuilt) record_result "网络存储SC就绪检查(te-nfs)" "PASS" "已重新初始化为华为CCE推荐te-nfs" ;;
+        *) record_result "网络存储SC就绪检查(te-nfs)" "PASS" "网络存储StorageClass(te-nfs)已就绪" ;;
+        esac
     else
         nfs_ready=0
         # FAIL 已由 ensure_nfs_storageclass 内部按平台登记, 此处不重复登记
@@ -5756,7 +6075,13 @@ EOF_USAGE
     if [[ $nfs_ready -eq 1 ]]; then
         local nfs_hint=""
         case $cloud_platform in
-        *huawei*) nfs_hint="华为CCE te-nfs 依赖 VPCEP(VPC 终端节点)配置，若失败请先确认 VPCEP 是否已正确配置" ;;
+        *huawei*)
+            if [[ "$HUAWEI_TE_NFS_OUTCOME" == reused || "$HUAWEI_TE_NFS_OUTCOME" == fallback ]]; then
+                nfs_hint="当前沿用非推荐te-nfs，请结合实际nfs-provisioner/NFS服务端排查动态供给、网络和挂载权限"
+            else
+                nfs_hint="华为CCE Everest te-nfs 依赖 VPCEP(VPC 终端节点)配置，若失败请先确认 VPCEP 是否已正确配置"
+            fi
+            ;;
         esac
         if verify_storage_e2e "te-nfs" "文件存储 te-nfs RWX基础" "te-csi-check-nfs" "ReadWriteMany" "$nfs_hint"; then
             record_result "端到端存储验证(文件存储 te-nfs, RWX基础)" "PASS" "RWX PVC动态供给、挂载与单Pod读写成功"
@@ -5802,7 +6127,7 @@ EOF_USAGE
 cleanup_on_exit() {
     if ! $SCRIPT_COMPLETED; then
         if [[ -n "${TARGET_NODE_SELECTOR_PROBE_POD:-}" ]]; then
-            target_node_selector_cleanup_probe "$TARGET_NODE_SELECTOR_PROBE_POD" || \
+            target_node_selector_cleanup_probe "$TARGET_NODE_SELECTOR_PROBE_POD" ||
                 log_error "异常退出时指定节点标签专项探测Pod未完成回收: ${NAMESPACE}/${TARGET_NODE_SELECTOR_PROBE_POD}"
         fi
         # Serverless异常退出同样按本轮run-id执行安全PV/PVC回收，避免误删并发检查或遗留计费卷。

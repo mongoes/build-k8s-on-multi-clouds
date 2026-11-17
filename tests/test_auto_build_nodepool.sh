@@ -99,8 +99,10 @@ main_order_log="$env_context_dir/main-order.log"
   resolve_target_eks_environment() { printf '%s\n' resolve-environment >>"$main_order_log"; }
   confirm_target_eks_environment() { printf '%s\n' confirm-environment >>"$main_order_log"; return 2; }
   check_eks_karpenter_status() { fail 'rejected environment must never reach operation execution'; }
-  main
-) || fail 'user environment rejection must be a clean cancellation'
+  main_rc=0
+  main || main_rc=$?
+  [[ $main_rc -eq 10 ]] || fail "user environment rejection must return dedicated cancellation rc=10, got rc=${main_rc}"
+) || fail 'user environment rejection must be a distinct clean cancellation'
 [[ "$(tr '\n' ' ' <"$main_order_log")" == 'check-user connection resolve-environment confirm-environment ' ]] || fail 'environment confirmation must precede every operation branch'
 
 run_create() {
@@ -270,6 +272,10 @@ grep -q 'cpu: 3200' "$tmp/zero"*/configs/nodepool-od-4c32g.yaml || fail 'busines
 
 # Multiple explicit business pools retain the same CPU limit.
 run_create zero 'od-4c32g spot-8c16g' '4c32g 8c16g' 'od spot' || fail 'multiple business NodePools must succeed'
+grep -q '^  weight: 10$' "$RUN_WORK/configs/nodepool-od-4c32g.yaml" || fail 'on-demand NodePool must render spec.weight=10'
+grep -q '^  weight: 100$' "$RUN_WORK/configs/nodepool-spot-8c16g.yaml" || fail 'spot NodePool must render the higher spec.weight=100'
+[[ "$(grep -c '^  weight:' "$RUN_WORK/configs/nodepool-od-4c32g.yaml")" -eq 1 ]] || fail 'on-demand NodePool must render exactly one top-level weight'
+[[ "$(grep -c '^  weight:' "$RUN_WORK/configs/nodepool-spot-8c16g.yaml")" -eq 1 ]] || fail 'spot NodePool must render exactly one top-level weight'
 for config in "$tmp/zero"*/configs/nodepool-*.yaml; do
   grep -q 'cpu: 3200' "$config" || fail "business template missing cpu 3200: $config"
 done
@@ -318,11 +324,70 @@ cluster_lookup_log="$tmp/cluster-lookup.log"
 grep -q 'nodepool-test-run: \${RUN_ID}' "$SCRIPT" || fail 'test deployment must carry a per-run label'
 grep -q 'local TEST_SELECTOR=' "$SCRIPT" || fail 'test pod lookup must use the per-run selector'
 grep -q 'status.conditions\[?(@.type=="Ready")\].status' "$SCRIPT" || fail 'test must require Pod Ready rather than Running'
-grep -q 'kubectl exec "\$POD_NAME"' "$SCRIPT" || fail 'pod-to-host check must be non-interactive'
+grep -q 'kubectl exec "\$pod_name"' "$SCRIPT" || fail 'pod-to-host check must be non-interactive'
 ! grep -q 'xargs kubectl patch deploy' "$SCRIPT" || fail 'cleanup must not bulk-patch nginx-test deployments'
 grep -q 'return 1' "$SCRIPT" || fail 'test failures must return nonzero'
 ! grep -q 'node.k8s.te/managed-by' "$SCRIPT" || fail 'NodePool template must not add ownership labels'
 ! grep -q 'node.k8s.te/config-hash' "$SCRIPT" || fail 'NodePool template must not add configuration hash labels'
+
+# Pod-to-executor validation must preserve the historical business-port path,
+# but a new executor without a service/listener must not block NodePool success.
+reverse_probe_work="$tmp/reverse-probe"
+mkdir -p "$reverse_probe_work"
+(
+  cd "$reverse_probe_work"
+  source "$source_copy"
+  REVERSE_PROBE_IP=172.31.222.25
+  curl() {
+    [[ "$*" == *'172.31.222.25:19039/metrics'* ]] || return 1
+    printf 'historical-metrics\n'
+  }
+  kubectl() {
+    [[ "$*" == *'exec pod-a -n debug -- curl'*'172.31.222.25:19039/metrics'* ]] || return 1
+  }
+  test_pod_to_executor pod-a debug
+) || fail 'a locally healthy historical business endpoint must remain the preferred reverse-probe target'
+
+(
+  cd "$reverse_probe_work"
+  source "$source_copy"
+  REVERSE_PROBE_IP=172.31.222.25
+  REVERSE_PROBE_ENABLE_TEMPORARY_HTTP=false
+  curl() { return 1; }
+  command() {
+    [[ "$1" == -v && "$2" == python3 ]] && return 1
+    builtin command "$@"
+  }
+  if test_pod_to_executor pod-a debug; then
+    fail 'no business endpoint and no listener capability must report SKIP, not PASS'
+  else
+    reverse_probe_rc=$?
+  fi
+  [[ "$reverse_probe_rc" -eq 2 ]] || fail 'no business endpoint and no listener capability must return SKIP status 2'
+) || fail 'unavailable reverse-probe capability must not be treated as a NodePool failure'
+
+# When no automation override is supplied, an interactive operator can opt into
+# the temporary listener fallback; an explicit false remains a non-interactive SKIP.
+(
+  cd "$reverse_probe_work"
+  source "$source_copy"
+  unset REVERSE_PROBE_ENABLE_TEMPORARY_HTTP
+  read_tty_input() { printf -v "$1" '%s' y; }
+  should_start_temporary_reverse_probe
+) || fail 'interactive y must enable the temporary reverse-probe fallback'
+(
+  cd "$reverse_probe_work"
+  source "$source_copy"
+  REVERSE_PROBE_ENABLE_TEMPORARY_HTTP=false
+  read_tty_input() { fail 'explicit false must not prompt'; }
+  if should_start_temporary_reverse_probe; then
+    fail 'explicit false must skip the temporary reverse-probe fallback'
+  fi
+)
+
+! grep -q 'grep ta1 /etc/hosts' "$SCRIPT" || fail 'reverse probe must not assume the executor is named ta1'
+! grep -q 'nc -z' "$SCRIPT" || fail 'reverse probe must not require nc'
+grep -q 'should_start_temporary_reverse_probe' "$SCRIPT" || fail 'temporary listener must require an explicit operator decision'
 
 # Runtime evidence is an audit-only side effect: successful reads are persisted, but collection failures never fail availability.
 evidence_work="$tmp/runtime-evidence"

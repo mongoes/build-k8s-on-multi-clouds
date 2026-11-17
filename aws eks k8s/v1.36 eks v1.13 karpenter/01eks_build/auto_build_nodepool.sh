@@ -13,6 +13,13 @@ NAMESPACE="debug"
 NGINX_IMAGE="nginx:1.20"
 #镜像地址2
 NGINX_IMAGE_CN="docker-ta.thinkingdata.cn/te/nginx:1.20"
+# Karpenter只在多个NodePool都兼容同一Pending Pod时比较weight；Spot优先，
+# 不可用或达到限制时允许回退到较低权重的On-Demand池。
+ON_DEMAND_NODEPOOL_WEIGHT=10
+SPOT_NODEPOOL_WEIGHT=100
+# 供父级就绪性检查脚本区分“管理员主动取消”和“执行失败”。该退出码只表示
+# 未执行任何节点组创建/测试/污点变更，不能被转换为成功。
+NODEPOOL_CANCELLED_RC=10
 
 # 颜色定义
 RED='\033[0;31m'
@@ -142,12 +149,12 @@ confirm_target_eks_environment() {
       return 1
     fi
     case "$confirmation" in
-      y|Y) return 0 ;;
-      n|N)
-        echo "已取消，未执行节点组创建、测试或污点操作。"
-        return 2
-        ;;
-      *) log_error "输入无效，只允许输入 y 或 n，请重新确认目标环境。" ;;
+    y | Y) return 0 ;;
+    n | N)
+      echo "已取消，未执行节点组创建、测试或污点操作。"
+      return 2
+      ;;
+    *) log_error "输入无效，只允许输入 y 或 n，请重新确认目标环境。" ;;
     esac
   done
 }
@@ -307,7 +314,7 @@ select_existing_nodepool_config() {
   fi
 
   echo "检测到存量节点池的关键配置与当前最佳规范存在差异："
-  for ((candidate_index=0; candidate_index<candidate_count; candidate_index++)); do
+  for ((candidate_index = 0; candidate_index < candidate_count; candidate_index++)); do
     selected_key="${candidate_keys[$candidate_index]}"
     IFS='|' read -r zone_json subnet_json security_group_json <<<"$selected_key"
     echo "历史配置 [$((candidate_index + 1))]（来源 NodePool: ${candidate_sources[$candidate_index]}）"
@@ -332,13 +339,13 @@ select_existing_nodepool_config() {
   while true; do
     if ! read_tty_input reuse_answer "是否复用历史配置？输入 y 复用历史配置，输入 n 采用当前最佳规范 <y/n>: "; then return 1; fi
     case "$reuse_answer" in
-      y|Y) break ;;
-      n|N)
-        echo "已选择当前最佳规范，将继续创建新的业务节点组。"
-        HISTORICAL_CONFIG_SELECTED=false
-        return 0
-        ;;
-      *) log_error "输入无效，只允许输入 y 或 n，请重新选择。" ;;
+    y | Y) break ;;
+    n | N)
+      echo "已选择当前最佳规范，将继续创建新的业务节点组。"
+      HISTORICAL_CONFIG_SELECTED=false
+      return 0
+      ;;
+    *) log_error "输入无效，只允许输入 y 或 n，请重新选择。" ;;
     esac
   done
 
@@ -431,8 +438,8 @@ build_nodepool_for_business() {
     ["8c32g"]="m8g.2xlarge m7i.2xlarge m7a.2xlarge m6i.2xlarge m6a.2xlarge"
     ["8c64g"]="r7i.2xlarge r6a.2xlarge r6i.2xlarge r7a.2xlarge"
     ["16c64g"]="m6a.4xlarge m6i.4xlarge m6in.4xlarge m7a.4xlarge m8g.4xlarge"
-    ["32c128g"]="m6a.8xlarge m6i.8xlarge m6in.8xlarge m7a.8xlarge m8g.8xlarge"
-    ["64c256g"]="m6a.16xlarge m6i.16xlarge m6in.16xlarge m7a.16xlarge m8g.16xlarge"
+    ["32c128g"]="m6a.8xlarge m6i.8xlarge m6in.8xlarge m7a.8xlarge m8g.8xlarge m9g.8xlarge"
+    ["64c256g"]="m6a.16xlarge m6i.16xlarge m6in.16xlarge m7a.16xlarge m8g.16xlarge m9g.16xlarge"
   )
 
   # 获取用户输入的节点组信息，可能需要多个节点组，且组内节点规格配置差异
@@ -501,7 +508,10 @@ build_nodepool_for_business() {
       $name_conflict || break
       log_error "NodePool 名称 ${NODEPOOL_NAME} 已存在或在本轮输入中重复；不会 apply，请重新输入该节点组名称。"
       if ! read_tty_input NODEPOOL_NAME "新的 NodePool 名称: "; then exit 1; fi
-      [[ -n "$NODEPOOL_NAME" ]] || { log_error "NodePool 名称不得为空。"; exit 1; }
+      [[ -n "$NODEPOOL_NAME" ]] || {
+        log_error "NodePool 名称不得为空。"
+        exit 1
+      }
     done
     NODEPOOL_NAMES[$i]="$NODEPOOL_NAME"
     SIZE="${NODEPOOL_SIZES[$i]}"
@@ -513,8 +523,10 @@ build_nodepool_for_business() {
     #数数域(节点组名前缀/node.k8s.te/billing-mode标签/spot污点值)用 od,Karpenter域用 on-demand,两者通过此处映射打通
     if [[ "$BILLING_MODE" == "od" ]]; then
       CAPACITY_TYPE="on-demand"
+      NODEPOOL_WEIGHT="$ON_DEMAND_NODEPOOL_WEIGHT"
     else
       CAPACITY_TYPE="spot"
+      NODEPOOL_WEIGHT="$SPOT_NODEPOOL_WEIGHT"
     fi
 
     # 根据付费类型决定是否添加污点
@@ -539,6 +551,7 @@ kind: NodePool
 metadata:
   name: ${NODEPOOL_NAME}
 spec:
+  weight: ${NODEPOOL_WEIGHT}
   template:
     metadata:
       labels:
@@ -1050,6 +1063,127 @@ collect_nodepool_runtime_evidence() {
   return 0
 }
 
+# 返回执行机用于接收 Pod 反向探测的私网 IPv4。可用 REVERSE_PROBE_IP 显式覆盖，
+# 自动发现仅使用本机默认路由的 source IP；绝不假设执行机名称为 ta1。
+resolve_reverse_probe_ip() {
+  local candidate="${REVERSE_PROBE_IP:-}"
+  if [[ -z "$candidate" ]]; then
+    candidate=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')
+  fi
+  if ! awk -F. 'NF == 4 && $1 >= 0 && $1 <= 255 && $2 >= 0 && $2 <= 255 && $3 >= 0 && $3 <= 255 && $4 >= 0 && $4 <= 255 && ($1 == 10 || ($1 == 172 && $2 >= 16 && $2 <= 31) || ($1 == 192 && $2 == 168)) { exit 0 } { exit 1 }' <<<"$candidate"; then
+    return 1
+  fi
+  printf '%s\n' "$candidate"
+}
+
+# 历史 ta 场景优先复用已有 metrics 服务；本机 HTTP 成功是使用该端口的前提。
+find_existing_reverse_probe_url() {
+  local target_ip="$1" candidate_port
+  for candidate_port in 19039 9100; do
+    if curl --noproxy '*' -fsS -m 2 "http://${target_ip}:${candidate_port}/metrics" >/dev/null 2>&1; then
+      REVERSE_PROBE_URL="http://${target_ip}:${candidate_port}/metrics"
+      REVERSE_PROBE_MODE="existing-business-port"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 自动化可用REVERSE_PROBE_ENABLE_TEMPORARY_HTTP=true/false显式控制；人工菜单
+# 未设置该变量时，历史业务端口失败后询问一次是否尝试临时监听。拒绝、超时或非TTY为SKIP。
+should_start_temporary_reverse_probe() {
+  local confirmation=""
+  if [[ -n "${REVERSE_PROBE_ENABLE_TEMPORARY_HTTP+x}" ]]; then
+    [[ "$REVERSE_PROBE_ENABLE_TEMPORARY_HTTP" == "true" ]]
+    return
+  fi
+  if ! read_tty_input confirmation "未发现执行机19039/9100业务端口。是否启动随机临时HTTP Probe进行Pod反向验证？不安装工具、不修改安全组；仅在已确认本轮端口放通时输入 y <y/n>: "; then
+    return 1
+  fi
+  [[ "$confirmation" == "y" || "$confirmation" == "Y" ]]
+}
+
+# 新执行机没有业务端口时，仅复用已存在的 python3 启动一次性临时 HTTP Probe。
+# 不安装软件、不自动修改安全组；未获同意、无法启动或本机自检失败由调用方标记为 SKIP。
+start_temporary_reverse_probe() {
+  local target_ip="$1" attempts=0 local_response
+  should_start_temporary_reverse_probe || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+
+  REVERSE_PROBE_PORT=$((20000 + RANDOM % 10000))
+  REVERSE_PROBE_TOKEN="nodepool-reverse-probe-${RANDOM}-$(date +%s)"
+  REVERSE_PROBE_LOG=$(mktemp "${TMPDIR:-/tmp}/nodepool-reverse-probe.XXXXXX") || return 1
+  python3 -c '
+import http.server
+import sys
+
+bind_ip, port, token = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/healthz":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(token.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, format, *args):
+        pass
+http.server.ThreadingHTTPServer((bind_ip, port), Handler).serve_forever()
+' "$target_ip" "$REVERSE_PROBE_PORT" "$REVERSE_PROBE_TOKEN" >"$REVERSE_PROBE_LOG" 2>&1 &
+  REVERSE_PROBE_PID=$!
+
+  while [[ $attempts -lt 5 ]]; do
+    local_response=$(curl --noproxy '*' -fsS -m 2 "http://${target_ip}:${REVERSE_PROBE_PORT}/healthz" 2>/dev/null) || true
+    [[ "$local_response" == "$REVERSE_PROBE_TOKEN" ]] && {
+      REVERSE_PROBE_URL="http://${target_ip}:${REVERSE_PROBE_PORT}/healthz"
+      REVERSE_PROBE_MODE="temporary-http-probe"
+      return 0
+    }
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  stop_temporary_reverse_probe
+  return 1
+}
+
+stop_temporary_reverse_probe() {
+  [[ -n "${REVERSE_PROBE_PID:-}" ]] && kill "$REVERSE_PROBE_PID" >/dev/null 2>&1 || true
+  [[ -n "${REVERSE_PROBE_PID:-}" ]] && wait "$REVERSE_PROBE_PID" 2>/dev/null || true
+  [[ -n "${REVERSE_PROBE_LOG:-}" ]] && rm -f "$REVERSE_PROBE_LOG" || true
+  unset REVERSE_PROBE_PID REVERSE_PROBE_LOG REVERSE_PROBE_PORT REVERSE_PROBE_TOKEN
+}
+
+# 返回 0=PASS、1=已建立有效目标但 Pod 访问失败、2=没有安全的本地 Probe 能力（不阻断 NodePool）。
+test_pod_to_executor() {
+  local pod_name="$1" namespace="$2" target_ip pod_response
+  target_ip=$(resolve_reverse_probe_ip) || {
+    echo "[SKIP] 未解析到执行机私网 IPv4；跳过 Pod 到执行机反向连通性核销。"
+    return 2
+  }
+
+  if find_existing_reverse_probe_url "$target_ip"; then
+    echo "测试从Pod访问执行机历史业务端口: ${REVERSE_PROBE_URL}"
+  elif start_temporary_reverse_probe "$target_ip"; then
+    echo "测试从Pod访问执行机临时HTTP Probe: ${REVERSE_PROBE_URL}"
+  else
+    echo "[SKIP] 执行机 ${target_ip} 未监听历史业务端口，且未获临时HTTP Probe授权/能力；不阻断NodePool流程。"
+    return 2
+  fi
+
+  if pod_response=$(kubectl exec "$pod_name" -n "$namespace" -- curl --noproxy '*' -fsS -m 10 "$REVERSE_PROBE_URL" 2>/dev/null); then
+    if [[ "$REVERSE_PROBE_MODE" != "temporary-http-probe" || "$pod_response" == "$REVERSE_PROBE_TOKEN" ]]; then
+      echo -e "\e[32m\e[1m测试结论：正常！容器访问云主机通畅！ \e[0m"
+      [[ "$REVERSE_PROBE_MODE" == "temporary-http-probe" ]] && stop_temporary_reverse_probe
+      return 0
+    fi
+  fi
+
+  [[ "$REVERSE_PROBE_MODE" == "temporary-http-probe" ]] && stop_temporary_reverse_probe
+  log_error "测试结论：异常！Pod无法访问已验证的执行机探测端点: ${REVERSE_PROBE_URL}"
+  return 1
+}
+
 #通用的节点组可用性测试
 test_nodepool() {
   local NODEPOOL_NAME=$1
@@ -1158,33 +1292,26 @@ EOF
     return 1
   fi
 
-  #开始检查K8S环境pod访问集群本地服务器是否畅通,取ta1的19039 presto metric监控端口，用于后续K8S访问集群网络连通性测试
+  # 优先复用历史业务 metrics 端口；新执行机无业务端口时仅使用已具备的临时 Probe 能力。
+  # 若两者皆不可用，结果为 SKIP，不应阻断已通过的节点组调度和执行机到 Pod 检查。
   echo "*** 测试项3: 容器访问云主机是否通畅 ***"
-  LOCAL_SERVER_IP=$(grep ta1 /etc/hosts | head -1 | awk '{print $1}')
-  LOCAL_SERVER_PORT=19039
-  #先确认本地ta1的确监听着19039,如果因为特殊原因ta1未监听该端口，可更换为exporter端口9100
-  if nc -z -w 2 $LOCAL_SERVER_IP $LOCAL_SERVER_PORT; then
-    echo "测试从Pod访问本地服务器: $LOCAL_SERVER_IP:$LOCAL_SERVER_PORT"
+  if test_pod_to_executor "$POD_NAME" "$NAMESPACE"; then
+    :
   else
-    #19039端口不存在，切换为9100 exporter端口
-    LOCAL_SERVER_PORT=9100
-    echo "测试从Pod访问本地服务器: $LOCAL_SERVER_IP:$LOCAL_SERVER_PORT"
-  fi
-
-  # 在Pod内执行curl命令
-  if kubectl exec "$POD_NAME" -n "$NAMESPACE" -- curl -LsS -m 10 "http://$LOCAL_SERVER_IP:$LOCAL_SERVER_PORT/metrics" &>/dev/null; then
-    echo -e "\e[32m\e[1m测试结论：正常！容器访问云主机通畅！ \e[0m"
-  else
-    log_error "测试结论：异常！Pod无法访问云主机!"
-    echo -e "\e[31m\e[1m可能原因:  \e[0m"
-    echo -e "\e[31m\e[1m1. 本地服务器和POD并非统一内网网段，服务器iptables阻止了来自K8S网络的访问 \e[0m"
-    echo -e "\e[31m\e[1m2. 本地服务器绑定安全组未放行K8S安全组,请联系客户放行 \e[0m"
-    kubectl delete deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
-    return 1
+    reverse_probe_rc=$?
+    if [[ $reverse_probe_rc -eq 2 ]]; then
+      echo "[WARN] Pod到执行机反向网络未核销（执行机无业务端口/Probe能力或目标IP）；NodePool调度验收继续。"
+    else
+      echo -e "\e[31m\e[1m可能原因:  \e[0m"
+      echo -e "\e[31m\e[1m1. 本地服务器和POD并非统一内网网段，服务器iptables阻止了来自K8S网络的访问 \e[0m"
+      echo -e "\e[31m\e[1m2. 本地服务器绑定安全组未放行K8S安全组,请联系客户放行 \e[0m"
+      kubectl delete deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
+      return 1
+    fi
   fi
 
   # 可用性结论已由Pod Ready及双向网络决定；以下采集仅供审计，失败不得阻断或跳过清理。
-  collect_nodepool_runtime_evidence "$NODEPOOL_NAME" "$RUN_ID" || \
+  collect_nodepool_runtime_evidence "$NODEPOOL_NAME" "$RUN_ID" ||
     echo "[WARN] NodePool运行证据采集出现未预期异常，不影响本轮可用性结论。"
   echo -e "******** 节点组 [$NODEPOOL_NAME] 可用性测试结束,请关注测试结论,如果有红色预警信息请跟进确认处理********"
 
@@ -1358,8 +1485,8 @@ main() {
     :
   else
     confirmation_rc=$?
-    [[ $confirmation_rc -eq 2 ]] && return 0
-    exit 1
+    [[ $confirmation_rc -eq 2 ]] && return "$NODEPOOL_CANCELLED_RC"
+    return 1
   fi
 
   while true; do

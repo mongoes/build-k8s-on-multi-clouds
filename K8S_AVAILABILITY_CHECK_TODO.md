@@ -9,30 +9,39 @@
 
 让可用性检查在标准节点、弹性节点和 Serverless 场景中，能对存储、调度、镜像拉取、DNS/网络和 MySQL 连通性给出可解释、可回归验证的结论。
 
+## 2026-11-17 验收收敛
+
+- 已验收：通用完整回归、Serverless、指定 Node Selector、数数公网仓库 HTTPS、AWS NodePool构建、AWS EKS NodePool创建/检查双入口、多调度域 Serverless和华为云 CCE。这些项目不再作为本轮阻塞待办。
+- 仍待定向现场证据：旧 Kyverno升级成功/失败兜底、历史测试PV显式Y/N、非法 `/etc/hosts`、历史MySQL配置回退，以及 Unschedulable/NotTriggerScaleUp/镜像/DNS/MySQL/RTT 失败矩阵。
+- 仍待优化：Hybrid中不可调度Serverless域的重复等待（已证实非死循环），以及过时TODO/失效注释收敛。
+- 仍待发布：本地权威主脚本与 `auto_build_nodepool.sh` 尚未成对提交/推送远端；发布时不得夹带当前工作区其他删除或未跟踪资产。
+
 ## 待办清单
 
 | 优先级 | 状态 | 待办 | 完成标准 | 当前阻塞 / 下一步 | 责任人 |
 | --- | --- | --- | --- | --- | --- |
 | P1 | 已定位，暂缓实施 | Hybrid中不可调度Serverless域重复串行等待 | 某Serverless域的定向网络Pod确认`no-nodepool`或最终不可调度后，该域的te-disk/te-nfs/同域RWX登记SKIP且不再各等待180秒；只有真实Pod Ready的域才能进入跨域RWX候选 | ACK Hybrid现场证明并非无限循环：两个ARM虚拟节点各串行等待网络、te-disk、te-nfs约9分钟，且调度失败域过早加入`READY_SERVERLESS_DOMAINS`。当前按用户要求先暂缓，优先实现标签选择器专项入口 | Codex/用户 |
-| P0 | 已实现，待现场验证 | 按节点标签选择器执行目标节点池专项检查 | 接受标准`key=value,key=value`选择器；核验全部命中节点Ready且未cordon，并用数数业务镜像定向Pod证明真实调度；无参数入口行为不变，专项入口不得执行Serverless、其他节点池、存储、MySQL或全量网络 | 示例：`--node-selector 'node.k8s.te/nodepool-name=reserved-64c256g,kubernetes.io/arch=amd64'`。本地行为及旧入口反向回归通过；待真实ACK Hybrid现场确认全部目标AMD64节点被命中、Pod落入目标集合且资源回收。池内规格/付费标签/污点的专项详细披露可在现场基础链路通过后按业务需要继续增强，不复用全量节点规划状态 | Codex/用户 |
+| P0 | 已验收 | 按节点标签选择器执行目标节点池专项检查 | 接受标准`key=value,key=value`选择器；核验全部命中节点Ready且未cordon，并用数数业务镜像定向Pod证明真实调度；无参数入口行为不变，专项入口不得执行Serverless、其他节点池、存储、MySQL或全量网络 | 用户确认现场与回归均正常；后续仅在新的标签/污点或调度边界出现时增量验证 | Codex/用户 |
 | P0 | 已现场验证 | GKE Filestore `te-nfs` 网络参数自动注入 | StorageClass 使用由执行主机主网卡 Metadata 路径提取的网络短名称，不再隐式依赖 `default` | 2026-07-30 修复后实测：SC 创建为 `network=default`，RWX PVC 成功动态供给、挂载读写；完整 Metadata 路径不再直传 Filestore | Codex/用户 |
 | P2 | 阻塞（待授权/环境） | GKE Filestore `te-nfs` 成本与实例复用现场核验 | 记录每个 `instance-storageclass-label` 对应的 Filestore 实例数、容量、share 数和月度预算 | 需目标 GCP 项目 `filestore.instances.list/get` 与账单查看权限；优先使用已有多个 `te-nfs` PVC 的集群，避免为测试额外产生 1TiB Filestore 成本 | 用户/云平台管理员 |
 | P0 | 已现场验证 | 回灌线上确认的 `max-volume-size` | 仓库 `te-nfs` 模板与脚本均包含 `max-volume-size: "128Gi"`，且只维护 `te-nfs` 这个名称 | 2026-07-30 修复后新建 SC 已确认 `max-volume-size=128Gi`，并成功完成 RWX PVC 动态供给；实际实例/share 装箱和成本见下一项 | Codex/用户 |
 | P0 | 已现场验证 | 临时存储探测 PV / Filestore share 回收 | 任一 `te-csi-check-*` PVC 绑定的 PV 在清理前被显式切换为 `Delete`，删除 PVC 后不遗留 `Released` PV 或 share | 2026-07-30 二次 GKE 实测，3 个本轮临时 PV 均打印“已回收”；历史 Released PV 不由本轮自动删除 | 待定 |
-| P0 | 已定位并实施，待现场复验 | 腾讯 TKE Serverless 临时 PV 回收 | 本轮 `probe-run` 下每个临时 PVC 的绑定 PV 均先切为 `Delete`、PVC 删除后在可接受时限内消失；超时必须保留 PV/CSI 证据并准确失败 | `pvc-c37c5c19-5187-498e-a273-e8518c32ad34` 已在60秒后自行消失，根因是CBS异步回收超过旧60秒等待而非清理遗漏；默认等待已调整为180秒，可由`STORAGE_PV_RECLAIM_TIMEOUT`覆盖。待下一次单EKlet回灌确认无假FAIL | Codex/用户 |
+| P0 | 已验收 | 腾讯 TKE Serverless 临时 PV 回收 | 本轮 `probe-run` 下每个临时 PVC 的绑定 PV 均先切为 `Delete`、PVC 删除后在可接受时限内消失；超时必须保留 PV/CSI 证据并准确失败 | CBS异步回收等待调整为180秒后，Serverless回归与资源回收已由用户统一验收 | Codex/用户 |
 | P0 | 已现场验证 | 清理历史 `te-csi-check-*` Released PV / Filestore share | 仅清理已核验为 `Released`、`debug/te-csi-check-*`、Filestore CSI 且无 PVC/Pod 引用的历史 PV，并确认后端 share 消失 | 用户确认历史 9 个测试 PV/share 已按安全流程清理完成；禁止把业务 `te-nfs` SC 改为 Delete | 用户/云平台管理员 |
 | P1 | 已实现，待现场验证 | 收尾识别并清理历史测试残留 PV | 候选必须通过 Released/debug/固定测试 claim/te-disk 或 te-nfs/CSI 动态卷/SC provisioner/PVC 不存在的全部门槛；所有正常路径在总览前展示后 `N` 跳过，30 秒超时或非 TTY 默认清理 | 本地 mock 已覆盖合格候选删除与业务 Released PV 排除；待 CCE 或隔离环境回灌 Y、N、超时三条路径 | Codex/用户 |
 | P0 | 已现场验证 | GKE `te-nfs` RWX 跨节点共享验证 | Writer/Reader 位于不同节点，Reader 能读取 Writer 写入的 token，临时 PV/share 均回收 | 用户确认双节点真实验证已符合预期 | 用户/Codex |
 | P0 | 已现场验证 | GKE Filestore `te-nfs` 端到端验证 | CSI、StorageClass、PVC、挂载 Pod 与检查结论均正确 | SC 创建、RWX PVC Bound、Pod 挂载读写、临时 PV 回收及双节点 Writer/Reader 跨节点共享均已现场通过 | Codex/用户 |
 | P2 | 阻塞（待授权/环境） | 标准节点 `te-nfs` 异常分流回归 | 能准确区分：无 CSI、无 StorageClass、PVC 绑定失败、挂载失败和成功 | 需独立 GKE Standard 项目/VPC、可启停 Filestore CSI/API 与控制 NFS 网络的权限；先补 Event 分类逻辑后再跑异常矩阵 | 用户/云平台管理员 |
-| P0 | 部分现场验证，待修复回收问题后闭环 | 腾讯 TKE Serverless（单 EKlet）统一主脚本回归 | 识别为 `Serverless`；虚拟节点固定调度、ClusterIP、历史MySQL配置回退、RWO、RWX基础、同虚拟节点双Pod共享、统一总览和本轮资源回收均符合预期 | 2026-08-07 回灌：前述功能检查全部通过；MySQL `ta3:3306` 已按 TCP 握手正确通过；跨虚拟节点 RWX 因仅一个健康虚拟节点 SKIP。仅 PV 回收失败，见“腾讯 TKE Serverless 临时 PV 回收”专项 | Codex/用户 |
-| P0 | 设计待review | AWS EKS回归统一标准检查流程 | 已有NodePool的EKS执行完整标准检查；零NodePool前置门禁只在明确确认后进入创建；存储与consolidation按真实问题暴露入口 | 已形成 `docs/superpowers/specs/2026-08-04-aws-eks-standard-check-and-special-actions-design.md`；review后进入实施计划 | Codex/用户 |
+| P0 | 已验收 | 腾讯 TKE Serverless（单 EKlet）统一主脚本回归 | 识别为 `Serverless`；虚拟节点固定调度、ClusterIP、历史MySQL配置回退、RWO、RWX基础、同虚拟节点双Pod共享、统一总览和本轮资源回收均符合预期 | 功能检查、MySQL TCP、存储与回收路径已经现场及完整Serverless回归验收 | Codex/用户 |
+| P0 | 已验收 | 多调度域 Serverless | 各调度域能独立执行网络、RWO、RWX及跨域RWX检查，失败不互相遮蔽 | 用户确认多调度域Serverless回归符合预期；不可调度域的重复等待仍是单独P1体验优化 | Codex/用户 |
+| P0 | 已验收 | Pod访问数数公网仓库 | 所有调度域严格使用HTTPS访问OSS和Docker仓库，不回退HTTP | 线上回灌及自动回归均符合预期 | Codex/用户 |
+| P0 | 已验收 | AWS EKS回归统一标准检查流程 | 无论是否已有NodePool都展示创建/检查双入口；创建需明确授权并校验物料完整性，检查路径继续完整标准流程 | AWS EKS环境对是否进入NodePool创建的判断、交互、构建脚本回归及创建后继续检查已经用户验收 | Codex/用户 |
 | P1 | 已实现，待现场验证 | Kyverno K8S兼容性检查 | `te-system` / `kube-system` 中存在 Kyverno 且 K8S>=1.34 时，发现任一版本<1.18.0或无法解析版本即重装一次；失败明确提示人工命令 | 本地矩阵已覆盖未安装、低版本、`kyvernopre`、混合/无法解析、低 K8S 版本和重装失败；待真实环境回灌 | Codex/用户 |
 | P1 | 已现场验证 | 托管云节点组业务规划交互 | 预制业务方案和自定义节点组能统一驱动 Pod 探测、节点组契约及总览；菜单首层可直接输入合法自定义节点组；GCP/AWS OR 语义和 30 秒超时正确 | 2026-08-03 GKE 交互实测：直接输入 `reserved-4c32g` 后展开为 `reserved-4c32g|od-4c32g`、打印 OR 说明并选中现存 `od-4c32g`，规划及 Pod 探测均 PASS | Codex/用户 |
 | P1 | 已现场验证 | 火山云节点可分配内存展示 | 仅在火山云域内把 memory Quantity 的 `m` milli-byte 展示为合理 GiB；其他云、CPU 和磁盘格式化行为不变 | 2026-08-03 VKE 实测：识别 `volcengine` 后 capacity=31.1Gi、allocatable=27.2Gi、CPU=3.9C，节点契约继续通过；非火山云隔离由本地负向样例覆盖 | Codex/用户 |
 | P1 | 已现场验证 | 节点池扩容结论展示真实性 | 仅在本轮观察到目标池从无节点变为 Pod 可调度时展示 `0→1`；已有节点场景不得声称已验证扩容 | 2026-08-03 GKE 单档成功路径实测：已有36天的 `od-4c32g` 可调度，实时成功结论和结果总览均未出现 `0→1` | Codex/用户 |
 | P1 | 进行中 | 核心功能测试样例矩阵与逐项验收 | 每项新功能均有前置条件、输入、预期输出、通过判定和现场证据；不得仅以整体脚本执行完成验收 | 先为节点组业务规划补齐交互成功/失败/超时/回退矩阵，再推广至后续功能 | Codex/用户 |
-| P1 | 待验证 | CCE NAS / Everest 兼容性复测 | `csi-nas`、`everest.io/share-access-to` 与 VPC ID 解析在真实 CCE 集群有效 | 收集集群版本、SC、PVC Event 和脚本输出 | 待定 |
+| P1 | 已验收 | CCE NAS / Everest 兼容性复测 | CCE环境下已有或非标准`te-nfs`能进入正确决策和端到端健康检查 | 用户确认华为云CCE验收完毕、健康检查正常；未知Everest/VPC形态以后续真实案例增量回归 | Codex/用户 |
 | P1 | 待验证 | 调度与弹性扩容异常可解释性 | `Unschedulable`、`NotTriggerScaleUp`、冷启动均有最终摘要，不能卡在“探测中” | 验证 `ELASTIC_COLD_START_GRACE=120` 是否适合目标集群 | 待定 |
 | P1 | 待验证 | 网络与依赖探测回归 | 镜像拉取、DNS、MySQL 地址解析、TCP 握手 RTT 的失败原因可区分 | 为每类失败保留最小证据与预期输出 | 待定 |
 | P2 | 待整理 | 云与场景回归矩阵 | 下方矩阵中每个目标场景都有日期、结果、证据位置 | 每完成一次现场验证即补齐矩阵 | 待定 |

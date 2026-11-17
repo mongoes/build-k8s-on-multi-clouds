@@ -60,34 +60,8 @@ kubectl() {
     esac
 }
 
-# AWS NodePool前置门禁必须区分CRD缺失、查询失败、零对象和已有对象。
-MOCK_CRD=notfound RESULTS=""
-if check_aws_nodepool_gate; then fail 'missing CRD must stop the AWS standard flow'; fi
-[[ "$RESULTS" == *'缺少nodepools.karpenter.sh CRD'* ]] || fail 'missing CRD must have a precise failure'
-
-MOCK_CRD=forbidden RESULTS=""
-if check_aws_nodepool_gate; then fail 'Forbidden CRD query must not be treated as zero NodePools'; fi
-[[ "$RESULTS" == *'CRD查询失败'* ]] || fail 'Forbidden CRD query must retain the permission diagnosis'
-
-MOCK_CRD=ok MOCK_LIST_FAIL=0 MOCK_NODEPOOLS=$'base-pool\n' RESULTS=""
-check_aws_nodepool_gate || fail 'an existing NodePool must continue the standard flow'
-[[ "$RESULTS" == *'已存在NodePool，继续标准可用性检查'* ]] || fail 'existing NodePool must record PASS'
-
-MOCK_NODEPOOLS="" RESULTS="" MOCK_TOOL_RUN=0
-_aws_interactive_tty_available() { return 1; }
-_download_and_run_aws_tool() { MOCK_TOOL_RUN=1; }
-if check_aws_nodepool_gate; then fail 'zero NodePools without consent must stop'; fi
-[[ "$MOCK_TOOL_RUN" == 0 ]] || fail 'non-interactive zero-NodePool gate must not run a privileged tool'
-
-MOCK_TOOL_RUN=0 RESULTS=""
-_aws_interactive_tty_available() { return 0; }
-_aws_confirm_short_yes() { return 0; }
-set +e
-check_aws_nodepool_gate
-gate_rc=$?
-set -e
-[[ $gate_rc -eq 10 ]] || fail 'authorized zero-NodePool flow must request a rerun after tool success'
-[[ "$MOCK_TOOL_RUN" == 1 ]] || fail 'authorized zero-NodePool flow must run auto_build_nodepool.sh once'
+# AWS NodePool创建/检查双入口已由test_k8s_avail_check.sh覆盖；本文件仅保留
+# consolidationPolicy审计、确认、精确patch和读回的专项回归，避免再次固化旧门禁语义。
 
 MOCK_LINES=$'safe-pool\tWhenEmpty\ncustom-pool\tNever\nunset-pool\t\n'
 AWS_CONSOLIDATION_CANDIDATES=""
