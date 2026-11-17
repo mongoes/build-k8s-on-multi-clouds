@@ -73,6 +73,9 @@ require_text 'shasum -a 256 -c -'
 require_text 'curl -fsSL'
 forbid_text 'curl -sLO "$kubectl_url"'
 forbid_text 'kubectl-1.34-${TARGET_ARCH}'
+require_text '# 标签/污点: 保留完整键名作为可审计证据, 各值为数组(多值多行堆叠)'
+forbid_text 'labels_raw="${labels_raw//node.k8s.te\//}"'
+forbid_text 'taints_raw="${taints_raw//node.k8s.te\//}"'
 
 # 正式发布的release、NodePool URL和SHA是一个不可分割的信任单元；调用者环境
 # 不得把其中任一项改到其他版本或对象。变更配对必须修改并重新发布主脚本。
@@ -84,8 +87,8 @@ release_values=$(
         AWS_AUTO_BUILD_NODEPOOL_SHA256='override-sha' \
         bash -c 'source "$1"; printf "%s\n%s\n%s\n" "$K8S_AVAIL_RELEASE" "$AWS_AUTO_BUILD_NODEPOOL_URL" "$AWS_AUTO_BUILD_NODEPOOL_SHA256"' _ "$release_source"
 )
-expected_release_values="v3.0.20261117.1
-https://download-thinkingdata.oss-cn-shanghai.aliyuncs.com/ta/tools/k8s-readiness/releases/v3.0.20261117.1/auto_build_nodepool.sh
+expected_release_values="v3.0.20261117.2
+https://download-thinkingdata.oss-cn-shanghai.aliyuncs.com/ta/tools/k8s-readiness/releases/v3.0.20261117.2/auto_build_nodepool.sh
 ${NODEPOOL_SCRIPT_SHA256}"
 [[ "$release_values" == "$expected_release_values" ]] || fail 'environment variables must not override the published NodePool release URL/SHA trust unit'
 

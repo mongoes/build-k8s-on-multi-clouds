@@ -67,7 +67,7 @@ AWS_NODEPOOL_READY_TIMEOUT=300
 AWS_NODEPOOL_CANCELLED_RC=10
 # AWS NodePool创建脚本使用不可变版本化路径，避免固定“latest”对象在主、子
 # 脚本分批发布时产生SHA错配。旧固定路径继续保留，供人工获取最新脚本。
-K8S_AVAIL_RELEASE="v3.0.20261117.1"
+K8S_AVAIL_RELEASE="v3.0.20261117.2"
 AWS_AUTO_BUILD_NODEPOOL_URL="${AWS_TOOL_BASE_URL}/k8s-readiness/releases/${K8S_AVAIL_RELEASE}/auto_build_nodepool.sh"
 # 固定为当前本地权威auto_build_nodepool.sh的SHA256。发布OSS物料和主脚本时必须
 # 成对同步；任一端不匹配时安全阻断。
@@ -1237,12 +1237,10 @@ discover_and_check_nodes() {
         local alloc_mem="${NODE_SNAPSHOT_ALLOCATABLE_MEMORY[$first_node]:-}"
         local alloc_disk="${NODE_SNAPSHOT_ALLOCATABLE_DISK[$first_node]:-}"
 
-        # 标签/污点: 去 node.k8s.te/ 前缀以紧凑展示, 各值为数组(多值多行堆叠)
+        # 标签/污点: 保留完整键名作为可审计证据, 各值为数组(多值多行堆叠)
         local labels_raw="${NODE_SNAPSHOT_TE_LABELS[$first_node]:-}"
-        labels_raw="${labels_raw//node.k8s.te\//}"
         labels_raw="${labels_raw//,/$'\n'}"
         local taints_raw="${NODE_SNAPSHOT_TE_TAINTS[$first_node]:-}"
-        taints_raw="${taints_raw//node.k8s.te\//}"
         taints_raw="${taints_raw//,/$'\n'}"
         local label_arr=() taint_arr=()
         local l
