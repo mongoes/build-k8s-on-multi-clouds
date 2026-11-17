@@ -883,7 +883,177 @@ ensure_namespace() {
     fi
 }
 
-# ==================== 节点池自动发现与归类检测 ====================
+# ==================== 节点快照与节点池自动发现 ====================
+# 超大集群中逐节点执行kubectl get node会把一次逻辑检查放大为数百次API请求。
+# 节点池探测完成后首次进入节点检查时，只读取一次Nodes列表并规范化到内存；
+# 池内一致性与节点组契约共用同一事实快照，确保结论来自同一时刻且不重复访问API。
+NODE_SNAPSHOT_READY=false
+NODE_SNAPSHOT_FILE=""
+NODE_SNAPSHOT_CAPTURE_SECONDS=0
+NODE_SNAPSHOT_API_CALLS=0
+NODE_SNAPSHOT_NAMES=()
+
+if ((BASH_VERSINFO[0] >= 4)); then
+    eval 'declare -A NODE_SNAPSHOT_NODEPOOL=()
+declare -A NODE_SNAPSHOT_CAPACITY_CPU=()
+declare -A NODE_SNAPSHOT_CAPACITY_MEMORY=()
+declare -A NODE_SNAPSHOT_CAPACITY_DISK=()
+declare -A NODE_SNAPSHOT_ALLOCATABLE_CPU=()
+declare -A NODE_SNAPSHOT_ALLOCATABLE_MEMORY=()
+declare -A NODE_SNAPSHOT_ALLOCATABLE_DISK=()
+declare -A NODE_SNAPSHOT_TE_LABELS=()
+declare -A NODE_SNAPSHOT_TE_TAINTS=()
+declare -A NODE_SNAPSHOT_BILLING_LABEL=()
+declare -A NODE_SNAPSHOT_BILLING_TAINT_VALUE=()
+declare -A NODE_SNAPSHOT_BILLING_TAINT_EFFECT=()
+declare -A NODE_SNAPSHOT_READY_STATUS=()
+declare -A NODE_SNAPSHOT_UNSCHEDULABLE=()
+declare -A NODE_SNAPSHOT_ARCH=()
+declare -A NODE_SNAPSHOT_IS_VIRTUAL=()'
+fi
+
+init_node_snapshot_maps() {
+    # 生产K8S执行机统一使用Linux Bash>=4；延迟声明避免未进入节点阶段的
+    # 专项入口在加载函数库时产生无意义副作用。
+    if ((BASH_VERSINFO[0] < 4)); then
+        log_error "节点快照优化要求Linux Bash>=4，当前版本=${BASH_VERSION}"
+        return 1
+    fi
+    return 0
+}
+
+refresh_node_snapshot() {
+    local started_at tmp_file name nodepool cap_cpu cap_mem cap_disk alloc_cpu alloc_mem alloc_disk
+    local te_labels te_taints billing_label billing_taint_value billing_taint_effect ready_status unschedulable arch is_virtual
+
+    started_at=$(date +%s)
+    init_node_snapshot_maps || return 1
+    _ensure_artifact_dir
+    NODE_SNAPSHOT_FILE="${ARTIFACT_DIR}/nodes-snapshot.json"
+    tmp_file="${NODE_SNAPSHOT_FILE}.tmp.$$"
+
+    NODE_SNAPSHOT_READY=false
+    NODE_SNAPSHOT_API_CALLS=1
+    NODE_SNAPSHOT_NAMES=()
+    NODE_SNAPSHOT_NODEPOOL=()
+    NODE_SNAPSHOT_CAPACITY_CPU=()
+    NODE_SNAPSHOT_CAPACITY_MEMORY=()
+    NODE_SNAPSHOT_CAPACITY_DISK=()
+    NODE_SNAPSHOT_ALLOCATABLE_CPU=()
+    NODE_SNAPSHOT_ALLOCATABLE_MEMORY=()
+    NODE_SNAPSHOT_ALLOCATABLE_DISK=()
+    NODE_SNAPSHOT_TE_LABELS=()
+    NODE_SNAPSHOT_TE_TAINTS=()
+    NODE_SNAPSHOT_BILLING_LABEL=()
+    NODE_SNAPSHOT_BILLING_TAINT_VALUE=()
+    NODE_SNAPSHOT_BILLING_TAINT_EFFECT=()
+    NODE_SNAPSHOT_READY_STATUS=()
+    NODE_SNAPSHOT_UNSCHEDULABLE=()
+    NODE_SNAPSHOT_ARCH=()
+    NODE_SNAPSHOT_IS_VIRTUAL=()
+
+    if ! kubectl get nodes -o json >"$tmp_file"; then
+        rm -f -- "$tmp_file"
+        log_error "无法读取Nodes列表，节点池配置与契约检查不能继续"
+        return 1
+    fi
+    if ! jq -e '.items | type == "array"' "$tmp_file" >/dev/null 2>&1; then
+        rm -f -- "$tmp_file"
+        log_error "Nodes API返回内容不是合法items数组，拒绝基于不完整数据继续检查"
+        return 1
+    fi
+    mv -f -- "$tmp_file" "$NODE_SNAPSHOT_FILE"
+
+    while IFS=$'\t' read -r name nodepool cap_cpu cap_mem cap_disk alloc_cpu alloc_mem alloc_disk te_labels te_taints billing_label billing_taint_value billing_taint_effect ready_status unschedulable arch is_virtual; do
+        [[ -n "$name" ]] || continue
+        [[ "$nodepool" == "__K8S_EMPTY__" ]] && nodepool=""
+        [[ "$cap_cpu" == "__K8S_EMPTY__" ]] && cap_cpu=""
+        [[ "$cap_mem" == "__K8S_EMPTY__" ]] && cap_mem=""
+        [[ "$cap_disk" == "__K8S_EMPTY__" ]] && cap_disk=""
+        [[ "$alloc_cpu" == "__K8S_EMPTY__" ]] && alloc_cpu=""
+        [[ "$alloc_mem" == "__K8S_EMPTY__" ]] && alloc_mem=""
+        [[ "$alloc_disk" == "__K8S_EMPTY__" ]] && alloc_disk=""
+        [[ "$te_labels" == "__K8S_EMPTY__" ]] && te_labels=""
+        [[ "$te_taints" == "__K8S_EMPTY__" ]] && te_taints=""
+        [[ "$billing_label" == "__K8S_EMPTY__" ]] && billing_label=""
+        [[ "$billing_taint_value" == "__K8S_EMPTY__" ]] && billing_taint_value=""
+        [[ "$billing_taint_effect" == "__K8S_EMPTY__" ]] && billing_taint_effect=""
+        [[ "$arch" == "__K8S_EMPTY__" ]] && arch=""
+        NODE_SNAPSHOT_NAMES+=("$name")
+        NODE_SNAPSHOT_NODEPOOL["$name"]="$nodepool"
+        NODE_SNAPSHOT_CAPACITY_CPU["$name"]="$cap_cpu"
+        NODE_SNAPSHOT_CAPACITY_MEMORY["$name"]="$cap_mem"
+        NODE_SNAPSHOT_CAPACITY_DISK["$name"]="$cap_disk"
+        NODE_SNAPSHOT_ALLOCATABLE_CPU["$name"]="$alloc_cpu"
+        NODE_SNAPSHOT_ALLOCATABLE_MEMORY["$name"]="$alloc_mem"
+        NODE_SNAPSHOT_ALLOCATABLE_DISK["$name"]="$alloc_disk"
+        NODE_SNAPSHOT_TE_LABELS["$name"]="$te_labels"
+        NODE_SNAPSHOT_TE_TAINTS["$name"]="$te_taints"
+        NODE_SNAPSHOT_BILLING_LABEL["$name"]="$billing_label"
+        NODE_SNAPSHOT_BILLING_TAINT_VALUE["$name"]="$billing_taint_value"
+        NODE_SNAPSHOT_BILLING_TAINT_EFFECT["$name"]="$billing_taint_effect"
+        NODE_SNAPSHOT_READY_STATUS["$name"]="$ready_status"
+        NODE_SNAPSHOT_UNSCHEDULABLE["$name"]="$unschedulable"
+        NODE_SNAPSHOT_ARCH["$name"]="$arch"
+        NODE_SNAPSHOT_IS_VIRTUAL["$name"]="$is_virtual"
+    done < <(jq -r '
+        def nz: if . == null or . == "" then "__K8S_EMPTY__" else . end;
+        .items[] |
+        [
+          ((.metadata.name // "") | nz),
+          ((.metadata.labels["node.k8s.te/nodepool-name"] // "") | nz),
+          ((.status.capacity.cpu // "") | nz),
+          ((.status.capacity.memory // "") | nz),
+          ((.status.capacity["ephemeral-storage"] // "") | nz),
+          ((.status.allocatable.cpu // "") | nz),
+          ((.status.allocatable.memory // "") | nz),
+          ((.status.allocatable["ephemeral-storage"] // "") | nz),
+          (([(.metadata.labels // {}) | to_entries[] | select(.key | startswith("node.k8s.te/")) | "\(.key)=\(.value)"] | sort | join(",")) | nz),
+          (([.spec.taints[]? | select(.key | startswith("node.k8s.te/")) | "\(.key)=\(.value // ""):\(.effect // "")"] | sort | join(",")) | nz),
+          ((.metadata.labels["node.k8s.te/billing-mode"] // "") | nz),
+          (([.spec.taints[]? | select(.key == "node.k8s.te/billing-mode")][0].value // "") | nz),
+          (([.spec.taints[]? | select(.key == "node.k8s.te/billing-mode")][0].effect // "") | nz),
+          ([.status.conditions[]? | select(.type == "Ready")][-1].status // "Unknown"),
+          ((.spec.unschedulable // false) | tostring),
+          ((.metadata.labels["kubernetes.io/arch"] // "") | nz),
+          ((
+            ((.metadata.labels["node.kubernetes.io/instance-type"] // "") == "eklet") or
+            ([(.metadata.labels // {}) | keys[] | select(startswith("eks.tke.cloud.tencent.com/"))] | length > 0) or
+            (
+              ((.metadata.labels.type // "") == "virtual-kubelet") and
+              ([(.metadata.labels // {}) | keys[] | select(
+                startswith("alibabacloud.com/") or
+                startswith("service.alibabacloud.com/") or
+                startswith("vk.alpha.alibabacloud.com/")
+              )] | length > 0)
+            )
+          ) | tostring)
+        ] | @tsv
+    ' "$NODE_SNAPSHOT_FILE")
+
+    if [[ ${#NODE_SNAPSHOT_NAMES[@]} -eq 0 ]]; then
+        log_error "Nodes快照中没有节点，无法执行节点池配置与契约检查"
+        return 1
+    fi
+    NODE_SNAPSHOT_CAPTURE_SECONDS=$(( $(date +%s) - started_at ))
+    NODE_SNAPSHOT_READY=true
+    log_info "节点快照采集完成: 节点=${#NODE_SNAPSHOT_NAMES[@]}, Kubernetes API调用=${NODE_SNAPSHOT_API_CALLS}, 耗时=${NODE_SNAPSHOT_CAPTURE_SECONDS}s"
+    log_info "节点快照证据: ${NODE_SNAPSHOT_FILE}"
+    return 0
+}
+
+ensure_node_snapshot() {
+    [[ "$NODE_SNAPSHOT_READY" == true ]] && return 0
+    refresh_node_snapshot
+}
+
+get_snapshot_standard_node_names() {
+    local node
+    for node in "${NODE_SNAPSHOT_NAMES[@]}"; do
+        [[ "${NODE_SNAPSHOT_IS_VIRTUAL[$node]:-false}" == "true" ]] || printf '%s\n' "$node"
+    done
+}
+
 # 功能：
 #   1. 发现K8S内所有节点，按 node.k8s.te/nodepool-name 标签归类
 #   2. 先进行详细检测(规格/标签/污点一致性)
@@ -891,9 +1061,12 @@ ensure_namespace() {
 discover_and_check_nodes() {
     log_step "节点池与节点配置检查"
     local platform="$1"
+    local stage_started_at=$(date +%s)
+
+    ensure_node_snapshot || return 1
 
     local all_node_names
-    all_node_names=$(get_standard_node_names)
+    all_node_names=$(get_snapshot_standard_node_names)
     if [[ -z "$all_node_names" ]]; then
         log_error "未获取到任何节点，请确认集群是否已添加节点"
         return 1
@@ -904,7 +1077,7 @@ discover_and_check_nodes() {
     # 按nodepool-name标签归类
     declare -A pool_nodes_map
     for node in $all_node_names; do
-        local nodepool_name=$(kubectl get node "$node" -o jsonpath='{.metadata.labels.node\.k8s\.te/nodepool-name}' 2>/dev/null)
+        local nodepool_name="${NODE_SNAPSHOT_NODEPOOL[$node]:-}"
         if [[ -z "$nodepool_name" ]]; then
             nodepool_name="<未打nodepool标签>"
         fi
@@ -925,9 +1098,9 @@ discover_and_check_nodes() {
         local prev_disk=""
         local spec_homo=true
         for node in $nodes_in_pool; do
-            local cpu=$(kubectl get node "$node" -o jsonpath='{.status.capacity.cpu}' 2>/dev/null)
-            local mem=$(kubectl get node "$node" -o jsonpath='{.status.capacity.memory}' 2>/dev/null)
-            local sys_disk=$(kubectl get node "$node" -o jsonpath='{.status.capacity.ephemeral-storage}' 2>/dev/null)
+            local cpu="${NODE_SNAPSHOT_CAPACITY_CPU[$node]:-}"
+            local mem="${NODE_SNAPSHOT_CAPACITY_MEMORY[$node]:-}"
+            local sys_disk="${NODE_SNAPSHOT_CAPACITY_DISK[$node]:-}"
             if [[ -n "$prev_cpu" ]]; then
                 if [[ "$cpu" != "$prev_cpu" ]]; then
                     spec_homo=false
@@ -959,13 +1132,11 @@ discover_and_check_nodes() {
         done
 
         # -- 标签一致性检测 --
-        local te_labels_base=$(kubectl get node "$first_node" -o jsonpath='{.metadata.labels}' 2>/dev/null |
-            jq -r 'to_entries[] | select(.key | startswith("node.k8s.te/")) | "\(.key)=\(.value)"' 2>/dev/null | sort)
+        local te_labels_base="${NODE_SNAPSHOT_TE_LABELS[$first_node]:-}"
         local label_homo=true
         if [[ -n "$te_labels_base" ]]; then
             for node in $nodes_in_pool; do
-                local node_te_labels=$(kubectl get node "$node" -o jsonpath='{.metadata.labels}' 2>/dev/null |
-                    jq -r 'to_entries[] | select(.key | startswith("node.k8s.te/")) | "\(.key)=\(.value)"' 2>/dev/null | sort)
+                local node_te_labels="${NODE_SNAPSHOT_TE_LABELS[$node]:-}"
                 if [[ "$node_te_labels" != "$te_labels_base" ]]; then
                     label_homo=false
                 fi
@@ -973,13 +1144,11 @@ discover_and_check_nodes() {
         fi
 
         # -- 污点一致性检测 --
-        local te_taints_base=$(kubectl get node "$first_node" -o jsonpath='{.spec.taints}' 2>/dev/null |
-            jq -r '.[] | select(.key | startswith("node.k8s.te/")) | "\(.key)=\(.value):\(.effect)"' 2>/dev/null | sort)
+        local te_taints_base="${NODE_SNAPSHOT_TE_TAINTS[$first_node]:-}"
         local taint_homo=true
         if [[ -n "$te_taints_base" ]]; then
             for node in $nodes_in_pool; do
-                local node_te_taints=$(kubectl get node "$node" -o jsonpath='{.spec.taints}' 2>/dev/null |
-                    jq -r '.[] | select(.key | startswith("node.k8s.te/")) | "\(.key)=\(.value):\(.effect)"' 2>/dev/null | sort)
+                local node_te_taints="${NODE_SNAPSHOT_TE_TAINTS[$node]:-}"
                 if [[ "$node_te_taints" != "$te_taints_base" ]]; then
                     taint_homo=false
                 fi
@@ -997,9 +1166,9 @@ discover_and_check_nodes() {
                 echo -e "    ${YELLOW}  规格不一致:${NC}"
                 echo "    规格不一致:" >>${LOG_FILE}
                 for node in $nodes_in_pool; do
-                    local cpu=$(kubectl get node "$node" -o jsonpath='{.status.capacity.cpu}' 2>/dev/null)
-                    local mem=$(kubectl get node "$node" -o jsonpath='{.status.capacity.memory}' 2>/dev/null)
-                    local sys_disk=$(kubectl get node "$node" -o jsonpath='{.status.capacity.ephemeral-storage}' 2>/dev/null)
+                    local cpu="${NODE_SNAPSHOT_CAPACITY_CPU[$node]:-}"
+                    local mem="${NODE_SNAPSHOT_CAPACITY_MEMORY[$node]:-}"
+                    local sys_disk="${NODE_SNAPSHOT_CAPACITY_DISK[$node]:-}"
                     echo -e "    ${YELLOW}    - $node: CPU=$(format_cpu $cpu) / 内存=$(format_memory_for_platform "$platform" "$mem") / 磁盘空间=$(format_resource $sys_disk)${NC}"
                     echo "    - $node: CPU=$(format_cpu $cpu) / 内存=$(format_memory_for_platform "$platform" "$mem") / 磁盘空间=$(format_resource $sys_disk)" >>${LOG_FILE}
                 done
@@ -1009,8 +1178,7 @@ discover_and_check_nodes() {
                 echo -e "    ${YELLOW}  标签不一致:${NC}"
                 echo "    标签不一致:" >>${LOG_FILE}
                 for node in $nodes_in_pool; do
-                    local node_te_labels=$(kubectl get node "$node" -o jsonpath='{.metadata.labels}' 2>/dev/null |
-                        jq -r 'to_entries[] | select(.key | startswith("node.k8s.te/")) | "\(.key)=\(.value)"' 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')
+                    local node_te_labels="${NODE_SNAPSHOT_TE_LABELS[$node]:-}"
                     [[ -z "$node_te_labels" ]] && node_te_labels="无"
                     echo -e "    ${YELLOW}    - $node: ${node_te_labels}${NC}"
                     echo "    - $node: ${node_te_labels}" >>${LOG_FILE}
@@ -1021,8 +1189,7 @@ discover_and_check_nodes() {
                 echo -e "    ${YELLOW}  污点不一致:${NC}"
                 echo "    污点不一致:" >>${LOG_FILE}
                 for node in $nodes_in_pool; do
-                    local node_te_taints=$(kubectl get node "$node" -o jsonpath='{.spec.taints}' 2>/dev/null |
-                        jq -r '.[] | select(.key | startswith("node.k8s.te/")) | "\(.key)=\(.value):\(.effect)"' 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')
+                    local node_te_taints="${NODE_SNAPSHOT_TE_TAINTS[$node]:-}"
                     [[ -z "$node_te_taints" ]] && node_te_taints="无"
                     echo -e "    ${YELLOW}    - $node: ${node_te_taints}${NC}"
                     echo "    - $node: ${node_te_taints}" >>${LOG_FILE}
@@ -1060,18 +1227,20 @@ discover_and_check_nodes() {
         local first_node=$(echo $nodes_in_pool | awk '{print $1}')
         local node_count=$(echo $nodes_in_pool | tr ' ' '\n' | grep -c .)
 
-        local cpu=$(kubectl get node "$first_node" -o jsonpath='{.status.capacity.cpu}' 2>/dev/null)
-        local mem=$(kubectl get node "$first_node" -o jsonpath='{.status.capacity.memory}' 2>/dev/null)
-        local sys_disk=$(kubectl get node "$first_node" -o jsonpath='{.status.capacity.ephemeral-storage}' 2>/dev/null)
-        local alloc_cpu=$(kubectl get node "$first_node" -o jsonpath='{.status.allocatable.cpu}' 2>/dev/null)
-        local alloc_mem=$(kubectl get node "$first_node" -o jsonpath='{.status.allocatable.memory}' 2>/dev/null)
-        local alloc_disk=$(kubectl get node "$first_node" -o jsonpath='{.status.allocatable.ephemeral-storage}' 2>/dev/null)
+        local cpu="${NODE_SNAPSHOT_CAPACITY_CPU[$first_node]:-}"
+        local mem="${NODE_SNAPSHOT_CAPACITY_MEMORY[$first_node]:-}"
+        local sys_disk="${NODE_SNAPSHOT_CAPACITY_DISK[$first_node]:-}"
+        local alloc_cpu="${NODE_SNAPSHOT_ALLOCATABLE_CPU[$first_node]:-}"
+        local alloc_mem="${NODE_SNAPSHOT_ALLOCATABLE_MEMORY[$first_node]:-}"
+        local alloc_disk="${NODE_SNAPSHOT_ALLOCATABLE_DISK[$first_node]:-}"
 
         # 标签/污点: 去 node.k8s.te/ 前缀以紧凑展示, 各值为数组(多值多行堆叠)
-        local labels_raw=$(kubectl get node "$first_node" -o jsonpath='{.metadata.labels}' 2>/dev/null |
-            jq -r 'to_entries[] | select(.key | startswith("node.k8s.te/")) | "\(.key|sub("node.k8s.te/";""))=\(.value)"' 2>/dev/null | sort)
-        local taints_raw=$(kubectl get node "$first_node" -o jsonpath='{.spec.taints}' 2>/dev/null |
-            jq -r '.[] | select(.key | startswith("node.k8s.te/")) | "\(.key|sub("node.k8s.te/";""))=\(.value):\(.effect)"' 2>/dev/null | sort)
+        local labels_raw="${NODE_SNAPSHOT_TE_LABELS[$first_node]:-}"
+        labels_raw="${labels_raw//node.k8s.te\//}"
+        labels_raw="${labels_raw//,/$'\n'}"
+        local taints_raw="${NODE_SNAPSHOT_TE_TAINTS[$first_node]:-}"
+        taints_raw="${taints_raw//node.k8s.te\//}"
+        taints_raw="${taints_raw//,/$'\n'}"
         local label_arr=() taint_arr=()
         local l
         while IFS= read -r l; do [[ -n "$l" ]] && label_arr+=("$l"); done <<<"$labels_raw"
@@ -1131,12 +1300,23 @@ discover_and_check_nodes() {
     echo "" | tee -a ${LOG_FILE}
     echo "共发现: ${pool_count} 个节点池，${total_nodes} 个节点" | tee -a ${LOG_FILE}
 
-    # -------- 全局节点资源概览 (直接调用kubectl) --------
+    # -------- 全局节点资源概览 (复用快照，不再次访问API) --------
     echo "" | tee -a ${LOG_FILE}
     echo "节点资源全局概览:" | tee -a ${LOG_FILE}
-    kubectl get nodes -L node.k8s.te/nodepool-name 2>/dev/null | tee -a ${LOG_FILE}
+    printf '%-55s %-8s %-12s %-10s %s\n' "NAME" "READY" "SCHEDULABLE" "ARCH" "NODEPOOL" | tee -a ${LOG_FILE}
+    for node in $all_node_names; do
+        local schedulable="true"
+        [[ "${NODE_SNAPSHOT_UNSCHEDULABLE[$node]:-false}" == "true" ]] && schedulable="false"
+        printf '%-55s %-8s %-12s %-10s %s\n' \
+            "$node" \
+            "${NODE_SNAPSHOT_READY_STATUS[$node]:-Unknown}" \
+            "$schedulable" \
+            "${NODE_SNAPSHOT_ARCH[$node]:-<unset>}" \
+            "${NODE_SNAPSHOT_NODEPOOL[$node]:-<未打nodepool标签>}" | tee -a ${LOG_FILE}
+    done
 
     echo "" >>${LOG_FILE}
+    log_info "节点池与节点配置检查性能: 耗时=$(( $(date +%s) - stage_started_at ))s, 节点快照复用=是, 新增Nodes API调用=0"
 
     if $has_issues; then
         return 1
@@ -1169,6 +1349,7 @@ check_nodepool_contract() {
     log_step "节点组契约校验(规格/付费类型/污点 vs 池名声明)"
 
     local platform="$1"
+    local stage_started_at=$(date +%s)
     local expected_str=$(get_expected_nodepools "$platform")
     if [[ -z "$expected_str" ]]; then
         log_info "  当前环境(${platform})无节点组规划(物理机/自建)，跳过节点组契约校验"
@@ -1176,13 +1357,19 @@ check_nodepool_contract() {
         return 0
     fi
 
+    if ! ensure_node_snapshot; then
+        log_error "节点快照不可用，无法执行节点组契约校验"
+        record_result "节点组契约校验(规格/付费类型/污点)" "FAIL" "Nodes API快照读取失败"
+        return 1
+    fi
+
     # 按 nodepool-name 标签归类(同 discover_and_check_nodes)
     local all_node_names
-    all_node_names=$(get_standard_node_names)
+    all_node_names=$(get_snapshot_standard_node_names)
     declare -A pool_nodes_map
     local node
     for node in $all_node_names; do
-        local np=$(kubectl get node "$node" -o jsonpath='{.metadata.labels.node\.k8s\.te/nodepool-name}' 2>/dev/null)
+        local np="${NODE_SNAPSHOT_NODEPOOL[$node]:-}"
         [[ -z "$np" ]] && np="<未打nodepool标签>"
         pool_nodes_map["$np"]="${pool_nodes_map[$np]} $node"
     done
@@ -1209,8 +1396,8 @@ check_nodepool_contract() {
         fi
 
         # -- b. 规格契约(WARNING): 期望规格 vs 实际 capacity, 相对差值 <= SPEC_TOLERANCE 视为正常 --
-        local cap_cpu=$(kubectl get node "$first_node" -o jsonpath='{.status.capacity.cpu}' 2>/dev/null)
-        local cap_mem=$(kubectl get node "$first_node" -o jsonpath='{.status.capacity.memory}' 2>/dev/null)
+        local cap_cpu="${NODE_SNAPSHOT_CAPACITY_CPU[$first_node]:-}"
+        local cap_mem="${NODE_SNAPSHOT_CAPACITY_MEMORY[$first_node]:-}"
         local cap_cpu_cores="${cap_cpu//[A-Za-z]/}"
         [[ "$cap_cpu" == *m ]] && cap_cpu_cores=$(awk "BEGIN{printf \"%.3f\", $cap_cpu_cores/1000}")
         # memory: K8S 通常上报 Ki, 换算为 Gi
@@ -1231,7 +1418,7 @@ check_nodepool_contract() {
 
         # -- c. billing-mode 标签契约(WARNING): 标签值 vs 池名前缀(od/on-demand 互认) --
         for node in $nodes_in_pool; do
-            local node_billing=$(kubectl get node "$node" -o jsonpath='{.metadata.labels.node\.k8s\.te/billing-mode}' 2>/dev/null)
+            local node_billing="${NODE_SNAPSHOT_BILLING_LABEL[$node]:-}"
             if ! _billing_match "$node_billing" "$billing"; then
                 log_warning "  节点池[${pool_name}]节点[${node}]付费类型标签与池名不符: node.k8s.te/billing-mode=${node_billing:-<空>}，池名声明为 ${billing}"
                 has_warn=true
@@ -1240,8 +1427,8 @@ check_nodepool_contract() {
 
         # -- d. 污点契约(FAIL): 污点错配是安全关键错误, 全程不阻断但在总览中标记为失败 --
         for node in $nodes_in_pool; do
-            local taint_val=$(kubectl get node "$node" -o jsonpath='{.spec.taints[?(@.key=="node.k8s.te/billing-mode")].value}' 2>/dev/null)
-            local taint_eff=$(kubectl get node "$node" -o jsonpath='{.spec.taints[?(@.key=="node.k8s.te/billing-mode")].effect}' 2>/dev/null)
+            local taint_val="${NODE_SNAPSHOT_BILLING_TAINT_VALUE[$node]:-}"
+            local taint_eff="${NODE_SNAPSHOT_BILLING_TAINT_EFFECT[$node]:-}"
             # d1. spot 池必须有 spot:NoSchedule 污点(不接受中断的服务不应被调度过来)
             if [[ "$billing" == "spot" ]]; then
                 if [[ "$taint_val" != "spot" || "$taint_eff" != "NoSchedule" ]]; then
@@ -1292,6 +1479,7 @@ check_nodepool_contract() {
         log_success "节点组契约校验通过(污点/规格/付费类型均符合池名声明)"
         record_result "节点组契约校验(规格/付费类型/污点)" "PASS" "污点/规格/付费类型均符合池名声明"
     fi
+    log_info "节点组契约校验性能: 节点快照复用=是, 新增Nodes API调用=0, 耗时=$(( $(date +%s) - stage_started_at ))s"
     return 0
 }
 
@@ -6037,15 +6225,27 @@ EOF_USAGE
     # 全程不阻断: 未通过的节点池红色标注原因, 就绪节点池继续后续检查。结果由函数内部登记。
     pod_deploy_check "$cloud_platform"
 
-    # 节点池和节点配置检查: 探测之后调用, 弹性池节点此时已拉起可见, 枚举规格/标签/污点
-    if discover_and_check_nodes "$cloud_platform"; then
-        record_result "节点池与节点配置检查(池内一致性)" "PASS" "节点池归类与规格/标签/污点一致性通过"
+    # 节点池探测结束后只读取一次Nodes列表。池内一致性与契约校验必须复用同一快照，
+    # 避免超大集群把逐节点查询放大为数百次Kubernetes API调用。
+    local node_snapshot_ready=0
+    if refresh_node_snapshot; then
+        node_snapshot_ready=1
     else
-        record_result "节点池与节点配置检查(池内一致性)" "WARN" "部分节点池内存在规格/标签/污点不一致，详见日志"
+        record_result "节点池与节点配置检查(池内一致性)" "FAIL" "Nodes API快照读取失败，未基于不完整数据继续"
+        record_result "节点组契约校验(规格/付费类型/污点)" "FAIL" "Nodes API快照读取失败，契约校验未执行"
+    fi
+
+    # 节点池和节点配置检查: 弹性池节点此时已拉起可见，全部读取本轮快照。
+    if [[ $node_snapshot_ready -eq 1 ]] && discover_and_check_nodes "$cloud_platform"; then
+        record_result "节点池与节点配置检查(池内一致性)" "PASS" "节点池归类与规格/标签/污点一致性通过；Nodes API读取1次"
+    elif [[ $node_snapshot_ready -eq 1 ]]; then
+        record_result "节点池与节点配置检查(池内一致性)" "WARN" "部分节点池内存在规格/标签/污点不一致，详见日志；Nodes API读取1次"
+    else
+        log_error "节点快照不可用，跳过节点池一致性明细，避免重复请求或使用不同时间点数据"
     fi
 
     # 节点组契约校验: 池实际规格/付费类型/污点 vs 池名声明。全程不阻断, 结果由函数内部登记。
-    check_nodepool_contract "$cloud_platform"
+    [[ $node_snapshot_ready -eq 1 ]] && check_nodepool_contract "$cloud_platform"
 
     # 对每个就绪节点池的 Pod 做双向网络连通性测试, 完成后清理探测资源。结果由函数内部登记。
     run_network_checks_per_pool
