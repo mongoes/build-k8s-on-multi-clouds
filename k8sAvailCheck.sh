@@ -1081,7 +1081,7 @@ discover_and_check_nodes() {
         if [[ -z "$nodepool_name" ]]; then
             nodepool_name="<未打nodepool标签>"
         fi
-        pool_nodes_map["$nodepool_name"]="${pool_nodes_map[$nodepool_name]} $node"
+        pool_nodes_map["$nodepool_name"]="${pool_nodes_map[$nodepool_name]:-} $node"
     done
 
     # -------- 仅当存在异常时才打印详情 --------
@@ -1371,7 +1371,7 @@ check_nodepool_contract() {
     for node in $all_node_names; do
         local np="${NODE_SNAPSHOT_NODEPOOL[$node]:-}"
         [[ -z "$np" ]] && np="<未打nodepool标签>"
-        pool_nodes_map["$np"]="${pool_nodes_map[$np]} $node"
+        pool_nodes_map["$np"]="${pool_nodes_map[$np]:-} $node"
     done
 
     # taint_bad: 污点错配(安全关键, 计入FAIL); has_warn: 规格/标签/对账类(计入WARN)
