@@ -67,7 +67,7 @@ AWS_NODEPOOL_READY_TIMEOUT=300
 AWS_NODEPOOL_CANCELLED_RC=10
 # 固定为当前本地权威auto_build_nodepool.sh的SHA256。发布OSS物料和主脚本时必须
 # 成对同步；任一端不匹配时安全阻断。
-AWS_AUTO_BUILD_NODEPOOL_SHA256="${AWS_AUTO_BUILD_NODEPOOL_SHA256:-a50006e043b7f5b588012f797115abb9afcbaa7de013bd9cca34d17ef9c01747}"
+AWS_AUTO_BUILD_NODEPOOL_SHA256="${AWS_AUTO_BUILD_NODEPOOL_SHA256:-3bd59dd3fe0e97e3307b0fa2c66aab6a36bd39900becb490b228c413d11b2823}"
 AWS_STORAGE_REPAIR_NEEDED=false
 AWS_STORAGE_REPAIR_REASONS=""
 AWS_CONSOLIDATION_CANDIDATES=""
@@ -99,8 +99,7 @@ IMAGE_PULL_FAIL_HINT="从 docker-ta.thinkingdata.cn 仓库拉取镜像失败，�
 #  - google(GKE)/aws(EKS): 无原生包年包月(reserved)实例,常驻节点运维可能命名为 reserved-*
 #                     或 od-*。故 4c32g/32c128g 两档各为"reserved 或 od 二选一"(用 | 分隔的
 #                     OR 组,组内任一别名可调度即算该档通过),spot-32c128g 唯一。
-#                     (注:AWS EKS 当前在 main 中经 auto_build_nodepool 提前 return,实际跑不到
-#                      节点池探测;此处一并定义以保持逻辑正确、未来若启用探测即生效。)
+#                     NodePool创建子脚本成功返回后继续本轮标准检查，因此AWS同样使用该OR契约。
 #  - 未覆盖云平台    : 用 google 风格的 od 三池兜底
 #  - 物理机/自建     : 不检查节点池(映射为空),仅起一个无 nodeSelector 的 Pod
 # OR 组语法: 同一档的多个候选用 | 连接(无空格),如 reserved-4c32g|od-4c32g;不同档用空格分隔。

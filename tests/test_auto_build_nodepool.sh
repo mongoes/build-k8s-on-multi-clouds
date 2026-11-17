@@ -105,6 +105,81 @@ main_order_log="$env_context_dir/main-order.log"
 ) || fail 'user environment rejection must be a distinct clean cancellation'
 [[ "$(tr '\n' ' ' <"$main_order_log")" == 'check-user connection resolve-environment confirm-environment ' ]] || fail 'environment confirmation must precede every operation branch'
 
+# The standalone builder owns only target confirmation, NodePool creation and
+# minimal object readiness.  Full scheduling/network/storage checks belong to
+# k8sAvailCheck.sh after the child returns successfully.
+creation_only_log="$env_context_dir/creation-only-main.log"
+(
+  source "$source_copy"
+  checkUser() { printf '%s\n' check-user >>"$creation_only_log"; }
+  test_k8s_connection() { printf '%s\n' connection >>"$creation_only_log"; }
+  resolve_target_eks_environment() { printf '%s\n' resolve-environment >>"$creation_only_log"; }
+  confirm_target_eks_environment() { printf '%s\n' confirm-environment >>"$creation_only_log"; return 0; }
+  check_eks_karpenter_status() { printf '%s\n' karpenter-preflight >>"$creation_only_log"; }
+  build_nodepool_for_business() {
+    printf '%s\n' build-nodepools >>"$creation_only_log"
+    NODEPOOL_NAMES=(od-4c32g spot-8c16g)
+  }
+  wait_nodepools_ready() {
+    printf 'wait-ready:%s\n' "$*" >>"$creation_only_log"
+  }
+  test_all_nodepools() { fail 'creation-only main must not run duplicate Pod/network availability checks'; }
+  taints_all_spot_nodepool() { fail 'creation-only main must not expose the old taint mutation branch'; }
+  read() { fail 'creation-only main must not display a second operation menu'; }
+  main
+) || fail 'main must complete the creation-only handoff flow'
+[[ "$(tr '\n' ' ' <"$creation_only_log")" == 'check-user connection resolve-environment confirm-environment karpenter-preflight build-nodepools wait-ready:od-4c32g spot-8c16g ' ]] ||
+  fail 'main must validate only the NodePools created in this invocation, in the expected order'
+
+# Minimal readiness follows each requested NodePool's actual nodeClassRef.  It
+# must not inspect an unrelated legacy pool and must not assume the class name
+# equals the NodePool name.
+ready_query_log="$env_context_dir/ready-query.log"
+(
+  source "$source_copy"
+  NODEPOOL_READY_TIMEOUT=5
+  sleep() { :; }
+  kubectl() {
+    printf '%s\n' "$*" >>"$ready_query_log"
+    case "$*" in
+    'get nodepool new-pool -o jsonpath={.status.conditions[?(@.type=="Ready")].status}') printf '%s' True ;;
+    'get nodepool new-pool -o jsonpath={.spec.template.spec.nodeClassRef.name}') printf '%s' shared-class ;;
+    'get ec2nodeclass shared-class -o jsonpath={.status.conditions[?(@.type=="Ready")].status}') printf '%s' True ;;
+    'get karpenter') printf '%s\n' 'NAME READY' 'new-pool True' ;;
+    *) return 1 ;;
+    esac
+  }
+  wait_nodepools_ready new-pool
+) || fail 'a requested NodePool and its referenced EC2NodeClass Ready=True must pass'
+grep -Fq 'get ec2nodeclass shared-class' "$ready_query_log" || fail 'readiness must verify the referenced EC2NodeClass'
+! grep -q 'legacy-pool' "$ready_query_log" || fail 'readiness must not inspect unrelated existing NodePools'
+
+# A failed readiness check is a normal function failure, not process
+# termination; main/parent callers need its return code to report precisely.
+ready_return_marker="$env_context_dir/ready-returned"
+(
+  source "$source_copy"
+  NODEPOOL_READY_TIMEOUT=1
+  sleep() { :; }
+  kubectl() {
+    case "$*" in
+    'get nodepool broken-pool -o jsonpath={.status.conditions[?(@.type=="Ready")].status}') printf '%s' False ;;
+    'get nodepool broken-pool -o jsonpath={.spec.template.spec.nodeClassRef.name}') printf '%s' broken-class ;;
+    'get ec2nodeclass broken-class -o jsonpath={.status.conditions[?(@.type=="Ready")].status}') printf '%s' False ;;
+    'get nodepool broken-pool -o jsonpath={.status.conditions[?(@.type=="Ready")].reason}') printf '%s' NotReady ;;
+    'get nodepool broken-pool -o jsonpath={.status.conditions[?(@.type=="Ready")].message}') printf '%s' waiting ;;
+    'get ec2nodeclass broken-class -o json') printf '%s' '{"status":{"conditions":[{"type":"Ready","status":"False","reason":"Waiting"}]}}' ;;
+    'get karpenter') return 0 ;;
+    *) return 1 ;;
+    esac
+  }
+  if wait_nodepools_ready broken-pool; then
+    fail 'a non-ready NodePool must fail readiness validation'
+  fi
+  : >"$ready_return_marker"
+) >/dev/null 2>&1 || true
+[[ -f "$ready_return_marker" ]] || fail 'readiness failure must return to its caller instead of exiting the process'
+
 run_create() {
   local nodepool_state="$1" names="$2" sizes="$3" billing="$4"
   local work="$tmp/$nodepool_state-$(date +%s%N)"
@@ -320,115 +395,18 @@ cluster_lookup_log="$tmp/cluster-lookup.log"
 )
 [[ ! -s "$cluster_lookup_log" ]] || fail 'missing kubeconfig cluster name must not call aws eks list-clusters'
 
-# Test resources must be isolated and failures must propagate to the caller.
-grep -q 'nodepool-test-run: \${RUN_ID}' "$SCRIPT" || fail 'test deployment must carry a per-run label'
-grep -q 'local TEST_SELECTOR=' "$SCRIPT" || fail 'test pod lookup must use the per-run selector'
-grep -q 'status.conditions\[?(@.type=="Ready")\].status' "$SCRIPT" || fail 'test must require Pod Ready rather than Running'
-grep -q 'kubectl exec "\$pod_name"' "$SCRIPT" || fail 'pod-to-host check must be non-interactive'
-! grep -q 'xargs kubectl patch deploy' "$SCRIPT" || fail 'cleanup must not bulk-patch nginx-test deployments'
-grep -q 'return 1' "$SCRIPT" || fail 'test failures must return nonzero'
+# The builder must not retain an independent Pod/network/taint test suite.
+# Those behaviors are owned by k8sAvailCheck.sh, which resumes after rc=0.
+! grep -q '^test_nodepool()' "$SCRIPT" || fail 'builder must not duplicate Pod scheduling checks'
+! grep -q '^test_all_nodepools()' "$SCRIPT" || fail 'builder must not duplicate the parent availability suite'
+! grep -q '^test_pod_to_executor()' "$SCRIPT" || fail 'builder must not duplicate network connectivity checks'
+! grep -q '^collect_nodepool_runtime_evidence()' "$SCRIPT" || fail 'builder must not maintain a second runtime evidence collector'
+! grep -q '^taints_all_spot_nodepool()' "$SCRIPT" || fail 'builder must not expose unrelated workload/taint mutation flows'
+! grep -q 'kind: Deployment' "$SCRIPT" || fail 'builder must not create availability-test Deployments'
+! grep -q 'kubectl exec' "$SCRIPT" || fail 'builder must not run Pod-level connectivity tests'
 ! grep -q 'node.k8s.te/managed-by' "$SCRIPT" || fail 'NodePool template must not add ownership labels'
 ! grep -q 'node.k8s.te/config-hash' "$SCRIPT" || fail 'NodePool template must not add configuration hash labels'
-
-# Pod-to-executor validation must preserve the historical business-port path,
-# but a new executor without a service/listener must not block NodePool success.
-reverse_probe_work="$tmp/reverse-probe"
-mkdir -p "$reverse_probe_work"
-(
-  cd "$reverse_probe_work"
-  source "$source_copy"
-  REVERSE_PROBE_IP=172.31.222.25
-  curl() {
-    [[ "$*" == *'172.31.222.25:19039/metrics'* ]] || return 1
-    printf 'historical-metrics\n'
-  }
-  kubectl() {
-    [[ "$*" == *'exec pod-a -n debug -- curl'*'172.31.222.25:19039/metrics'* ]] || return 1
-  }
-  test_pod_to_executor pod-a debug
-) || fail 'a locally healthy historical business endpoint must remain the preferred reverse-probe target'
-
-(
-  cd "$reverse_probe_work"
-  source "$source_copy"
-  REVERSE_PROBE_IP=172.31.222.25
-  REVERSE_PROBE_ENABLE_TEMPORARY_HTTP=false
-  curl() { return 1; }
-  command() {
-    [[ "$1" == -v && "$2" == python3 ]] && return 1
-    builtin command "$@"
-  }
-  if test_pod_to_executor pod-a debug; then
-    fail 'no business endpoint and no listener capability must report SKIP, not PASS'
-  else
-    reverse_probe_rc=$?
-  fi
-  [[ "$reverse_probe_rc" -eq 2 ]] || fail 'no business endpoint and no listener capability must return SKIP status 2'
-) || fail 'unavailable reverse-probe capability must not be treated as a NodePool failure'
-
-# When no automation override is supplied, an interactive operator can opt into
-# the temporary listener fallback; an explicit false remains a non-interactive SKIP.
-(
-  cd "$reverse_probe_work"
-  source "$source_copy"
-  unset REVERSE_PROBE_ENABLE_TEMPORARY_HTTP
-  read_tty_input() { printf -v "$1" '%s' y; }
-  should_start_temporary_reverse_probe
-) || fail 'interactive y must enable the temporary reverse-probe fallback'
-(
-  cd "$reverse_probe_work"
-  source "$source_copy"
-  REVERSE_PROBE_ENABLE_TEMPORARY_HTTP=false
-  read_tty_input() { fail 'explicit false must not prompt'; }
-  if should_start_temporary_reverse_probe; then
-    fail 'explicit false must skip the temporary reverse-probe fallback'
-  fi
-)
-
-! grep -q 'grep ta1 /etc/hosts' "$SCRIPT" || fail 'reverse probe must not assume the executor is named ta1'
-! grep -q 'nc -z' "$SCRIPT" || fail 'reverse probe must not require nc'
-grep -q 'should_start_temporary_reverse_probe' "$SCRIPT" || fail 'temporary listener must require an explicit operator decision'
-
-# Runtime evidence is an audit-only side effect: successful reads are persisted, but collection failures never fail availability.
-evidence_work="$tmp/runtime-evidence"
-mkdir -p "$evidence_work"
-(
-  cd "$evidence_work"
-  source "$source_copy"
-  NODEPOOL_EVIDENCE_DIR="$evidence_work/evidence"
-  AWS_DEFAULT_REGION=us-east-1
-  kubectl() {
-    case "$*" in
-    'get nodepool spot-4c32g --request-timeout=10s -o json') printf '%s' '{"metadata":{"name":"spot-4c32g"}}' ;;
-    'get ec2nodeclass spot-4c32g --request-timeout=10s -o json') printf '%s' '{"metadata":{"name":"spot-4c32g"}}' ;;
-    'get nodeclaims -l karpenter.sh/nodepool=spot-4c32g --request-timeout=10s -o json') printf '%s' '{"items":[{"metadata":{"name":"spot-claim","labels":{"node.kubernetes.io/instance-type":"r8a.xlarge","karpenter.sh/capacity-type":"spot","topology.kubernetes.io/zone":"us-east-1d"}},"status":{"providerID":"aws:///us-east-1d/i-0123456789abcdef0","conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
-    'get nodes -l karpenter.sh/nodepool=spot-4c32g --request-timeout=10s -o json') printf '%s' '{"items":[{"metadata":{"name":"ip-10-0-0-1","labels":{"node.kubernetes.io/instance-type":"r8a.xlarge","karpenter.sh/capacity-type":"spot","topology.kubernetes.io/zone":"us-east-1d"}},"spec":{"providerID":"aws:///us-east-1d/i-0123456789abcdef0"}}]}' ;;
-    *) return 1 ;;
-    esac
-  }
-  aws() {
-    [[ "$*" == *'ec2 describe-instances'* ]] || return 1
-    printf '%s' '{"Reservations":[{"Instances":[{"InstanceId":"i-0123456789abcdef0","SubnetId":"subnet-123","VpcId":"vpc-123","PrivateIpAddress":"10.0.0.1","PublicIpAddress":"1.2.3.4","InstanceLifecycle":"spot","Placement":{"AvailabilityZone":"us-east-1d"}}]}]}'
-  }
-  collect_nodepool_runtime_evidence spot-4c32g run-1
-) || fail 'successful runtime evidence collection must remain non-blocking'
-summary_file="$evidence_work/evidence/run-1/spot-4c32g/evidence-summary.txt"
-[[ -s "$summary_file" ]] || fail 'runtime evidence summary must be persisted'
-grep -q 'i-0123456789abcdef0' "$summary_file" || fail 'runtime evidence summary must include the EC2 instance ID'
-grep -q 'subnet-123' "$summary_file" || fail 'runtime evidence summary must include the EC2 subnet'
-
-(
-  cd "$evidence_work"
-  source "$source_copy"
-  NODEPOOL_EVIDENCE_DIR="$evidence_work/failing-evidence"
-  kubectl() { return 1; }
-  aws() { return 1; }
-  collect_nodepool_runtime_evidence spot-4c32g run-failed
-) || fail 'runtime evidence read failures must not fail NodePool availability'
-
-# The Deployment selector must match labels nested under the Pod template metadata.
-grep -q '^        app: nginx-test$' "$SCRIPT" || fail 'Pod template app label must be nested under metadata.labels'
-grep -q '^        nodepool-test-run: \${RUN_ID}$' "$SCRIPT" || fail 'Pod template run-id label must be nested under metadata.labels'
+grep -q '完整调度、网络、节点契约与存储检查由k8sAvailCheck.sh继续执行' "$SCRIPT" || fail 'standalone success must explain the full-check handoff'
 
 # NodePool discovery has one fail-closed JSON boundary: only a valid empty items array means zero NodePools.
 load_json_work="$tmp/load-nodepools"

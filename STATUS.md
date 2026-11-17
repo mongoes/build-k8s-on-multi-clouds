@@ -1,5 +1,14 @@
 # 项目状态
 
+## 2026-11-17：AWS NodePool创建脚本职责收敛已完成本地回归
+
+- `auto_build_nodepool.sh`继续作为可独立下载执行的AWS创建入口，但只负责目标EKS身份确认、Karpenter前置检查、NodePool/EC2NodeClass创建和本轮对象Ready回读。
+- 已删除子脚本中重复的测试Deployment、Pod双向网络、全量NodePool可用性、运行证据采集及spot污点治理路径；这些检查统一由`k8sAvailCheck.sh`在子脚本成功返回后继续执行，避免同一轮重复等待和重复判断。
+- 最小验收仅接受本轮创建的NodePool名称，并按`nodeClassRef.name`回读真实EC2NodeClass；无名称、对象未Ready或引用缺失均返回失败，不能用存量Ready对象冒充本轮成功。
+- 主脚本仍保留进程边界防护：校验创建前后Kubernetes目标未漂移、比较NodePool前后集合、只验收新增对象，然后进入节点规划、调度、网络、契约和存储完整检查。
+- 已更新主脚本内下载物料SHA256并通过配对校验。9组本地测试中8组PASS，Nodes快照行为测试因Mac Bash 3.2按既定规则SKIP；两个主脚本`bash -n`和`git diff --check`通过。
+- 下一步：在内部AWS EKS测试环境验证“创建子脚本rc=0后，同一次`k8sAvailCheck.sh`继续标准检查”，覆盖创建成功、取消、创建失败、无新增对象及新增对象未Ready；未完成该现场矩阵前不合并`main`。
+
 ## 2026-11-17：超大集群Nodes单次快照优化已完成Linux/EKS现场验收
 
 - 已实施：弹性节点池探测结束后仅执行一次`kubectl get nodes -o json`，保存原始证据并规范化到按节点名索引的内存快照；节点池内一致性、节点组契约及节点全局概览复用同一时刻数据，不再逐节点请求API。

@@ -1,24 +1,20 @@
 #!/bin/bash
-#适用于AWS EKS环境创建节点组以及可用性检查
+# 适用于 AWS EKS 环境创建或补充 Karpenter NodePool。
+# 本脚本只负责目标身份确认、资源创建和 NodePool/EC2NodeClass Ready 回读；
+# 调度、网络、节点契约与存储等完整可用性检查统一由 k8sAvailCheck.sh 执行。
 
 # ========== 基础环境参数配置部分 ==========
 # 定义临时目录，用于存放节点组测试日志以及配置文件
 OUTPUT_DIR="nodepool_configs"
 mkdir -p "$OUTPUT_DIR"
 #日志文件
-LOG_FILE="${OUTPUT_DIR}/aws_eks_nodepool_test.log"
-#命名空间
-NAMESPACE="debug"
-#镜像地址1
-NGINX_IMAGE="nginx:1.20"
-#镜像地址2
-NGINX_IMAGE_CN="docker-ta.thinkingdata.cn/te/nginx:1.20"
+LOG_FILE="${OUTPUT_DIR}/aws_eks_nodepool_build.log"
 # Karpenter只在多个NodePool都兼容同一Pending Pod时比较weight；Spot优先，
 # 不可用或达到限制时允许回退到较低权重的On-Demand池。
 ON_DEMAND_NODEPOOL_WEIGHT=10
 SPOT_NODEPOOL_WEIGHT=100
 # 供父级就绪性检查脚本区分“管理员主动取消”和“执行失败”。该退出码只表示
-# 未执行任何节点组创建/测试/污点变更，不能被转换为成功。
+# 未执行任何节点组创建，不能被转换为成功。
 NODEPOOL_CANCELLED_RC=10
 
 # 颜色定义
@@ -151,7 +147,7 @@ confirm_target_eks_environment() {
     case "$confirmation" in
     y | Y) return 0 ;;
     n | N)
-      echo "已取消，未执行节点组创建、测试或污点操作。"
+      echo "已取消，未执行节点组创建。"
       return 2
       ;;
     *) log_error "输入无效，只允许输入 y 或 n，请重新确认目标环境。" ;;
@@ -633,812 +629,73 @@ EOF
   echo ""
 }
 
-#根据 Pod 解析其顶层工作负载控制器,输出格式 "kind name"(如 Deployment trino-worker-ch-default)
-#Pod -> ownerReferences: 若为 ReplicaSet 则继续上溯到 Deployment;StatefulSet/DaemonSet 等直接返回
-resolve_workload() {
-  local ns=$1 pod=$2
-  local owner_kind owner_name
-  owner_kind=$(kubectl get pod "$pod" -n "$ns" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null)
-  owner_name=$(kubectl get pod "$pod" -n "$ns" -o jsonpath='{.metadata.ownerReferences[0].name}' 2>/dev/null)
-  if [ "$owner_kind" == "ReplicaSet" ]; then
-    local rs_owner_kind rs_owner_name
-    rs_owner_kind=$(kubectl get rs "$owner_name" -n "$ns" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null)
-    rs_owner_name=$(kubectl get rs "$owner_name" -n "$ns" -o jsonpath='{.metadata.ownerReferences[0].name}' 2>/dev/null)
-    if [ -n "$rs_owner_kind" ]; then
-      echo "$rs_owner_kind $rs_owner_name"
-      return
-    fi
-  fi
-  [ -n "$owner_kind" ] && echo "$owner_kind $owner_name"
-}
 
-#为指定工作负载的 .spec.template.spec.tolerations 严谨地追加目标容忍
-#入参: kind name ns key value effect
-#策略: 1.完全匹配则幂等跳过; 2.无任何容忍则新建; 3.已有容忍且无同key则追加; 4.已有同key但不同value则人工确认
-add_toleration_to_workload() {
-  local kind=$1 name=$2 ns=$3 key=$4 value=$5 effect=$6
-
-  local existing_tol
-  existing_tol=$(kubectl get "$kind" "$name" -n "$ns" -o jsonpath='{.spec.template.spec.tolerations}' 2>/dev/null)
-  [ -z "$existing_tol" ] && existing_tol="[]"
-
-  # 情况1: 已存在完全匹配(key+value+effect)的容忍 -> 幂等跳过
-  local fully_tolerated
-  fully_tolerated=$(echo "$existing_tol" | jq --arg k "$key" --arg v "$value" --arg e "$effect" \
-    'any(.[]; .key==$k and ((.value // "")==$v) and ((.effect // "")==$e))')
-  if [ "$fully_tolerated" == "true" ]; then
-    echo "  ${ns}/${kind}/${name} 已容忍目标污点,跳过。"
-    return 0
-  fi
-
-  # 情况4: 已存在同 key 但 value 不同的容忍 -> 人工确认后再追加
-  local same_key_diff_value
-  same_key_diff_value=$(echo "$existing_tol" | jq --arg k "$key" --arg v "$value" \
-    'any(.[]; .key==$k and ((.value // "")!=$v))')
-  if [ "$same_key_diff_value" == "true" ]; then
-    echo -e "\e[33m\e[1m  ${ns}/${kind}/${name} 已存在 key=${key} 但 value 不同的容忍:\e[0m"
-    echo "$existing_tol" | jq -c --arg k "$key" '.[] | select(.key==$k)' | sed 's/^/        /'
-    local confirm_diff
-    read -p "  是否仍要为其追加 value=${value} 的容忍?(保留原有容忍) <y/n> " confirm_diff </dev/tty
-    confirm_diff=$(echo "$confirm_diff" | tr '[:upper:]' '[:lower:]')
-    if [ "$confirm_diff" != "y" ]; then
-      echo "  已跳过 ${ns}/${kind}/${name}。"
-      return 0
-    fi
-  fi
-
-  # 情况2/3: 在原有容忍数组(可能为空)基础上追加目标容忍,整体写回,保证不丢失原有容忍
-  local merged_tol patch
-  merged_tol=$(echo "$existing_tol" | jq -c --arg k "$key" --arg v "$value" --arg e "$effect" \
-    '. + [{"key":$k,"operator":"Equal","value":$v,"effect":$e}]')
-  patch=$(jq -nc --argjson tol "$merged_tol" '{"spec":{"template":{"spec":{"tolerations":$tol}}}}')
-  if kubectl patch "$kind" "$name" -n "$ns" --type merge -p "$patch" >/dev/null 2>&1; then
-    echo -e "\e[32m\e[1m  成功为 ${ns}/${kind}/${name} 追加容忍。\e[0m"
-  else
-    log_error "  为 ${ns}/${kind}/${name} 追加容忍失败,请人工检查。"
-  fi
-}
-
-#判断指定工作负载控制器的 .spec.template.spec.tolerations 是否已容忍目标污点。
-#口径与Pod级判定完全一致(effect匹配 + Exists/Equal 两种operator)。
-#入参: kind name ns key value;返回: 已容忍输出"true",否则"false"
-workload_tolerates_taint() {
-  local kind=$1 name=$2 ns=$3 key=$4 value=$5
-  local tol
-  tol=$(kubectl get "$kind" "$name" -n "$ns" -o jsonpath='{.spec.template.spec.tolerations}' 2>/dev/null)
-  [ -z "$tol" ] && tol="[]"
-  echo "$tol" | jq -r --arg k "$key" --arg v "$value" '
-    (any(.[];
-      (.effect == null or .effect == "" or .effect == "NoSchedule")
-      and (
-        (.operator == "Exists" and (.key == null or .key == "" or .key == $k))
-        or ((.operator == "Equal" or .operator == null) and .key == $k and .value == $v)
-      )
-    )) | tostring'
-}
-
-#找出"必须容忍spot污点但其控制器当前未容忍"的关键服务【工作负载控制器】,输出多行 "ns kind name"(已去重)。
-#为何以【控制器】而非Pod为单位判定容忍:
-#  补容忍是patch到控制器(Deployment等)的;但存量Pending旧Pod的spec.tolerations是陈旧的、不会更新,
-#  若仍按Pod判容忍,会在"刚补完容忍+存量旧Pod还在"的窗口期持续误报缺容忍。改为校验控制器模板即可彻底闭环。
-#关键: 两类服务识别口径【完全不同】,必须分别处理,否则会漏检!
-#  1) trino-worker: deployment控制器,无通用标签 -> 只能按Pod名关键字匹配,再溯源控制器
-#  2) starrocks-cn: 控制器/Pod带确定标签 app.kubernetes.io/name=starrocks 且 app.kubernetes.io/component=cn
-#                   其Pod名通常形如 <cluster>-cn-N,并不包含"starrocks-cn"字样,故【必须】用标签匹配,不能用名称grep
-#入参: key value (目标spot污点的 key/value)
-find_untolerated_critical_workloads() {
-  local k=$1 v=$2
-
-  # 第一步: 收集候选关键服务Pod(此处【不】按Pod级容忍过滤,只负责命中关键服务),输出 ns/pod
-  local candidate_pods
-  candidate_pods=$(
-    # 1) trino-worker: 按Pod名关键字匹配(无通用标签)
-    kubectl get pods -A -o json 2>/dev/null |
-      jq -r '.items[] | select(.metadata.name | contains("trino-worker")) | "\(.metadata.namespace)/\(.metadata.name)"'
-    # 2) starrocks-cn: 按确定标签精确匹配(Pod名通常不含starrocks-cn,必须用标签)
-    kubectl get pods -A -l app.kubernetes.io/name=starrocks,app.kubernetes.io/component=cn -o json 2>/dev/null |
-      jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)"'
-  )
-  candidate_pods=$(echo "$candidate_pods" | grep -v '^$' | sort -u)
-  [ -z "$candidate_pods" ] && return 0
-
-  # 第二步: 候选Pod溯源到顶层控制器并去重(避免同一控制器多Pod重复判定)
-  local resolved="" line ns pod workload
-  while read -r line; do
-    [ -z "$line" ] && continue
-    ns="${line%%/*}"
-    pod="${line#*/}"
-    workload=$(resolve_workload "$ns" "$pod")
-    [ -n "$workload" ] && resolved="${resolved}${ns} ${workload}"$'\n'
-  done <<<"$candidate_pods"
-  resolved=$(echo "$resolved" | grep -v '^$' | sort -u)
-  [ -z "$resolved" ] && return 0
-
-  # 第三步: 在【控制器】层校验容忍,只输出尚未容忍目标污点的控制器
-  local rkind rname
-  while read -r ns rkind rname; do
-    [ -z "$rkind" ] && continue
-    if [ "$(workload_tolerates_taint "$rkind" "$rname" "$ns" "$k" "$v")" != "true" ]; then
-      echo "$ns $rkind $rname"
-    fi
-  done <<<"$resolved"
-}
-
-#对"未容忍目标spot污点的关键服务【控制器】"统一处理: 打印 -> 人工确认 -> 安全幂等地追加容忍。
-#入参已是去重后的控制器列表(ns kind name),溯源/容忍校验已在 find_untolerated_critical_workloads 完成。
-#入参: critical_workloads(多行 "ns kind name") key value effect
-handle_critical_untolerated() {
-  local critical_workloads=$1 key=$2 value=$3 effect=$4
-
-  #按 ns/kind/name 友好打印
-  echo "$critical_workloads" | awk '{print "  - "$1"/"$2"/"$3}'
-  echo ""
-
-  local confirm_tol
-  read -p "是否要为上述关键服务自动追加对 ${key}=${value}:${effect} 的容忍策略?(作用于其工作负载控制器,安全幂等) <y/n> " confirm_tol
-  confirm_tol=$(echo "$confirm_tol" | tr '[:upper:]' '[:lower:]')
-  if [ "$confirm_tol" != "y" ]; then
-    echo -e "\e[33m\e[1m已选择不自动追加容忍。请确认这些关键服务有承载能力或手动补充容忍后再决定后续操作。\e[0m"
-    echo ""
-    return 0
-  fi
-
-  echo "开始为关键服务追加容忍(作用于顶层工作负载控制器,避免Pod重建后丢失)..."
-  #控制器已去重,逐个追加容忍(格式: ns kind name)
-  local ns kind name
-  while read -r ns kind name; do
-    [ -z "$kind" ] && continue
-    add_toleration_to_workload "$kind" "$name" "$ns" "$key" "$value" "$effect"
-  done <<<"$critical_workloads"
-  echo -e "\e[33m\e[1m容忍追加处理完成。Tips: 容忍已写入控制器模板,存量Pod需重建(滚动重启)后才会真正应用新容忍。\e[0m"
-  echo ""
-}
-
-#找出所有spot类型节点组,并patch上污点。
-#前提:1.确认存在可用的on-demand节点组承载无容忍Pod; 2.执行前需人工确认; 3.执行前打印受影响Pod范围。
-#在节点组创建与可用性检查完成后于主流程末尾调用。
-taints_all_spot_nodepool() {
-  # 步骤1: 找出所有包含 karpenter.sh/capacity-type = spot 的 NodePool
-  echo "正在查找所有Spot类型的Karpenter NodePool..."
-
-  # 期望追加的污点(key/value/effect)
-  local TAINT_KEY="node.k8s.te/billing-mode"
-  local TAINT_VALUE="spot"
-  local TAINT_EFFECT="NoSchedule"
-
-  # trino-worker、starrocks-cn 这类计算服务必须运行在 spot 节点上,因此它们【必须】已配置对该 spot 污点的容忍;
-  # 若缺少容忍,打污点后将被拒绝调度。两者识别口径不同(见 find_untolerated_critical_workloads),由该函数统一负责检测。
-
-  # 找出所有 spot 类型节点池(仅用于判断"是否存在spot池"以及全部已就绪的提示)
-  local all_spot_nodepools
-  all_spot_nodepools=$(kubectl get nodepools.karpenter.sh -o json | jq -r '
-  .items[] |
-  select(
-    .spec.template.spec.requirements[]? |
-    select(.key == "karpenter.sh/capacity-type" and (.values[]? == "spot"))
-  ) |
-  .metadata.name
-')
-
-  if [ -z "$all_spot_nodepools" ]; then
-    echo "未找到任何符合条件的Spot类型NodePool,当前环境无需变更！"
-    return 0
-  fi
-
-  # 真正需要处理的是"spot类型 且 尚未打上目标污点"的节点池。
-  # 注意: 必须显式检查 .spec.template.spec.taints 是否已含 key+value+effect 完全匹配的污点,
-  # 否则会把已打污点的 spot 池也误判为"未打污点"。
-  spot_nodepools=$(kubectl get nodepools.karpenter.sh -o json | jq -r \
-    --arg k "$TAINT_KEY" --arg v "$TAINT_VALUE" --arg e "$TAINT_EFFECT" '
-  .items[] |
-  select(
-    .spec.template.spec.requirements[]? |
-    select(.key == "karpenter.sh/capacity-type" and (.values[]? == "spot"))
-  ) |
-  select(
-    ((.spec.template.spec.taints // []) | any(
-      .key == $k and ((.value // "") == $v) and ((.effect // "") == $e)
-    )) | not
-  ) |
-  .metadata.name
-')
-
-  # 所有 spot 池均已打目标污点,无需再追加污点;但仍需校验关键服务(trino-worker/starrocks-cn)是否都已有容忍
-  if [ -z "$spot_nodepools" ]; then
-    echo -e "\e[32m\e[1m检测到的所有【spot类型节点池】均已打上目标污点(${TAINT_KEY}=${TAINT_VALUE}:${TAINT_EFFECT})。\e[0m"
-    echo "当前spot类型节点池列表:"
-    echo "$all_spot_nodepools" | sed 's/^/  - /'
-    echo ""
-
-    #即便污点已就位,关键服务若缺容忍仍是隐患。以【控制器】为单位检测(规避存量Pending旧Pod导致的窗口期误报)
-    local affected_critical
-    affected_critical=$(find_untolerated_critical_workloads "$TAINT_KEY" "$TAINT_VALUE")
-
-    if [ -z "$affected_critical" ]; then
-      echo -e "\e[32m\e[1m当前环境非常标准，所有spot节点池都已有污点，trino-worker/starrocks-cn等需要spot节点的服务(其控制器)都有容忍策略，无需任何变更！\e[0m"
-    else
-      echo -e "\e[31m\e[1m注意:spot污点虽已就位,但以下【必须容忍spot污点】的关键服务【其控制器未配置容忍策略】,可能无法调度到spot节点:\e[0m"
-      #复用统一处理: 打印 -> 人工确认 -> 安全幂等追加容忍(溯源/容忍校验已在检测函数完成)
-      handle_critical_untolerated "$affected_critical" "$TAINT_KEY" "$TAINT_VALUE" "$TAINT_EFFECT"
-    fi
-    return 0
-  fi
-
-  echo -e "\e[31m\e[1m检测到以下【spot类型节点池】当前【未打污点】,需重点关注:\e[0m"
-  echo -e "\e[31m\e[1m$spot_nodepools\e[0m"
-  echo ""
-
-  # 在执行 on-demand 节点池检查与受影响服务确认前,先做整体说明,让用户理解后续两步的目的
-  echo -e "为了避免spot池打污点操作影响到未有容忍策略的服务，现开始检查环境：要求必须存在on-demand节点池承载服务、打印未有容忍的服务列表要求人工确认影响"
-  echo ""
-
-  # ===== 前提1: 确认存在可用的 on-demand 类型节点组 =====
-  # spot 节点组打 NoSchedule 后,无对应容忍的 Pod 需要 on-demand 节点承载;若无 on-demand 节点组则放弃操作
-  local ondemand_nodepools
-  ondemand_nodepools=$(kubectl get nodepools.karpenter.sh -o json | jq -r '
-  .items[] |
-  select(
-    .spec.template.spec.requirements[]? |
-    select(.key == "karpenter.sh/capacity-type" and (.values[]? == "on-demand"))
-  ) |
-  .metadata.name
-')
-  if [ -z "$ondemand_nodepools" ]; then
-    log_error "未检测到任何 on-demand 类型节点组,为避免无对应容忍的 Pod 无处调度,已跳过 spot 节点组污点追加。"
-    return 0
-  fi
-  echo "确认存在 on-demand 类型节点组(可承载无对应容忍的 Pod):"
-  echo "$ondemand_nodepools"
-  echo ""
-
-  # ===== 前提3: 打印受影响的 Pod =====
-  # NoSchedule 不驱逐存量 Pod,但加污点后,凡是没有匹配该污点容忍(toleration)的 Pod 都将无法再调度到 spot 节点,视为理论受影响范围
-  local affected_pods
-  affected_pods=$(kubectl get pods -A -o json | jq -r --arg k "$TAINT_KEY" --arg v "$TAINT_VALUE" '
-    .items[]
-    | select(
-        ((.spec.tolerations // []) | any(
-          (.effect == null or .effect == "" or .effect == "NoSchedule")
-          and (
-            (.operator == "Exists" and (.key == null or .key == "" or .key == $k))
-            or ((.operator == "Equal" or .operator == null) and .key == $k and .value == $v)
-          )
-        )) | not
-      )
-    | "\(.metadata.namespace)/\(.metadata.name)"
-  ')
-  echo "确认以下 Pod 无对应容忍,加污点后将无法调度到 spot 节点(理论受影响范围):"
-  if [ -z "$affected_pods" ]; then
-    echo "  (无:当前所有 Pod 均已容忍该污点)"
-  else
-    echo "$affected_pods" | sed 's/^/  - /'
-    echo "受影响 Pod 总数: $(echo "$affected_pods" | grep -c .)"
-  fi
-  echo ""
-
-  # ===== 关键服务容忍策略校验 =====
-  # 以【控制器】为单位检测(trino-worker按名/starrocks-cn按标签 -> 溯源控制器 -> 校验控制器模板容忍),
-  # 既规避 starrocks-cn 因Pod名不含关键字漏检,又规避存量Pending旧Pod导致的"补完容忍仍误报"窗口期问题。
-  local critical_workloads
-  critical_workloads=$(find_untolerated_critical_workloads "$TAINT_KEY" "$TAINT_VALUE")
-  if [ -n "$critical_workloads" ]; then
-    echo -e "\e[31m\e[1m================================ 重点警告 ================================\e[0m"
-    echo -e "\e[31m\e[1m检测到以下【必须容忍spot污点】的关键服务(trino-worker/starrocks-cn)【其控制器未配置容忍策略】,加污点后将被拒绝调度:\e[0m"
-    echo -e "\e[31m\e[1m=========================================================================\e[0m"
-    echo ""
-    #复用统一处理: 打印 -> 人工确认 -> 安全幂等追加容忍
-    handle_critical_untolerated "$critical_workloads" "$TAINT_KEY" "$TAINT_VALUE" "$TAINT_EFFECT"
-  fi
-
-  # ===== 前提2: 需要人工确认 =====
-  local confirm_taint
-  read -p "以上为受影响范围。确认要为上述 spot 节点组追加 ${TAINT_KEY}=${TAINT_VALUE}:${TAINT_EFFECT} 污点吗? <y/n> " confirm_taint
-  confirm_taint=$(echo "$confirm_taint" | tr '[:upper:]' '[:lower:]')
-  if [ "$confirm_taint" != "y" ]; then
-    echo "已取消 spot 节点组污点追加操作。"
-    return 0
-  fi
-
-  # 步骤2: 为找到的每个NodePool幂等地追加污点
-  for nodepool in $spot_nodepools; do
-    echo "正在处理 NodePool: $nodepool"
-
-    # 读取该节点组现有的 taints 数组(可能为空)
-    local existing_taints
-    existing_taints=$(kubectl get nodepools.karpenter.sh "$nodepool" \
-      -o jsonpath='{.spec.template.spec.taints}' 2>/dev/null)
-    if [ -z "$existing_taints" ]; then
-      existing_taints="[]"
-    fi
-
-    # 幂等判断:若相同 key+value+effect 的污点已存在则跳过,避免重复写入
-    local already_exists
-    already_exists=$(echo "$existing_taints" | jq --arg k "$TAINT_KEY" --arg v "$TAINT_VALUE" --arg e "$TAINT_EFFECT" \
-      'any(.[]; .key == $k and .value == $v and .effect == $e)')
-    if [ "$already_exists" == "true" ]; then
-      echo "NodePool $nodepool 已存在目标污点,跳过。"
-      echo "---"
-      continue
-    fi
-
-    # 读-改-写:在现有 taints 基础上追加目标污点,保留原有其他污点,再整体写回。
-    # 因 NodePool 为 CRD,strategic merge 对数组通常不可用(缺少 patchMergeKey),
-    # 故这里显式构造完整的 taints 数组,用 merge patch 整体替换,从而保证"不丢失现有污点"。
-    local merged_taints
-    merged_taints=$(echo "$existing_taints" | jq -c --arg k "$TAINT_KEY" --arg v "$TAINT_VALUE" --arg e "$TAINT_EFFECT" \
-      '. + [{"key": $k, "value": $v, "effect": $e}]')
-
-    local TAINT_PATCH
-    TAINT_PATCH=$(jq -nc --argjson taints "$merged_taints" \
-      '{"spec": {"template": {"spec": {"taints": $taints}}}}')
-
-    kubectl patch nodepools.karpenter.sh "$nodepool" --type merge -p "$TAINT_PATCH"
-
-    if [ $? -eq 0 ]; then
-      echo "成功为 $nodepool 追加污点。"
-    else
-      echo "为 $nodepool 打污点时出错。"
-    fi
-    echo "---"
-  done
-  echo "操作完成。"
-}
-
-# 尽力采集 NodePool -> NodeClaim -> Node -> EC2 运行证据，仅供事后审计。
-# 任一读取或写盘失败只记录 WARN，绝不改变既有可用性测试结论。
-collect_nodepool_runtime_evidence() {
-  local nodepool_name=$1 run_id=$2
-  local evidence_root="${NODEPOOL_EVIDENCE_DIR:-./nodepool_evidence}"
-  local evidence_dir="${evidence_root}/${run_id}/${nodepool_name}"
-  local warnings_file="${evidence_dir}/collection-warnings.txt"
-  local complete=true instance_ids="" instance_id
-
-  if ! mkdir -p "$evidence_dir" 2>/dev/null; then
-    echo "[WARN] 无法创建NodePool运行证据目录 ${evidence_dir}，不影响本轮可用性结论。"
-    return 0
-  fi
-  : >"$warnings_file" 2>/dev/null || {
-    echo "[WARN] 无法创建NodePool运行证据告警文件 ${warnings_file}，不影响本轮可用性结论。"
-    return 0
-  }
-
-  capture_evidence_command() {
-    local output_file=$1 description=$2
-    shift 2
-    if ! "$@" >"${evidence_dir}/${output_file}" 2>"${evidence_dir}/${output_file}.error"; then
-      complete=false
-      printf '[WARN] %s读取失败；原始错误见 %s.error\n' "$description" "$output_file" >>"$warnings_file" 2>/dev/null || true
-      return 0
-    fi
-    rm -f "${evidence_dir}/${output_file}.error" 2>/dev/null || true
-    return 0
-  }
-
-  capture_evidence_command nodepool.json "NodePool ${nodepool_name}" kubectl get nodepool "$nodepool_name" --request-timeout=10s -o json
-  capture_evidence_command ec2nodeclass.json "EC2NodeClass ${nodepool_name}" kubectl get ec2nodeclass "$nodepool_name" --request-timeout=10s -o json
-  capture_evidence_command nodeclaims.json "NodeClaim集合 ${nodepool_name}" kubectl get nodeclaims -l "karpenter.sh/nodepool=${nodepool_name}" --request-timeout=10s -o json
-  capture_evidence_command nodes.json "Node集合 ${nodepool_name}" kubectl get nodes -l "karpenter.sh/nodepool=${nodepool_name}" --request-timeout=10s -o json
-
-  if [[ -s "${evidence_dir}/nodeclaims.json" || -s "${evidence_dir}/nodes.json" ]]; then
-    instance_ids=$(
-      {
-        jq -r '.items[]? | (.status.providerID // .spec.providerID // empty)' "${evidence_dir}/nodeclaims.json" 2>/dev/null || true
-        jq -r '.items[]? | (.spec.providerID // empty)' "${evidence_dir}/nodes.json" 2>/dev/null || true
-      } | sed -n 's#^aws:///[^/]*/\(i-[0-9a-fA-F]*\)$#\1#p' | sort -u
-    )
-  fi
-  if [[ -n "$instance_ids" ]]; then
-    local -a instance_id_args=()
-    while IFS= read -r instance_id; do
-      [[ -n "$instance_id" ]] && instance_id_args+=("$instance_id")
-    done <<<"$instance_ids"
-    capture_evidence_command ec2-instances.json "EC2实例 ${instance_ids//$'\n'/,}" aws ec2 describe-instances --instance-ids "${instance_id_args[@]}" --output json --cli-connect-timeout 5 --cli-read-timeout 10
-  else
-    complete=false
-    printf '%s\n' '{"Reservations":[]}' >"${evidence_dir}/ec2-instances.json" 2>/dev/null || true
-    printf '[WARN] 未从NodeClaim/Node解析到EC2 InstanceId。\n' >>"$warnings_file" 2>/dev/null || true
-  fi
-
-  {
-    echo "NodePool运行证据摘要"
-    echo "RUN_ID=${run_id}"
-    echo "NODEPOOL=${nodepool_name}"
-    echo "COLLECTED_AT=$(date '+%Y-%m-%dT%H:%M:%S%z')"
-    echo "--- NodeClaims ---"
-    jq -r '.items[]? | [(.metadata.name // "UNKNOWN"), (.status.providerID // .spec.providerID // "UNKNOWN"), (.metadata.labels["node.kubernetes.io/instance-type"] // "UNKNOWN"), (.metadata.labels["karpenter.sh/capacity-type"] // "UNKNOWN"), (.metadata.labels["topology.kubernetes.io/zone"] // "UNKNOWN"), ([.status.conditions[]? | select(.type == "Ready") | .status][0] // "UNKNOWN")] | @tsv' "${evidence_dir}/nodeclaims.json" 2>/dev/null || echo "UNKNOWN"
-    echo "--- Nodes ---"
-    jq -r '.items[]? | [(.metadata.name // "UNKNOWN"), (.spec.providerID // "UNKNOWN"), (.metadata.labels["node.kubernetes.io/instance-type"] // "UNKNOWN"), (.metadata.labels["karpenter.sh/capacity-type"] // "UNKNOWN"), (.metadata.labels["topology.kubernetes.io/zone"] // "UNKNOWN")] | @tsv' "${evidence_dir}/nodes.json" 2>/dev/null || echo "UNKNOWN"
-    echo "--- EC2 Instances ---"
-    jq -r '.Reservations[]?.Instances[]? | [(.InstanceId // "UNKNOWN"), (.InstanceType // "UNKNOWN"), (.InstanceLifecycle // "on-demand"), (.Placement.AvailabilityZone // "UNKNOWN"), (.SubnetId // "UNKNOWN"), (.VpcId // "UNKNOWN"), (.PrivateIpAddress // "UNKNOWN"), (.PublicIpAddress // "NONE")] | @tsv' "${evidence_dir}/ec2-instances.json" 2>/dev/null || echo "UNKNOWN"
-  } >"${evidence_dir}/evidence-summary.txt" 2>/dev/null || {
-    complete=false
-    printf '[WARN] evidence-summary.txt写入失败。\n' >>"$warnings_file" 2>/dev/null || true
-  }
-
-  if $complete; then
-    echo "[AUDIT] NodePool运行证据已保存: ${evidence_dir}"
-  else
-    echo "[WARN] NodePool运行证据采集不完整，不影响本轮可用性结论: ${evidence_dir}"
-  fi
-  return 0
-}
-
-# 返回执行机用于接收 Pod 反向探测的私网 IPv4。可用 REVERSE_PROBE_IP 显式覆盖，
-# 自动发现仅使用本机默认路由的 source IP；绝不假设执行机名称为 ta1。
-resolve_reverse_probe_ip() {
-  local candidate="${REVERSE_PROBE_IP:-}"
-  if [[ -z "$candidate" ]]; then
-    candidate=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')
-  fi
-  if ! awk -F. 'NF == 4 && $1 >= 0 && $1 <= 255 && $2 >= 0 && $2 <= 255 && $3 >= 0 && $3 <= 255 && $4 >= 0 && $4 <= 255 && ($1 == 10 || ($1 == 172 && $2 >= 16 && $2 <= 31) || ($1 == 192 && $2 == 168)) { exit 0 } { exit 1 }' <<<"$candidate"; then
-    return 1
-  fi
-  printf '%s\n' "$candidate"
-}
-
-# 历史 ta 场景优先复用已有 metrics 服务；本机 HTTP 成功是使用该端口的前提。
-find_existing_reverse_probe_url() {
-  local target_ip="$1" candidate_port
-  for candidate_port in 19039 9100; do
-    if curl --noproxy '*' -fsS -m 2 "http://${target_ip}:${candidate_port}/metrics" >/dev/null 2>&1; then
-      REVERSE_PROBE_URL="http://${target_ip}:${candidate_port}/metrics"
-      REVERSE_PROBE_MODE="existing-business-port"
-      return 0
-    fi
-  done
-  return 1
-}
-
-# 自动化可用REVERSE_PROBE_ENABLE_TEMPORARY_HTTP=true/false显式控制；人工菜单
-# 未设置该变量时，历史业务端口失败后询问一次是否尝试临时监听。拒绝、超时或非TTY为SKIP。
-should_start_temporary_reverse_probe() {
-  local confirmation=""
-  if [[ -n "${REVERSE_PROBE_ENABLE_TEMPORARY_HTTP+x}" ]]; then
-    [[ "$REVERSE_PROBE_ENABLE_TEMPORARY_HTTP" == "true" ]]
-    return
-  fi
-  if ! read_tty_input confirmation "未发现执行机19039/9100业务端口。是否启动随机临时HTTP Probe进行Pod反向验证？不安装工具、不修改安全组；仅在已确认本轮端口放通时输入 y <y/n>: "; then
-    return 1
-  fi
-  [[ "$confirmation" == "y" || "$confirmation" == "Y" ]]
-}
-
-# 新执行机没有业务端口时，仅复用已存在的 python3 启动一次性临时 HTTP Probe。
-# 不安装软件、不自动修改安全组；未获同意、无法启动或本机自检失败由调用方标记为 SKIP。
-start_temporary_reverse_probe() {
-  local target_ip="$1" attempts=0 local_response
-  should_start_temporary_reverse_probe || return 1
-  command -v python3 >/dev/null 2>&1 || return 1
-
-  REVERSE_PROBE_PORT=$((20000 + RANDOM % 10000))
-  REVERSE_PROBE_TOKEN="nodepool-reverse-probe-${RANDOM}-$(date +%s)"
-  REVERSE_PROBE_LOG=$(mktemp "${TMPDIR:-/tmp}/nodepool-reverse-probe.XXXXXX") || return 1
-  python3 -c '
-import http.server
-import sys
-
-bind_ip, port, token = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/healthz":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(token.encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
-    def log_message(self, format, *args):
-        pass
-http.server.ThreadingHTTPServer((bind_ip, port), Handler).serve_forever()
-' "$target_ip" "$REVERSE_PROBE_PORT" "$REVERSE_PROBE_TOKEN" >"$REVERSE_PROBE_LOG" 2>&1 &
-  REVERSE_PROBE_PID=$!
-
-  while [[ $attempts -lt 5 ]]; do
-    local_response=$(curl --noproxy '*' -fsS -m 2 "http://${target_ip}:${REVERSE_PROBE_PORT}/healthz" 2>/dev/null) || true
-    [[ "$local_response" == "$REVERSE_PROBE_TOKEN" ]] && {
-      REVERSE_PROBE_URL="http://${target_ip}:${REVERSE_PROBE_PORT}/healthz"
-      REVERSE_PROBE_MODE="temporary-http-probe"
-      return 0
-    }
-    sleep 1
-    attempts=$((attempts + 1))
-  done
-  stop_temporary_reverse_probe
-  return 1
-}
-
-stop_temporary_reverse_probe() {
-  [[ -n "${REVERSE_PROBE_PID:-}" ]] && kill "$REVERSE_PROBE_PID" >/dev/null 2>&1 || true
-  [[ -n "${REVERSE_PROBE_PID:-}" ]] && wait "$REVERSE_PROBE_PID" 2>/dev/null || true
-  [[ -n "${REVERSE_PROBE_LOG:-}" ]] && rm -f "$REVERSE_PROBE_LOG" || true
-  unset REVERSE_PROBE_PID REVERSE_PROBE_LOG REVERSE_PROBE_PORT REVERSE_PROBE_TOKEN
-}
-
-# 返回 0=PASS、1=已建立有效目标但 Pod 访问失败、2=没有安全的本地 Probe 能力（不阻断 NodePool）。
-test_pod_to_executor() {
-  local pod_name="$1" namespace="$2" target_ip pod_response
-  target_ip=$(resolve_reverse_probe_ip) || {
-    echo "[SKIP] 未解析到执行机私网 IPv4；跳过 Pod 到执行机反向连通性核销。"
-    return 2
-  }
-
-  if find_existing_reverse_probe_url "$target_ip"; then
-    echo "测试从Pod访问执行机历史业务端口: ${REVERSE_PROBE_URL}"
-  elif start_temporary_reverse_probe "$target_ip"; then
-    echo "测试从Pod访问执行机临时HTTP Probe: ${REVERSE_PROBE_URL}"
-  else
-    echo "[SKIP] 执行机 ${target_ip} 未监听历史业务端口，且未获临时HTTP Probe授权/能力；不阻断NodePool流程。"
-    return 2
-  fi
-
-  if pod_response=$(kubectl exec "$pod_name" -n "$namespace" -- curl --noproxy '*' -fsS -m 10 "$REVERSE_PROBE_URL" 2>/dev/null); then
-    if [[ "$REVERSE_PROBE_MODE" != "temporary-http-probe" || "$pod_response" == "$REVERSE_PROBE_TOKEN" ]]; then
-      echo -e "\e[32m\e[1m测试结论：正常！容器访问云主机通畅！ \e[0m"
-      [[ "$REVERSE_PROBE_MODE" == "temporary-http-probe" ]] && stop_temporary_reverse_probe
-      return 0
-    fi
-  fi
-
-  [[ "$REVERSE_PROBE_MODE" == "temporary-http-probe" ]] && stop_temporary_reverse_probe
-  log_error "测试结论：异常！Pod无法访问已验证的执行机探测端点: ${REVERSE_PROBE_URL}"
-  return 1
-}
-
-#通用的节点组可用性测试
-test_nodepool() {
-  local NODEPOOL_NAME=$1
-  local RUN_ID="$(date +%s)-$RANDOM"
-  echo -e "\n******** 开始测试节点组 [$NODEPOOL_NAME] 可用性 ******"
-
-  # 每轮测试都有不可冲突的名称与标签，清理只影响本轮对象。
-  local DEPLOYMENT_NAME="debug-${NODEPOOL_NAME//[^a-zA-Z0-9]/-}-${RUN_ID}"
-  local TEST_SELECTOR="app=nginx-test,nodepool=${NODEPOOL_NAME},nodepool-test-run=${RUN_ID}"
-
-  #如果AWS中国区则优先使用数数仓库镜像，避免从docker hub拉取镜像失败问题
-  ZONE=$(get_zone)
-  if [[ "${ZONE}" =~ "cn-north"(.*) ]]; then
-    NGINX_IMAGE="${NGINX_IMAGE_CN}"
-  fi
-
-  #在K8S环境中创建nginx服务
-  echo "*** 测试项1: 在节点组 ${NODEPOOL_NAME} 启动nginx服 *** "
-  cat <<EOF | kubectl apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ${DEPLOYMENT_NAME}
-  namespace: ${NAMESPACE}
-  labels:
-    app: nginx-test
-    nodepool: ${NODEPOOL_NAME}
-    nodepool-test-run: ${RUN_ID}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: nginx-test
-  template:
-    metadata:
-      labels:
-        app: nginx-test
-        nodepool-test-run: ${RUN_ID}
-        nodepool: ${NODEPOOL_NAME}
-    spec:
-      containers:
-      - name: nginx
-        image: ${NGINX_IMAGE}
-        ports:
-        - containerPort: 80
-        readinessProbe:
-          httpGet:
-            path: /
-            port: 80
-          initialDelaySeconds: 5
-          periodSeconds: 5
-      nodeSelector:
-        node.kubernetes.type: ${NODEPOOL_NAME}
-      # 测试Pod需容忍所有可能的节点组污点以完成调度验证。billing-mode口径仅od/spot两类:
-      # spot节点组会被打上 billing-mode=spot:NoSchedule 污点(见taints_all_spot_nodepool),故必须容忍spot;
-      # od节点组默认不打污点,od容忍为防御性保留。reserved付费类型AWS EKS不存在,已移除该死容忍。
-      tolerations:
-      - effect: NoSchedule
-        key: node.k8s.te/billing-mode
-        operator: Equal
-        value: spot
-      - effect: NoSchedule
-        key: node.k8s.te/billing-mode
-        operator: Equal
-        value: od
-EOF
-
-  # 等待 Deployment Available、Pod Ready 和 Pod IP；Running 本身不足以证明服务可用。
-  echo "等待 Deployment Available、Pod Ready 和 Pod IP,预期3分钟内启动"
-  sleep 5
-  TIMEOUT=180
-  ELAPSED=0
-  POD_READY=false
-  while [ $ELAPSED -lt $TIMEOUT ]; do
-    DEPLOYMENT_AVAILABLE=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null)
-    POD_NAME=$(kubectl get pods -n "$NAMESPACE" -l "$TEST_SELECTOR" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    POD_READY_STATUS=$(kubectl get pods -n "$NAMESPACE" -l "$TEST_SELECTOR" -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
-    POD_IP=$(kubectl get pods -n "$NAMESPACE" -l "$TEST_SELECTOR" -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
-    if [ "$DEPLOYMENT_AVAILABLE" == "True" ] && [ "$POD_READY_STATUS" == "True" ] && [ -n "$POD_IP" ]; then
-      POD_READY=true
-      echo "节点组${NODEPOOL_NAME}启动Pod正常，Pod Name: $POD_NAME , Pod IP: $POD_IP"
-      echo -e "\e[32m\e[1m测试结论：正常！${NODEPOOL_NAME} 节点组成功调度并启动nginx服务!\e[0m"
-
-      break
-    fi
-    echo "等待Pod启动...... "
-    sleep 5
-    let ELAPSED+=5
-  done
-
-  if ! $POD_READY; then
-    log_error "测试结论：异常！Pod未在${TIMEOUT}秒内启动，请排查后重试，常见原因(按概率排序): "
-    echo -e "\e[31m\e[1m1. 节点组资源对象未就绪:请执行 kubectl get karpenter 确认 NodePool/EC2NodeClass 是否 READY=True;\n   若为 False,再执行 kubectl describe ec2nodeclass ${NODEPOOL_NAME} 查看 SubnetsReady/SecurityGroupsReady 等子条件(常见为子网/安全组未打 karpenter.sh/discovery 发现标签)\n2. K8S无实例可调度(如机型在该可用区无库存、超出limits)\n3. K8S无实例可调度(如机型在该可用区无库存、超出limits)\n排查明细请执行: kubectl describe pods -n $NAMESPACE -l ${TEST_SELECTOR}\e[0m"
-    kubectl delete deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
-    return 1
-  fi
-
-  #开始检查本地服务器访问K8S环境nginx是否正常
-  echo "*** 测试项2: 云主机访问nginx容器是否通畅 ***"
-  if curl -s -m 10 "http://$POD_IP" | grep -q "Welcome to nginx!"; then
-    echo -e "\e[32m\e[1m测试结论：正常！云主机访问nginx容器通畅！\e[0m"
-  else
-    log_error "测试结论：异常！测试云主机访问nginx容器失败!"
-    echo -e "\e[31m\e[1m可能是因为K8S环境节点组 ${NODEPOOL_NAME} 绑定安全组未放行集群所绑定的安全组,请联系客户放行 \e[0m"
-    kubectl delete deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
-    return 1
-  fi
-
-  # 优先复用历史业务 metrics 端口；新执行机无业务端口时仅使用已具备的临时 Probe 能力。
-  # 若两者皆不可用，结果为 SKIP，不应阻断已通过的节点组调度和执行机到 Pod 检查。
-  echo "*** 测试项3: 容器访问云主机是否通畅 ***"
-  if test_pod_to_executor "$POD_NAME" "$NAMESPACE"; then
-    :
-  else
-    reverse_probe_rc=$?
-    if [[ $reverse_probe_rc -eq 2 ]]; then
-      echo "[WARN] Pod到执行机反向网络未核销（执行机无业务端口/Probe能力或目标IP）；NodePool调度验收继续。"
-    else
-      echo -e "\e[31m\e[1m可能原因:  \e[0m"
-      echo -e "\e[31m\e[1m1. 本地服务器和POD并非统一内网网段，服务器iptables阻止了来自K8S网络的访问 \e[0m"
-      echo -e "\e[31m\e[1m2. 本地服务器绑定安全组未放行K8S安全组,请联系客户放行 \e[0m"
-      kubectl delete deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
-      return 1
-    fi
-  fi
-
-  # 可用性结论已由Pod Ready及双向网络决定；以下采集仅供审计，失败不得阻断或跳过清理。
-  collect_nodepool_runtime_evidence "$NODEPOOL_NAME" "$RUN_ID" ||
-    echo "[WARN] NodePool运行证据采集出现未预期异常，不影响本轮可用性结论。"
-  echo -e "******** 节点组 [$NODEPOOL_NAME] 可用性测试结束,请关注测试结论,如果有红色预警信息请跟进确认处理********"
-
-  kubectl delete deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
-
-}
-
-#清理测试资源即临时启动的deployment
-clean_check_resource() {
-  echo -e "Tips: 每个测试 Deployment 已在本轮测试后精确删除；不会操作其他 nginx-test 资源。"
-}
-
-# 校验 NodePool 及其关联 EC2NodeClass 是否 Ready,是创建测试Pod的前提
-# 背景:节点组资源对象(NodePool/EC2NodeClass)Ready=False 时,Karpenter无法provision节点,测试Pod会一直Pending直到超时。
-#      提前校验可快速失败并给出准确原因(如子网/安全组发现标签缺失),避免干等180秒后才暴露问题。
-# 入参:可选,指定要校验的节点组名(空格分隔);【不传则校验当前所有NodePool】。
-# 策略:最多轮询60秒;超时仍未Ready则打印精准原因线索(kubectl get karpenter + 未就绪资源的关键condition)后退出。
+# 只校验本轮创建的 NodePool 及其实际引用的 EC2NodeClass。
+# 不接管存量池，不创建测试Pod；完整业务可用性由父级 k8sAvailCheck.sh 验收。
 wait_nodepools_ready() {
-  log_step "校验节点组资源对象(NodePool/EC2NodeClass)是否就绪"
-  local TIMEOUT=60 ELAPSED=0 ALL_READY=false
+  log_step "校验本轮创建的NodePool及其关联EC2NodeClass是否就绪"
+  local timeout="${NODEPOOL_READY_TIMEOUT:-60}"
+  local elapsed=0
+  local all_ready=false
+  local not_ready=""
+  local np np_ready nodeclass_name nodeclass_ready
 
-  # 收集待校验的 NodePool 名称:有入参则只校验入参指定的,否则校验全部
-  local nodepools
-  if [ $# -gt 0 ]; then
-    nodepools="$*"
-  else
-    nodepools=$(kubectl get nodepool -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
-  fi
-  if [ -z "$nodepools" ]; then
-    log_error "未获取到任何NodePool,无法校验就绪状态,请确认节点组是否创建成功。"
-    exit 1
+  if [ "$#" -eq 0 ]; then
+    log_error "未收到本轮创建的NodePool名称，拒绝使用存量NodePool代替本轮验收。"
+    return 1
   fi
 
-  echo "正在等待以下节点组就绪(最多${TIMEOUT}秒): ${nodepools}"
-  while [ $ELAPSED -lt $TIMEOUT ]; do
-    local not_ready=""
-    local np
-    for np in $nodepools; do
-      # NodePool 的顶层 Ready condition
-      local np_ready
-      np_ready=$(kubectl get nodepool "$np" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
-      if [ "$np_ready" != "True" ]; then
+  echo "正在等待以下本轮NodePool资源就绪(最多${timeout}秒): $*"
+  while [ "$elapsed" -lt "$timeout" ]; do
+    not_ready=""
+    for np in "$@"; do
+      np_ready=$(kubectl get nodepool "$np" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+      nodeclass_name=$(kubectl get nodepool "$np" -o jsonpath='{.spec.template.spec.nodeClassRef.name}' 2>/dev/null || true)
+      nodeclass_ready=""
+      if [ -n "$nodeclass_name" ]; then
+        nodeclass_ready=$(kubectl get ec2nodeclass "$nodeclass_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+      fi
+
+      if [ "$np_ready" != "True" ] || [ -z "$nodeclass_name" ] || [ "$nodeclass_ready" != "True" ]; then
         not_ready="${not_ready} ${np}"
       fi
     done
 
     if [ -z "$not_ready" ]; then
-      ALL_READY=true
+      all_ready=true
       break
     fi
-    echo "仍有节点组未就绪,等待中......(已等待 ${ELAPSED}s)"
+    echo "仍有本轮NodePool或EC2NodeClass未就绪，等待中......(已等待 ${elapsed}s)"
     sleep 5
-    let ELAPSED+=5
+    elapsed=$((elapsed + 5))
   done
 
-  if $ALL_READY; then
-    log_success "所有节点组资源对象均已就绪(Ready=True)!"
-    kubectl get karpenter
+  if $all_ready; then
+    log_success "本轮创建的NodePool及其关联EC2NodeClass均已就绪(Ready=True)!"
+    kubectl get karpenter || true
     return 0
   fi
 
-  # 超时未就绪:打印精准原因线索后退出
-  log_error "错误:部分节点组在${TIMEOUT}秒内未就绪(Ready=False),已终止后续可用性测试。未就绪节点组:${not_ready}"
-  echo -e "\e[31m\e[1m========== 节点组资源对象状态总览 ==========\e[0m"
-  kubectl get karpenter
-  echo ""
-  echo -e "\e[31m\e[1m========== 未就绪原因线索(精准定位) ==========\e[0m"
-  local np
+  log_error "本轮NodePool资源在${timeout}秒内未全部就绪，本阶段未完成。未就绪NodePool:${not_ready}"
+  echo -e "\e[31m\e[1m========== 本轮未就绪原因线索 =========\e[0m"
   for np in $not_ready; do
-    echo -e "\e[33m\e[1m● 节点组 ${np}:\e[0m"
-    # NodePool 的 Ready condition reason/message
     local np_reason np_msg
-    np_reason=$(kubectl get nodepool "$np" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null)
-    np_msg=$(kubectl get nodepool "$np" -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null)
-    echo "    NodePool.Ready:  reason=${np_reason:-未知}  message=${np_msg:-无}"
-    # EC2NodeClass(同名)所有 status=False 的 condition,逐条打印 type/reason/message
-    echo "    EC2NodeClass 未就绪子条件:"
-    kubectl get ec2nodeclass "$np" -o json 2>/dev/null | jq -r '
-      .status.conditions[]? | select(.status != "True")
-      | "      - \(.type): reason=\(.reason) message=\(.message // "无")"' 2>/dev/null
+    np_reason=$(kubectl get nodepool "$np" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)
+    np_msg=$(kubectl get nodepool "$np" -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || true)
+    nodeclass_name=$(kubectl get nodepool "$np" -o jsonpath='{.spec.template.spec.nodeClassRef.name}' 2>/dev/null || true)
+    echo "  NodePool ${np}: reason=${np_reason:-未知} message=${np_msg:-无} nodeClassRef=${nodeclass_name:-缺失}"
+    if [ -n "$nodeclass_name" ]; then
+      kubectl get ec2nodeclass "$nodeclass_name" -o json 2>/dev/null | jq -r '
+        .status.conditions[]? | select(.status != "True")
+        | "    EC2NodeClass.\(.type): reason=\(.reason) message=\(.message // "无")"' 2>/dev/null || true
+    fi
   done
-  echo ""
-  echo -e "\e[31m\e[1m常见根因: 子网(SubnetsReady=False,SubnetSelector未匹配到子网)或安全组(SecurityGroupsReady=False)缺少发现标签。\e[0m"
-  echo -e "\e[31m\e[1m请补打发现标签后重试:子网只需存在 key ${subnetSelectorKey:-karpenter.sh/discovery-subnet}(value 不限,只按key匹配);安全组需 key ${securityGroupSelectorKey:-karpenter.sh/discovery-sg}=集群名(精确匹配)。\e[0m"
-  exit 1
+  echo -e "\e[31m\e[1m常见根因: 子网或安全组发现标签未匹配、NodeClass配置错误或AWS权限不足。修复后可安全重试本脚本。\e[0m"
+  return 1
 }
 
-# 获取节点组并测试可用性
-test_all_nodepools() {
-  # 只从经过校验的 NodePool JSON 获取名称，不依赖 kubectl 聚合展示文本。
-  local nodepools_json
-  nodepools_json=$(load_nodepools_json) || exit 1
-  NODEPOOL_NAMES=($(printf '%s' "$nodepools_json" | jq -er '.items[].metadata.name'))
 
-  if [ -z "${NODEPOOL_NAMES}" ]; then
-    log_error "未获取到节点组信息，请确认是否需要重试本脚本尝试创建？"
-    exit 1
-  else
-    log_step "开始测试EKS/节点组可用性，包括容器的调度和起服是否正常、云主机与容器之间网络互通性等"
-    echo "检测到当前EKS集群已有节点组：${NODEPOOL_NAMES[@]}"
-    # 定义可用性测试所用的命名空间，如不存在则创建
-    if ! kubectl get ns $NAMESPACE &>/dev/null; then
-      echo "为可用性测试创建命名空间: $NAMESPACE"
-      kubectl create ns $NAMESPACE
-    fi
-
-    # 测试所有节点组
-    local test_failed=false
-    for np in "${NODEPOOL_NAMES[@]}"; do
-      if ! test_nodepool "$np"; then
-        test_failed=true
-      fi
-    done
-    echo ""
-    if $test_failed; then
-      log_error "****************** 至少一个节点组未通过可用性测试 ******************"
-      return 1
-    fi
-    log_success "****************** 所有节点组都已通过可用性测试 ******************"
-
-    #所有业务节点组都测试完成后，清理测试资源，避免资源浪费
-    clean_check_resource
-  fi
-
-}
-
-###检测karpenter pod 运行是否正常,这是节点组创建的必要条件，如果karpenter异常需要及时通知用户并退出节点组创建程序
+###检测karpenter pod 运行是否正常,这是节点组创建的必要条件
 check_eks_karpenter_status() {
   #检查karpenter状态，节点组创建及可用性依赖karpenter
   TIMEOUT=30
@@ -1455,19 +712,19 @@ check_eks_karpenter_status() {
   done
 
   if ! ${KARPENTER_READY}; then
-    log_error "错误：Karpenter状态异常，退出节点组创建和可用性测试流程，请确认eks和karpenter等依赖服务状态健康后重试本脚本"
-    exit 1
+    log_error "错误：Karpenter状态异常，退出节点组创建流程，请确认EKS和Karpenter等依赖服务状态健康后重试本脚本"
+    return 1
   fi
 
   #检查eks/karpente版本，api-versions版本是否符合预期，老版本标准是karpenter.k8s.aws/v1、karpenter.sh/v1
   eks_api_versions_check=$(kubectl api-versions | grep -E '^karpenter.k8s.aws/v1$|^karpenter.sh/v1$' | wc -l)
   if [ ${eks_api_versions_check} -lt 2 ]; then
     log_error "当前EKS版本较低，不支持所需Api,无法自动创建节点组!"
-    log_error "请参考https://thinkingdata.feishu.cn/wiki/RvGxwQnnSijuQbkKQQScX7MKntc手动创建所需节点组然后重试本脚本进行节点组可用性检查"
-    log_error "或参考https://thinkingdata.feishu.cn/wiki/QUquwBMtPienoHknJk0cyLnOncb升级EKS版本至较新版后重试本脚本进行节点组创建及可用性检查"
+    log_error "请参考https://thinkingdata.feishu.cn/wiki/RvGxwQnnSijuQbkKQQScX7MKntc手动创建所需节点组"
+    log_error "或参考https://thinkingdata.feishu.cn/wiki/QUquwBMtPienoHknJk0cyLnOncb升级EKS版本后重试节点组创建"
     echo "当前EKS版本是:"
     kubectl version
-    exit 1
+    return 1
   fi
 }
 
@@ -1479,8 +736,8 @@ main() {
   #检查k8s是否可访问
   test_k8s_connection
 
-  # 所有创建、测试和污点操作之前，先证明并由操作者确认唯一目标EKS环境。
-  resolve_target_eks_environment || exit 1
+  # 所有创建操作之前，先证明并由操作者确认唯一目标EKS环境。
+  resolve_target_eks_environment || return 1
   if confirm_target_eks_environment; then
     :
   else
@@ -1489,45 +746,20 @@ main() {
     return 1
   fi
 
-  while true; do
-    #询问用户是想要创建节点组并测试可用性 or 仅测试节点组可用性？
-    #未来可能会新增其他自动化场景比如EKS版本升级，这里采用case esac控制流结构易于理解和维护
-    echo "请选择操作类型："
-    echo -e " 1.创建节点组并测试其可用性"
-    echo -e " 2.仅测试已有节点组可用性"
-    echo -e " 3.仅为spot节点组追加污点检查"
-    read -p ">" user_input
-    # 将输入转换为小写进行统一判断
-    normalized_input=$(echo "$user_input" | tr '[:upper:]' '[:lower:]')
+  # 创建入口只承担创建前置校验、对象写入和最小资源回读；不再重复主脚本的
+  # Pod调度、网络、节点契约及存储检查。
+  check_eks_karpenter_status || return 1
+  build_nodepool_for_business || return 1
 
-    case $normalized_input in
-    1)
-      #检查eks和karpenter是否支持开展后续的节点组创建流程
-      check_eks_karpenter_status
-      #创建业务节点组，需要用户输入所需创建的节点组名称及规格信息
-      build_nodepool_for_business
-      #创建完成后先校验节点组资源对象是否就绪(Ready),不就绪则给出精准原因并退出,避免测试Pod干等超时
-      wait_nodepools_ready
-      #公共测试逻辑，测试EKS/节点组可用性，包括各节点组调度可用性、网络连通性等等
-      test_all_nodepools
-      ;;
-    2)
-      #仅测试已有节点组可用性:同样先校验就绪状态再测试
-      wait_nodepools_ready
-      test_all_nodepools
-      ;;
-    3)
-      #独立入口:仅执行spot节点组污点检查(内部含on-demand节点组检查、受影响Pod打印、人工确认三道前提)
-      log_step "为spot类型节点组追加污点"
-      taints_all_spot_nodepool
-      ;;
-    *)
-      echo "无效输入，请重新输入！"
-      continue
-      ;;
-    esac
-    break
-  done
+  if [ ${#NODEPOOL_NAMES[@]} -eq 0 ]; then
+    log_error "本轮未形成待验收的NodePool名称，拒绝将存量资源记为创建成功。"
+    return 1
+  fi
+  wait_nodepools_ready "${NODEPOOL_NAMES[@]}" || return 1
+
+  log_success "NodePool创建与资源对象Ready验收完成。"
+  log_info "完整调度、网络、节点契约与存储检查由k8sAvailCheck.sh继续执行；独立运行本脚本时，请随后执行k8sAvailCheck.sh完成交付验收。"
+  return 0
 }
 
 # 执行主函数
