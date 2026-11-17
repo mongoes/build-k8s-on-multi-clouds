@@ -1,13 +1,17 @@
 # 项目状态
 
-## 2026-11-17：AWS NodePool创建脚本职责收敛已完成本地回归
+## 2026-11-17：AWS NodePool创建脚本职责收敛已完成内部EKS现场验收
 
 - `auto_build_nodepool.sh`继续作为可独立下载执行的AWS创建入口，但只负责目标EKS身份确认、Karpenter前置检查、NodePool/EC2NodeClass创建和本轮对象Ready回读。
 - 已删除子脚本中重复的测试Deployment、Pod双向网络、全量NodePool可用性、运行证据采集及spot污点治理路径；这些检查统一由`k8sAvailCheck.sh`在子脚本成功返回后继续执行，避免同一轮重复等待和重复判断。
 - 最小验收仅接受本轮创建的NodePool名称，并按`nodeClassRef.name`回读真实EC2NodeClass；无名称、对象未Ready或引用缺失均返回失败，不能用存量Ready对象冒充本轮成功。
 - 主脚本仍保留进程边界防护：校验创建前后Kubernetes目标未漂移、比较NodePool前后集合、只验收新增对象，然后进入节点规划、调度、网络、契约和存储完整检查。
 - 已更新主脚本内下载物料SHA256并通过配对校验。9组本地测试中8组PASS，Nodes快照行为测试因Mac Bash 3.2按既定规则SKIP；两个主脚本`bash -n`和`git diff --check`通过。
-- 下一步：在内部AWS EKS测试环境验证“创建子脚本rc=0后，同一次`k8sAvailCheck.sh`继续标准检查”，覆盖创建成功、取消、创建失败、无新增对象及新增对象未Ready；未完成该现场矩阵前不合并`main`。
+- 内部EKS现场取消路径已通过：目标身份确认后输入`n`，子脚本返回专用rc=10，创建前后NodePool集合一致，未产生资源。
+- 内部EKS现场成功路径已通过：主脚本选择“新建或补充NodePool”，子脚本创建`od-8c32g`并只回读本轮NodePool及其关联EC2NodeClass为Ready；返回后主脚本准确识别一个新增对象，并在同一次运行中继续标准检查。
+- 完整业务验收结果：新池从0节点扩容到1节点并承载探测Pod；严格HTTPS双仓库、Pod/NodePort/MySQL、节点契约、`te-disk` RWO、`te-nfs` RWX基础与跨节点共享全部执行，最终20项PASS、0项FAIL、2项既有环境WARN、1项SKIP。
+- 资源回收结果：本轮三个临时PV均读回消失；精确删除本轮`od-8c32g` NodePool后，NodeClaim与弹性节点终止，再删除同名EC2NodeClass；最终四类对象均NotFound/空集合，debug无本轮测试资源。既有业务PV只读展示，未处理。
+- 现场分发边界：OSS上的`auto_build_nodepool.sh`仍为旧物料，SHA与当前主脚本不匹配。本次仅在内部测试会话中临时把下载定向到Mac上传的配对子脚本，未修改服务器或OSS。下一步必须成对发布两份脚本后再合并`main`；创建失败、rc=0但无新增对象、新增对象未Ready继续由行为级回归覆盖，不为制造现场失败而污染集群。
 
 ## 2026-11-17：超大集群Nodes单次快照优化已完成Linux/EKS现场验收
 
